@@ -1,0 +1,25 @@
+[package]
+name = "lmux-compositor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+lmux-bus = { path = "../lmux-bus" }
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "fs"] }
+tracing.workspace = true
+uuid = { version = "1", features = ["v4", "serde"] }
+zbus.workspace = true
+tempfile = "3"
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

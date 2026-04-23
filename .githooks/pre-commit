@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# lmux pre-commit hook — enforces NFR10 (clippy -D warnings) and NFR11 (no bare unwrap/expect).
+#
+# Install once per clone:
+#     git config core.hooksPath .githooks
+#
+# Skip (emergency only; CI will still fail):
+#     git commit --no-verify ...
+
+set -eu
+set -o pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+fail() {
+    printf '\n\033[1;31mpre-commit: %s\033[0m\n' "$1" >&2
+    exit 1
+}
+
+step() {
+    printf '\033[1;34mpre-commit:\033[0m %s\n' "$1" >&2
+}
+
+step "cargo fmt --check"
+if ! cargo fmt --all -- --check; then
+    fail "rustfmt found unformatted code — run 'cargo fmt --all'"
+fi
+
+step "cargo clippy -D warnings"
+if ! cargo clippy --all-targets --all-features --quiet -- -D warnings; then
+    fail "clippy found violations — fix the warnings above"
+fi
+
+step "unwrap/expect scan (NFR11)"
+# Matches bare `.unwrap()` and `.expect(...)` but skips lines inside #[cfg(test)]
+# modules and files under tests/. Uses awk so we can track block context.
+violations=$(
+    find crates/*/src -type f -name '*.rs' \
+        -print0 |
+    xargs -0 awk '
+        BEGIN { depth = 0; test_depth = -1; entered = 0 }
+        {
+            line = $0
+
+            # Track entering a #[cfg(test)] attribute. Other attributes
+            # (e.g. #[allow]) may sit between it and the opening brace,
+            # so we wait for depth to actually rise before considering
+            # ourselves inside the test block.
+            if (test_depth < 0 && line ~ /^[[:space:]]*#\[cfg\(test\)\]/) {
+                test_depth = depth
+                entered = 0
+                next
+            }
+
+            # Track braces to find the end of the cfg(test) block.
+            opens  = gsub(/\{/, "{", line)
+            closes = gsub(/\}/, "}", line)
+            depth += opens - closes
+
+            if (test_depth >= 0) {
+                if (!entered) {
+                    if (depth > test_depth) { entered = 1 }
+                    next
+                }
+                if (depth <= test_depth) { test_depth = -1; entered = 0 }
+                next
+            }
+
+            # Skip in-line test attributes on functions too.
+            if ($0 ~ /#\[(test|tokio::test)\]/) { next }
+
+            if ($0 ~ /\.(unwrap|expect)\(/) {
+                printf "%s:%d: %s\n", FILENAME, FNR, $0
+            }
+        }
+    '
+)
+
+if [ -n "$violations" ]; then
+    printf '%s\n' "$violations" >&2
+    fail "bare .unwrap()/.expect() found in non-test code (NFR11)"
+fi
+
+step "all checks passed"

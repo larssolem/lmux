@@ -1,0 +1,16 @@
+# Rust
+target/
+**/target/
+*.rs.bk
+
+# Zig build artefacts from crates/lmux-libghostty/vendor-ghostty/
+**/vendor-ghostty/zig-out/
+**/vendor-ghostty/.zig-cache/
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+.idea/
+.claude/settings.local.json
+.serena/

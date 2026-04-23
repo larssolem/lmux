@@ -1,0 +1,42 @@
+[package]
+name = "lmux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "lmux"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+gtk4.workspace = true
+libc.workspace = true
+pangocairo.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+lmux-libghostty = { path = "../lmux-libghostty" }
+lmux-layout = { path = "../lmux-layout" }
+lmux-state = { path = "../lmux-state" }
+lmux-pty = { path = "../lmux-pty" }
+lmux-notify = { path = "../lmux-notify" }
+lmux-control = { path = "../lmux-control" }
+lmux-anchor = { path = "../lmux-anchor" }
+lmux-config = { path = "../lmux-config" }
+lmux-bus = { path = "../lmux-bus" }
+lmux-compositor = { path = "../lmux-compositor" }
+lmux-session = { path = "../lmux-session" }
+lmux-wayland-host = { path = "../lmux-wayland-host" }
+async-trait.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "macros", "sync", "time"] }
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

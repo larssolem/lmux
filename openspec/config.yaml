@@ -1,0 +1,52 @@
+schema: spec-driven
+
+context: |
+  Project: lmux — a Rust-based developer cockpit that combines a tmux-style
+  terminal multiplexer with GUI "satellite" docking on KWin (and a nested
+  smithay-based Wayland compositor for in-process satellites). Single-binary
+  cockpit, no daemon; sessions persisted as atomic TOML under
+  $XDG_STATE_HOME/lmux/.
+
+  Tech stack:
+    - Rust workspace (edition shared across crates); GTK4 via gtk4-rs
+    - libghostty (dynamic link) for terminal rendering
+    - Tokio for async I/O; glib::MainContext::spawn_local bridges to the
+      GTK main loop
+    - zbus for KWin scripting D-Bus calls
+    - smithay 0.7 for the nested Wayland compositor (lmux-wayland-host)
+    - bubblewrap for the default satellite sandbox
+    - tracing + tracing-appender (daily-rotated) for logging
+
+  Domain vocabulary (use consistently in specs / proposals / tasks):
+    - Cockpit: the running lmux process
+    - Pane: one terminal widget OR one satellite widget inside the cockpit
+    - Session: named, persisted pane-tree + anchor metadata
+    - Anchor: a pane the user has marked as long-running (dev server, AI
+      agent); has a UUID, a lifecycle (live / paused / hidden / dead), and
+      optionally an associated satellite workspace
+    - Satellite: an external GUI app spawned by the cockpit and visually
+      docked to a pane
+    - Bus: Unix-socket IPC at $XDG_RUNTIME_DIR/lmux/bus.sock speaking
+      length-prefixed JSON with a versioned envelope (kinds in
+      crates/lmux-bus/src/kinds.rs)
+
+  Conventions:
+    - ADRs live in docs/adr/; reference them by number (ADR-0015, etc.)
+      from specs/proposals when a decision is authoritative there
+    - Use SHALL / MUST in requirement text; scenarios are WHEN/THEN
+      (plus AND as needed)
+    - Each requirement needs at least one scenario
+    - Keep capability names lowercase-kebab (terminal-core, bus-ipc,
+      compositor-control, satellites, observability, …)
+
+  Non-goals for v0.2 (do not add requirements for these without a PRD
+  revision): wlroots/Hyprland backend, plugin SDK, remote/SSH sessions,
+  AUR/Flatpak packaging, network telemetry.
+
+rules:
+  proposal:
+    - Reference ADRs by number when a decision already lives there
+    - Explicitly name which capability specs change (New vs Modified)
+  tasks:
+    - Group tasks under numbered ## headings; every task is a `- [ ]` checkbox
+    - Order by dependency; earliest items are prerequisites for later ones
