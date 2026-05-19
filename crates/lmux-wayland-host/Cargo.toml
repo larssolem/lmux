@@ -11,15 +11,17 @@ workspace = true
 
 [dependencies]
 async-channel.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 smithay = { version = "0.7", default-features = false, features = [
     "wayland_frontend",
     "desktop",
 ] }
-thiserror.workspace = true
 tracing.workspace = true
 
-[dev-dependencies]
+[target.'cfg(target_os = "linux")'.dev-dependencies]
 libc = "0.2"
 tempfile = "3"
 wayland-client = "0.31"

@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::thread;
 
-use lmux_compositor::CompositorControl;
+use lmux_compositor::{CompositorControl, FocusPolicy, SatelliteWindowId, WindowGroupSwitch};
 
 /// Commands the bridge accepts. Extend with geometry/attach when full
 /// docking (v0.3) lands.
@@ -19,6 +19,14 @@ pub enum CompositorCommand {
     /// Show or hide the satellite window whose PID equals `pid`. GTK side
     /// fires this on every anchor switch, once per known satellite.
     SetSatelliteVisible { pid: u32, visible: bool },
+    /// Apply a full anchor switch as a grouped operation. macOS uses this
+    /// path to keep native windows visually consistent; Linux backends get
+    /// a default per-window implementation.
+    ApplyWindowGroupSwitch {
+        hide: Vec<SatelliteWindowId>,
+        show: Vec<SatelliteWindowId>,
+        focus_policy: FocusPolicy,
+    },
 }
 
 pub type CompositorSender = async_channel::Sender<CompositorCommand>;
@@ -57,6 +65,32 @@ async fn drain(rx: CompositorReceiver, compositor: Arc<dyn CompositorControl>) {
                     Ok(()) => tracing::debug!(pid, visible, "compositor-bridge: visibility ok"),
                     Err(err) => {
                         tracing::warn!(pid, visible, error = %err, "compositor-bridge: visibility failed");
+                    }
+                }
+            }
+            CompositorCommand::ApplyWindowGroupSwitch {
+                hide,
+                show,
+                focus_policy,
+            } => {
+                match compositor
+                    .apply_window_group_switch(WindowGroupSwitch {
+                        hide,
+                        show,
+                        focus_policy,
+                    })
+                    .await
+                {
+                    Ok(results) => {
+                        let failures = results.iter().filter(|r| !r.ok).count();
+                        tracing::debug!(
+                            windows = results.len(),
+                            failures,
+                            "compositor-bridge: group switch applied"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "compositor-bridge: group switch failed");
                     }
                 }
             }

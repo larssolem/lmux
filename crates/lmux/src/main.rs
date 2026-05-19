@@ -6,7 +6,51 @@ mod launcher;
 mod layout;
 mod pane;
 mod render;
+#[cfg(target_os = "linux")]
 mod satellite;
+#[cfg(not(target_os = "linux"))]
+mod satellite {
+    use gtk4::prelude::*;
+    use gtk4::Frame;
+
+    use crate::layout::PaneId;
+    use crate::pane::{FocusCallback, FocusModeCell};
+
+    pub struct SatelliteWidget {
+        pane_id: PaneId,
+        frame: Frame,
+    }
+
+    impl SatelliteWidget {
+        #[allow(dead_code)]
+        pub fn placeholder(pane_id: PaneId) -> Self {
+            let frame = Frame::builder().hexpand(true).vexpand(true).build();
+            frame.add_css_class("pane");
+            frame.add_css_class("satellite");
+            Self { pane_id, frame }
+        }
+
+        pub fn pane_id(&self) -> PaneId {
+            self.pane_id
+        }
+
+        pub fn widget(&self) -> &Frame {
+            &self.frame
+        }
+
+        pub fn grab_focus(&self) {
+            self.frame.grab_focus();
+        }
+
+        pub fn has_exited(&self) -> bool {
+            false
+        }
+
+        pub fn request_close(&self) {}
+
+        pub fn attach_focus_callback(&self, _cb: FocusCallback, _focus_mode: FocusModeCell) {}
+    }
+}
 mod sidebar;
 mod state;
 mod switcher;
@@ -51,8 +95,9 @@ fn pty_trampoline(rest: Vec<std::ffi::OsString>) -> ! {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    // SAFETY: prctl(2) with PR_SET_PDEATHSIG is a no-op on non-Linux but
-    // always safe to call on Linux. The ulong is the signal number.
+    // SAFETY: prctl(2) with PR_SET_PDEATHSIG is Linux-specific. Other Unix
+    // platforms still use this trampoline as a plain exec wrapper.
+    #[cfg(target_os = "linux")]
     unsafe {
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong);
     }

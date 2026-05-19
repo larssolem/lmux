@@ -7,15 +7,19 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
+#[cfg(target_os = "linux")]
 use async_channel::Sender;
 use gtk4::prelude::*;
 use gtk4::{Orientation, Paned, Widget};
 use lmux_anchor::{Anchor, AnchorRegistry};
+use lmux_compositor::{FocusPolicy, SatelliteWindowId, WindowBackend};
+#[cfg(target_os = "linux")]
 use lmux_wayland_host::{HostCommand, HostEvent, HostHandle, SurfaceId};
 use uuid::Uuid;
 
 use crate::layout::{Dir, Layout, PaneId};
 use crate::pane::{BellCallback, FocusCallback, Pane};
+#[cfg(target_os = "linux")]
 use crate::satellite::SatelliteWidget;
 
 /// CSS class applied to an anchor pane's Frame. Paired with the provider
@@ -35,6 +39,17 @@ pub const REARRANGE_CSS_CLASS: &str = "lmux--rearrange";
 /// CSS class for the currently active anchor — the one rendered on screen.
 /// Other tagged anchors keep `pane--anchor` but lose `pane--anchor-active`.
 pub const ANCHOR_ACTIVE_CSS_CLASS: &str = "pane--anchor-active";
+
+fn default_window_backend() -> WindowBackend {
+    #[cfg(target_os = "macos")]
+    {
+        WindowBackend::Macos
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        WindowBackend::Kwin
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -112,11 +127,11 @@ pub struct AppState {
     /// — the switcher sets it to `Some(name)` on the first swap, and
     /// subsequent swaps save back to that name before loading the next.
     current_session: Option<String>,
-    /// Which anchor owns each live GUI satellite, keyed by child PID.
+    /// Which anchor owns each live GUI satellite.
     /// Populated by the launcher on successful spawn and drained by
     /// `set_active_anchor` so satellites share the lifecycle of their
     /// owning anchor (hide on switch-away, show on switch-back).
-    satellite_pids_by_anchor: HashMap<PaneId, Vec<u32>>,
+    satellite_windows_by_anchor: HashMap<PaneId, Vec<SatelliteWindowId>>,
     /// Sender to the compositor bridge thread. `None` in unit tests and
     /// on the snapshot-restore path before the cockpit wires one up.
     compositor_tx: Option<crate::compositor_bridge::CompositorSender>,
@@ -125,23 +140,28 @@ pub struct AppState {
     /// shutdown. `None` when the compositor failed to start (e.g. CI
     /// without `XDG_RUNTIME_DIR`) — the cockpit still works, just without
     /// GUI satellites.
+    #[cfg(target_os = "linux")]
     wayland_host: Option<HostHandle>,
     /// Command channel to the nested compositor. Cloned per satellite so
     /// GTK widgets can post `HostCommand::ResizeToplevel`, pointer/key
     /// events, etc. `None` when `wayland_host` is None.
+    #[cfg(target_os = "linux")]
     host_cmd_tx: Option<Sender<HostCommand>>,
     /// Reverse lookup from nested-compositor surface id to the PaneId we
     /// allocated for it. Lets host events (FrameReady, Title/Close)
     /// find the right satellite in `self.panes` in O(1).
+    #[cfg(target_os = "linux")]
     surface_to_pane: HashMap<SurfaceId, PaneId>,
     /// Reverse lookup from popup SurfaceId to the parent satellite's PaneId,
     /// so popup-targeted frames/repositions/closes route to the right
     /// `SatelliteWidget` overlay.
+    #[cfg(target_os = "linux")]
     popup_to_pane: HashMap<SurfaceId, PaneId>,
     /// Socket name advertised by the nested compositor (`lmux-<pid>`).
     /// Set when `HostEvent::Ready` is dispatched so the launcher can set
     /// `WAYLAND_DISPLAY` on satellite children. `None` before the host
     /// signals ready (or when the host isn't running at all).
+    #[cfg(target_os = "linux")]
     wayland_display_name: Option<String>,
 }
 
@@ -178,12 +198,17 @@ impl AppState {
             phase: Phase::Running,
             on_anchors_changed: Vec::new(),
             current_session: None,
-            satellite_pids_by_anchor: HashMap::new(),
+            satellite_windows_by_anchor: HashMap::new(),
             compositor_tx: None,
+            #[cfg(target_os = "linux")]
             wayland_host: None,
+            #[cfg(target_os = "linux")]
             host_cmd_tx: None,
+            #[cfg(target_os = "linux")]
             surface_to_pane: HashMap::new(),
+            #[cfg(target_os = "linux")]
             popup_to_pane: HashMap::new(),
+            #[cfg(target_os = "linux")]
             wayland_display_name: None,
         }
     }
@@ -224,12 +249,17 @@ impl AppState {
             phase: Phase::Running,
             on_anchors_changed: Vec::new(),
             current_session: None,
-            satellite_pids_by_anchor: HashMap::new(),
+            satellite_windows_by_anchor: HashMap::new(),
             compositor_tx: None,
+            #[cfg(target_os = "linux")]
             wayland_host: None,
+            #[cfg(target_os = "linux")]
             host_cmd_tx: None,
+            #[cfg(target_os = "linux")]
             surface_to_pane: HashMap::new(),
+            #[cfg(target_os = "linux")]
             popup_to_pane: HashMap::new(),
+            #[cfg(target_os = "linux")]
             wayland_display_name: None,
         };
         st.rebuild_widget_tree();
@@ -411,19 +441,26 @@ impl AppState {
     /// so the satellite hides when its owner is inactive and shows again
     /// when it becomes active.
     pub fn register_satellite(&mut self, anchor: PaneId, pid: u32) {
+        self.register_satellite_window(
+            anchor,
+            SatelliteWindowId::for_pid(default_window_backend(), pid),
+        );
+    }
+
+    pub fn register_satellite_window(&mut self, anchor: PaneId, window: SatelliteWindowId) {
         if !self.anchors.contains(&anchor) {
             tracing::warn!(
                 anchor,
-                pid,
+                pid = ?window.pid,
                 "register_satellite: pane is not a tagged anchor"
             );
             return;
         }
-        self.satellite_pids_by_anchor
+        self.satellite_windows_by_anchor
             .entry(anchor)
             .or_default()
-            .push(pid);
-        tracing::info!(anchor, pid, "registered satellite under anchor");
+            .push(window.clone());
+        tracing::info!(anchor, window = ?window, "registered satellite under anchor");
     }
 
     /// Wire up the bridge so anchor-switch side effects reach KWin.
@@ -438,23 +475,30 @@ impl AppState {
         let Some(tx) = self.compositor_tx.as_ref() else {
             return;
         };
-        for (anchor, pids) in &self.satellite_pids_by_anchor {
-            let visible = self.active_anchor == Some(*anchor);
-            for &pid in pids {
-                let _ = tx.send_blocking(
-                    crate::compositor_bridge::CompositorCommand::SetSatelliteVisible {
-                        pid,
-                        visible,
-                    },
-                );
+        let active = self.active_anchor;
+        let mut hide = Vec::new();
+        let mut show = Vec::new();
+        for (anchor, windows) in &self.satellite_windows_by_anchor {
+            if Some(*anchor) == active {
+                show.extend(windows.iter().cloned());
+            } else {
+                hide.extend(windows.iter().cloned());
             }
         }
+        let _ = tx.send_blocking(
+            crate::compositor_bridge::CompositorCommand::ApplyWindowGroupSwitch {
+                hide,
+                show,
+                focus_policy: FocusPolicy::Terminal,
+            },
+        );
     }
 
     /// Install the nested-Wayland compositor handle + command channel
     /// (ADR-0018). Must be called before the host-event dispatcher is
     /// spawned. Dropped panes that are satellites will still receive
     /// `request_close` via this channel until AppState itself is dropped.
+    #[cfg(target_os = "linux")]
     pub fn install_wayland_host(&mut self, handle: HostHandle, cmd_tx: Sender<HostCommand>) {
         self.wayland_host = Some(handle);
         self.host_cmd_tx = Some(cmd_tx);
@@ -464,6 +508,7 @@ impl AppState {
     /// it wants to address a satellite directly (e.g., force-close on
     /// anchor-pane removal). `None` if the host never started.
     #[allow(dead_code)]
+    #[cfg(target_os = "linux")]
     pub fn host_cmd_tx(&self) -> Option<Sender<HostCommand>> {
         self.host_cmd_tx.clone()
     }
@@ -472,14 +517,21 @@ impl AppState {
     /// for use as `WAYLAND_DISPLAY` in satellite child env. `None` when
     /// the host never started or no Ready event has been dispatched yet.
     /// Populated by `handle_host_event` on `HostEvent::Ready`.
+    #[cfg(target_os = "linux")]
     pub fn wayland_display_name(&self) -> Option<&str> {
         self.wayland_display_name.as_deref()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn wayland_display_name(&self) -> Option<&str> {
+        None
     }
 
     /// Dispatch a single event from `lmux_wayland_host`. Runs on the GTK
     /// main thread — the caller is a `spawn_local` task draining the
     /// host's async-channel receiver. Creating satellites, pushing
     /// frames, and collapsing the layout on close all happen here.
+    #[cfg(target_os = "linux")]
     pub fn handle_host_event(&mut self, event: HostEvent) {
         match event {
             HostEvent::Ready { display_name } => {
@@ -673,6 +725,7 @@ impl AppState {
     /// The widget goes on the bottom/right per the same convention as
     /// `split_focused` — focus stays on the originating pane unless the
     /// caller decides otherwise.
+    #[cfg(target_os = "linux")]
     fn on_toplevel_created(
         &mut self,
         surface_id: SurfaceId,
@@ -728,6 +781,7 @@ impl AppState {
         tracing::info!(pane_id, ?surface_id, "satellite pane created");
     }
 
+    #[cfg(target_os = "linux")]
     fn on_toplevel_closed(&mut self, surface_id: SurfaceId) {
         let Some(pane_id) = self.surface_to_pane.remove(&surface_id) else {
             return;

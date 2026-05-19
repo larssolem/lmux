@@ -84,8 +84,15 @@ impl Pane {
     /// Returns `None` if the child is gone or the link can't be read. Used to
     /// propagate CWD into sibling panes when splitting.
     pub fn cwd(&self) -> Option<std::path::PathBuf> {
-        let pid = self.child.process_id()?;
-        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+        #[cfg(target_os = "linux")]
+        {
+            let pid = self.child.process_id()?;
+            std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
     }
 }
 
@@ -103,6 +110,9 @@ pub const TRAMPOLINE_ENV: &str = "LMUX_TRAMPOLINE";
 
 fn trampoline_path() -> Option<std::path::PathBuf> {
     if let Some(v) = std::env::var_os(TRAMPOLINE_ENV) {
+        if v.is_empty() {
+            return None;
+        }
         return Some(std::path::PathBuf::from(v));
     }
     let exe = std::env::current_exe().ok()?;

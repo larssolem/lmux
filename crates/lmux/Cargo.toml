@@ -33,10 +33,12 @@ lmux-config = { path = "../lmux-config" }
 lmux-bus = { path = "../lmux-bus" }
 lmux-compositor = { path = "../lmux-compositor" }
 lmux-session = { path = "../lmux-session" }
-lmux-wayland-host = { path = "../lmux-wayland-host" }
 async-trait.workspace = true
 tokio = { workspace = true, features = ["rt", "net", "macros", "sync", "time"] }
 uuid.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+lmux-wayland-host = { path = "../lmux-wayland-host" }
 
 [dev-dependencies]
 tempfile = "3"

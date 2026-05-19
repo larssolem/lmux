@@ -10,6 +10,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod kwin;
+pub mod macos;
 pub mod noop;
 pub mod spawn;
 
@@ -19,6 +20,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub use kwin::KwinCompositor;
+pub use macos::MacWindowCompositor;
 pub use noop::NoopCompositor;
 
 /// Rect in compositor screen coordinates. Mirrors [`lmux_bus::kinds::Rect`]
@@ -35,6 +37,69 @@ pub struct Rect {
 /// Opaque compositor-specific window id (KWin window uuid on KDE).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowId(pub String);
+
+/// Backend namespace for a managed satellite window identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowBackend {
+    Kwin,
+    Hyprland,
+    Macos,
+    Noop,
+    Unknown(String),
+}
+
+/// Stable cross-backend identity for one GUI satellite window.
+///
+/// PID-only matching is enough for the current KWin visibility path, but
+/// macOS needs per-window identity because single-instance apps can own
+/// windows for multiple anchors in the same process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SatelliteWindowId {
+    pub backend: WindowBackend,
+    pub request_id: Option<Uuid>,
+    pub pid: Option<u32>,
+    pub backend_window_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+impl SatelliteWindowId {
+    pub fn for_pid(backend: WindowBackend, pid: u32) -> Self {
+        Self {
+            backend,
+            request_id: None,
+            pid: Some(pid),
+            backend_window_id: format!("pid:{pid}"),
+            bundle_id: None,
+            title: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FocusPolicy {
+    Terminal,
+    LastSatellite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowGroupSwitch {
+    pub hide: Vec<SatelliteWindowId>,
+    pub show: Vec<SatelliteWindowId>,
+    pub focus_policy: FocusPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowOpResult {
+    pub window: SatelliteWindowId,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
 
 /// Health status reported by [`CompositorControl::health`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +171,48 @@ pub trait CompositorControl: Send + Sync {
         _visible: bool,
     ) -> Result<(), CompositorError> {
         Ok(())
+    }
+
+    /// Show or hide a specific managed satellite window. New backends should
+    /// implement this identity-based method; the default preserves the
+    /// existing PID path for KWin and Noop.
+    async fn set_window_visible(
+        &self,
+        window: &SatelliteWindowId,
+        visible: bool,
+    ) -> Result<(), CompositorError> {
+        if let Some(pid) = window.pid {
+            self.set_window_visible_by_pid(pid, visible).await
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Apply an anchor switch as one group operation. Backends with native
+    /// batching (macOS helper) can override; the default runs each window
+    /// operation independently and returns per-window results.
+    async fn apply_window_group_switch(
+        &self,
+        switch: WindowGroupSwitch,
+    ) -> Result<Vec<WindowOpResult>, CompositorError> {
+        let mut out = Vec::with_capacity(switch.hide.len() + switch.show.len());
+        for window in switch.hide {
+            let result = self.set_window_visible(&window, false).await;
+            out.push(WindowOpResult {
+                window,
+                ok: result.is_ok(),
+                error: result.err().map(|e| e.to_string()),
+            });
+        }
+        for window in switch.show {
+            let result = self.set_window_visible(&window, true).await;
+            out.push(WindowOpResult {
+                window,
+                ok: result.is_ok(),
+                error: result.err().map(|e| e.to_string()),
+            });
+        }
+        Ok(out)
     }
 }
 

@@ -32,17 +32,43 @@
 use std::ffi::OsString;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicBool;
+#[cfg(target_os = "linux")]
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
 use std::thread;
 
 use thiserror::Error;
 
+#[cfg(target_os = "linux")]
 mod host;
+#[cfg(target_os = "linux")]
 mod state;
 
+#[cfg(target_os = "linux")]
 pub use host::HostHandle;
+#[cfg(target_os = "linux")]
 pub use state::SurfaceId;
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub struct SurfaceId(pub u64);
+
+#[cfg(not(target_os = "linux"))]
+impl std::fmt::Display for SurfaceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "sfc-{}", self.0)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub struct HostHandle;
+
+#[cfg(not(target_os = "linux"))]
+impl HostHandle {
+    pub fn request_shutdown(&self) {}
+}
 
 /// Payload for [`HostEvent::DmabufFrame`]. Kept as its own struct because
 /// `OwnedFd` doesn't implement `Clone`, so we can't let the variant ride
@@ -256,6 +282,8 @@ pub enum Error {
     EventLoopInit(String),
     #[error("host thread spawn failed: {0}")]
     ThreadSpawn(std::io::Error),
+    #[error("nested Wayland host is only available on Linux")]
+    UnsupportedPlatform,
 }
 
 /// Spawn the compositor on a dedicated OS thread and return the channel
@@ -263,6 +291,7 @@ pub enum Error {
 ///
 /// The returned [`HostHandle`] owns the thread's join handle and a
 /// shutdown flag; dropping it posts [`HostCommand::Shutdown`] and joins.
+#[cfg(target_os = "linux")]
 pub fn start() -> Result<
     (
         HostHandle,
@@ -298,4 +327,16 @@ pub fn start() -> Result<
         cmd_tx,
         evt_rx,
     ))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn start() -> Result<
+    (
+        HostHandle,
+        async_channel::Sender<HostCommand>,
+        async_channel::Receiver<HostEvent>,
+    ),
+    Error,
+> {
+    Err(Error::UnsupportedPlatform)
 }

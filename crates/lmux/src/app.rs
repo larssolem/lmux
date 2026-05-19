@@ -170,6 +170,7 @@ pub fn activate(app: &Application) {
     install_notifier(&window, &state);
     install_bus_server(&state);
     install_config_watch(&window, &state);
+    #[cfg(target_os = "linux")]
     install_wayland_host(&state);
 
     // Grab focus once the window is mapped so keystrokes reach the initial
@@ -490,20 +491,28 @@ fn install_bus_server(state: &SharedAppState) {
 /// back to `NoopCompositor` so non-KDE users still get a functioning
 /// cockpit (NFR14).
 fn build_compositor() -> std::sync::Arc<dyn lmux_compositor::CompositorControl> {
-    if !is_kde_session() {
-        tracing::info!("compositor: no KDE session detected, using Noop");
-        return std::sync::Arc::new(lmux_compositor::NoopCompositor::default());
+    #[cfg(target_os = "macos")]
+    {
+        tracing::info!("compositor: macOS detected, using MacWindowCompositor (degraded until helper is available)");
+        return std::sync::Arc::new(lmux_compositor::MacWindowCompositor::degraded());
     }
-    match locate_kwin_script() {
-        Some(path) => {
-            tracing::info!(script = %path.display(), "compositor: KwinCompositor active");
-            std::sync::Arc::new(lmux_compositor::KwinCompositor::new(
-                path.to_string_lossy().into_owned(),
-            ))
+    #[cfg(not(target_os = "macos"))]
+    {
+        if !is_kde_session() {
+            tracing::info!("compositor: no KDE session detected, using Noop");
+            return std::sync::Arc::new(lmux_compositor::NoopCompositor::default());
         }
-        None => {
-            tracing::warn!("compositor: KDE detected but lmux-dock.js not found, using Noop");
-            std::sync::Arc::new(lmux_compositor::NoopCompositor::default())
+        match locate_kwin_script() {
+            Some(path) => {
+                tracing::info!(script = %path.display(), "compositor: KwinCompositor active");
+                std::sync::Arc::new(lmux_compositor::KwinCompositor::new(
+                    path.to_string_lossy().into_owned(),
+                ))
+            }
+            None => {
+                tracing::warn!("compositor: KDE detected but lmux-dock.js not found, using Noop");
+                std::sync::Arc::new(lmux_compositor::NoopCompositor::default())
+            }
         }
     }
 }
@@ -912,6 +921,7 @@ fn save_snapshot(state: &SharedAppState) {
 /// or the socket name is already taken), we log + continue: the cockpit
 /// still runs as a pure-terminal multiplexer, just without GUI
 /// satellites.
+#[cfg(target_os = "linux")]
 fn install_wayland_host(state: &SharedAppState) {
     let (handle, cmd_tx, evt_rx) = match lmux_wayland_host::start() {
         Ok(triple) => triple,

@@ -15,20 +15,11 @@ use std::time::{Duration, Instant};
 use lmux_pty::{spawn, SpawnOpts, TRAMPOLINE_ENV};
 
 fn with_no_trampoline<R>(f: impl FnOnce() -> R) -> R {
-    // Setting TRAMPOLINE_ENV to /bin/true would break exec; unsetting it
-    // makes `trampoline_path` fall back to current_exe() which is the test
-    // binary — that still execs "--exec-pty <shell>" which the test binary
-    // doesn't handle. So we stub TRAMPOLINE_ENV to point at /bin/sh itself
-    // so spawning `/bin/sh --exec-pty /bin/sh` works for dumb echo tests…
-    // actually easier: set TRAMPOLINE_ENV to a tiny script? Simplest —
-    // just run the spawn and read whatever comes out, skipping the
-    // trampoline assertion. The trampoline only adds PDEATHSIG; absence
-    // here is fine for the tests below.
-    //
-    // We accomplish "no trampoline" by pointing TRAMPOLINE_ENV at /bin/env
-    // with no extra args — /bin/env then execs /bin/sh directly.
+    // Empty TRAMPOLINE_ENV disables the lmux binary trampoline. The
+    // trampoline only adds Linux PDEATHSIG; absence here is fine for the
+    // lifecycle tests below and keeps them portable to non-Linux targets.
     let prev = std::env::var_os(TRAMPOLINE_ENV);
-    std::env::set_var(TRAMPOLINE_ENV, "/usr/bin/env");
+    std::env::set_var(TRAMPOLINE_ENV, "");
     let out = f();
     match prev {
         Some(v) => std::env::set_var(TRAMPOLINE_ENV, v),

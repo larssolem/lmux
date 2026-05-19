@@ -31,6 +31,13 @@ ldd target/release/lmux | grep -i ghostty   # should print nothing
 
 ## Development
 
+### macOS port branch
+
+macOS work-in-progress notes live in [docs/macos-port.md](docs/macos-port.md).
+The first supported path is a native build on Apple hardware; Docker is not
+used for macOS GUI E2E because the tests need the macOS window server and
+Accessibility permissions.
+
 ### Pre-commit hook
 
 The repo ships a pre-commit hook under `.githooks/`. Enable it once:
