@@ -862,6 +862,7 @@ fn start_pty_reader(
 /// layout/rebuild/focus code paths treat them uniformly.
 pub enum Pane {
     Terminal(TerminalPane),
+    #[allow(dead_code)]
     Satellite(crate::satellite::SatelliteWidget),
 }
 
@@ -875,6 +876,7 @@ impl Pane {
     /// Wrap a pre-built satellite widget as a pane. The satellite was
     /// already allocated by the host-event dispatcher with its PaneId
     /// baked in, so we just promote it here.
+    #[cfg(target_os = "linux")]
     pub fn from_satellite(widget: crate::satellite::SatelliteWidget) -> Self {
         Self::Satellite(widget)
     }
@@ -1009,6 +1011,7 @@ impl Pane {
         matches!(self, Self::Satellite(_))
     }
 
+    #[cfg(target_os = "linux")]
     pub fn as_satellite(&self) -> Option<&crate::satellite::SatelliteWidget> {
         if let Self::Satellite(s) = self {
             Some(s)

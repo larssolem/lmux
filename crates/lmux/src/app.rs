@@ -517,6 +517,7 @@ fn build_compositor() -> std::sync::Arc<dyn lmux_compositor::CompositorControl> 
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn is_kde_session() -> bool {
     if std::env::var_os("KDE_SESSION_VERSION").is_some() {
         return true;
@@ -526,6 +527,7 @@ fn is_kde_session() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn locate_kwin_script() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(override_path) = std::env::var_os("LMUX_KWIN_SCRIPT") {

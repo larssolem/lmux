@@ -16,9 +16,6 @@ use lmux_compositor::{CompositorControl, FocusPolicy, SatelliteWindowId, WindowG
 /// docking (v0.3) lands.
 #[derive(Debug, Clone)]
 pub enum CompositorCommand {
-    /// Show or hide the satellite window whose PID equals `pid`. GTK side
-    /// fires this on every anchor switch, once per known satellite.
-    SetSatelliteVisible { pid: u32, visible: bool },
     /// Apply a full anchor switch as a grouped operation. macOS uses this
     /// path to keep native windows visually consistent; Linux backends get
     /// a default per-window implementation.
@@ -60,14 +57,6 @@ pub fn spawn(compositor: Arc<dyn CompositorControl>) -> CompositorSender {
 async fn drain(rx: CompositorReceiver, compositor: Arc<dyn CompositorControl>) {
     while let Ok(cmd) = rx.recv().await {
         match cmd {
-            CompositorCommand::SetSatelliteVisible { pid, visible } => {
-                match compositor.set_window_visible_by_pid(pid, visible).await {
-                    Ok(()) => tracing::debug!(pid, visible, "compositor-bridge: visibility ok"),
-                    Err(err) => {
-                        tracing::warn!(pid, visible, error = %err, "compositor-bridge: visibility failed");
-                    }
-                }
-            }
             CompositorCommand::ApplyWindowGroupSwitch {
                 hide,
                 show,
