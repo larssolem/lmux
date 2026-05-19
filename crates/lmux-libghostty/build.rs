@@ -20,13 +20,20 @@ fn main() {
         "cargo:rerun-if-changed={}",
         vendor_dir.join("build.zig.zon").display()
     );
+    println!("cargo:rerun-if-env-changed=ZIG");
 
-    let status = Command::new("zig")
+    let zig = env::var_os("ZIG").unwrap_or_else(|| "zig".into());
+    let status = Command::new(&zig)
         .arg("build")
         .arg("--release=fast")
         .current_dir(&vendor_dir)
         .status()
-        .expect("failed to run `zig build` for vendor-ghostty");
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to run `{}` build` for vendor-ghostty: {err}",
+                PathBuf::from(&zig).display()
+            )
+        });
     assert!(status.success(), "zig build failed");
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());

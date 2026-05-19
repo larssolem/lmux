@@ -25,6 +25,12 @@ The vendored Ghostty build currently expects Zig 0.15.2. If Homebrew has moved a
 
 ## Build Checks
 
+Fast path:
+
+```sh
+scripts/macos-smoke.sh
+```
+
 Start with the crates that do not require the GTK app binary:
 
 ```sh
