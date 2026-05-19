@@ -165,6 +165,16 @@ fn cwd_reflects_initial_directory() {
         })
         .expect("spawn");
 
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(
+                pane.cwd().is_none(),
+                "cwd lookup is only implemented through /proc on Linux"
+            );
+            pane.kill().ok();
+            return;
+        }
+
         // /proc/<pid>/cwd requires the child to have finished setting its
         // cwd; give the kernel a beat.
         let deadline = Instant::now() + Duration::from_secs(1);
