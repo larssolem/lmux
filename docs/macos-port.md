@@ -23,6 +23,19 @@ brew install rust zig gtk4 pkg-config
 
 The vendored Ghostty build currently expects Zig 0.15.2. If Homebrew has moved ahead, install/pin Zig 0.15.2 or set `ZIG=/path/to/zig-0.15.2` before building.
 
+## Toolchain via mise
+
+This branch pins the build tool versions in `mise.toml`:
+
+```sh
+mise trust
+mise install
+mise run test:port
+mise run macos:smoke
+```
+
+`mise run macos:smoke` puts the pinned Zig on `PATH`, so the Ghostty build should use Zig 0.15.2 without a manual `ZIG=...` override. Use `mise run verify` on Linux for the formatting and Linux-testable port checks.
+
 ## Build Checks
 
 Fast path:

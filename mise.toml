@@ -1,0 +1,42 @@
+[tools]
+rust = "1.93.0"
+zig = "0.15.2"
+
+[env]
+RUST_BACKTRACE = "1"
+
+[tasks.fmt]
+description = "Format the Rust workspace"
+run = "cargo fmt --all"
+
+[tasks."fmt:check"]
+description = "Check Rust formatting"
+run = "cargo fmt --all -- --check"
+
+[tasks."check:portable"]
+description = "Check the Linux-testable macOS port foundation crates"
+run = "cargo check -p lmux-compositor -p lmux-bus -p lmux-control -p lmux-pty -p lmux-wayland-host"
+
+[tasks."test:compositor"]
+description = "Run compositor contract tests, including the macOS helper scaffold"
+run = "cargo test -p lmux-compositor"
+
+[tasks."test:portable"]
+description = "Run portable bus/control/PTY tests"
+run = "cargo test -p lmux-bus -p lmux-control -p lmux-pty"
+
+[tasks."test:port"]
+description = "Run the Linux-testable macOS port test set"
+depends = ["test:compositor", "test:portable"]
+
+[tasks."check:app"]
+description = "Check the GTK app binary with the pinned Zig toolchain"
+run = "cargo check -p lmux"
+
+[tasks."macos:smoke"]
+description = "Run the first-pass macOS smoke test sequence"
+run = "scripts/macos-smoke.sh"
+
+[tasks.verify]
+description = "Run formatting plus the Linux-testable macOS port checks"
+depends = ["fmt:check", "check:portable", "test:port"]

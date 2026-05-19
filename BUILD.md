@@ -31,6 +31,17 @@ ldd target/release/lmux | grep -i ghostty   # should print nothing
 
 ## Development
 
+### mise toolchain
+
+The repo includes `mise.toml` for pinned development tool versions and common
+test targets:
+
+```sh
+mise trust
+mise install
+mise run verify
+```
+
 ### macOS port branch
 
 macOS work-in-progress notes live in [docs/macos-port.md](docs/macos-port.md).
