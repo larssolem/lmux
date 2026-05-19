@@ -67,6 +67,28 @@ mise run terminal
 3. Split panes and switch anchors with the normal prefix keybindings.
 4. Open the launcher and confirm macOS-specific blockers are logged clearly.
 
+## macOS Keyboard Shortcuts
+
+The cockpit prefix remains `Ctrl+B` on macOS so the pane-management model
+matches Linux and tmux:
+
+- `Ctrl+B`, then `|` / `\` / `+` splits vertically.
+- `Ctrl+B`, then `-` splits horizontally.
+- `Ctrl+B`, then `o` / `]` cycles focus forward.
+- `Ctrl+B`, then `p` / `[` cycles focus backward.
+- `Ctrl+B`, then `s` opens the session switcher.
+- `Ctrl+B`, then `l` opens the GUI launcher.
+- `Ctrl+B`, then `x` closes the focused pane.
+- `Ctrl+B`, then `q` shuts down lmux.
+
+Terminal copy/paste accepts the existing Linux chords and macOS Command chords:
+
+- `Ctrl+Shift+C` and `Ctrl+Shift+V`
+- `Command+C` and `Command+V`
+
+When a GUI satellite has focus, lmux intentionally lets key events pass through
+so the native application keeps its own macOS shortcuts.
+
 ## Future macOS E2E Lane
 
 Full GUI-window E2E needs a real macOS desktop session, not Xcode Simulator:

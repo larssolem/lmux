@@ -17,7 +17,7 @@ use lmux_libghostty::{
 };
 use lmux_pty::{self, Pane as PtyPane};
 
-use crate::keymap::{self, KeyAction};
+use crate::keymap::{self, KeyAction, TerminalShortcut};
 use crate::layout::PaneId;
 use crate::render::{CairoRenderer, Selection};
 
@@ -336,12 +336,11 @@ impl TerminalPane {
             if inner.borrow().exit_code.is_some() {
                 return glib::Propagation::Stop;
             }
-            if is_copy_shortcut(keyval, modifier) {
-                copy_selection_to_clipboard(&inner);
-                return glib::Propagation::Stop;
-            }
-            if is_paste_shortcut(keyval, modifier) {
-                request_paste_from_clipboard(&area, &inner);
+            if let Some(shortcut) = keymap::classify_terminal_shortcut(keyval, modifier) {
+                match shortcut {
+                    TerminalShortcut::Copy => copy_selection_to_clipboard(&inner),
+                    TerminalShortcut::Paste => request_paste_from_clipboard(&area, &inner),
+                }
                 return glib::Propagation::Stop;
             }
             let page_rows = inner.borrow().rows;
@@ -514,24 +513,6 @@ impl Inner {
         let row = (row as u16).min(self.rows.saturating_sub(1));
         ViewportPoint { row, col }
     }
-}
-
-fn is_copy_shortcut(keyval: gdk::Key, modifier: gdk::ModifierType) -> bool {
-    let needed = gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK;
-    modifier.contains(needed)
-        && keyval
-            .to_unicode()
-            .map(|c| c.eq_ignore_ascii_case(&'c'))
-            .unwrap_or(false)
-}
-
-fn is_paste_shortcut(keyval: gdk::Key, modifier: gdk::ModifierType) -> bool {
-    let needed = gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK;
-    modifier.contains(needed)
-        && keyval
-            .to_unicode()
-            .map(|c| c.eq_ignore_ascii_case(&'v'))
-            .unwrap_or(false)
 }
 
 fn copy_selection_to_clipboard(inner: &Rc<RefCell<Inner>>) {
