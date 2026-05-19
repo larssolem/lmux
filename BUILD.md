@@ -40,6 +40,7 @@ test targets:
 mise trust
 mise install
 mise run verify
+mise run terminal
 ```
 
 ### macOS port branch

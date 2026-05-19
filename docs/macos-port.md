@@ -32,6 +32,7 @@ mise trust
 mise install
 mise run test:port
 mise run macos:smoke
+mise run terminal
 ```
 
 `mise run macos:smoke` puts the pinned Zig on `PATH`, so the Ghostty build should use Zig 0.15.2 without a manual `ZIG=...` override. Use `mise run verify` on Linux for the formatting and Linux-testable port checks.
@@ -56,7 +57,7 @@ Then try the app:
 
 ```sh
 cargo check -p lmux
-cargo run -p lmux
+mise run terminal
 ```
 
 ## Manual Runtime Smoke
