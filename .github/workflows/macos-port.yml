@@ -1,0 +1,44 @@
+name: macOS Port
+
+on:
+  push:
+    branches:
+      - macos-port-window-groups
+  pull_request:
+    branches:
+      - macos-port-window-groups
+  workflow_dispatch:
+
+jobs:
+  macos-port:
+    name: macOS build and smoke checks
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Homebrew dependencies
+        run: brew bundle --file Brewfile
+
+      - name: Install mise toolchains
+        uses: jdx/mise-action@v3
+        with:
+          install: false
+          cache: true
+
+      - name: Trust mise config
+        run: mise trust
+
+      - name: Install pinned toolchains
+        run: mise install
+
+      - name: Doctor
+        run: mise run doctor:macos
+
+      - name: Portable port tests
+        run: mise run test:port
+
+      - name: App compile check
+        run: mise run check:app

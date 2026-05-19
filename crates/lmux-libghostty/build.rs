@@ -4,6 +4,8 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
+const REQUIRED_ZIG_VERSION: &str = "0.15.2";
+
 fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -23,6 +25,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ZIG");
 
     let zig = env::var_os("ZIG").unwrap_or_else(|| "zig".into());
+    verify_zig_version(&zig);
     let status = Command::new(&zig)
         .arg("build")
         .arg("--release=fast")
@@ -30,7 +33,7 @@ fn main() {
         .status()
         .unwrap_or_else(|err| {
             panic!(
-                "failed to run `{}` build` for vendor-ghostty: {err}",
+                "failed to run `{} build` for vendor-ghostty: {err}",
                 PathBuf::from(&zig).display()
             )
         });
@@ -67,4 +70,21 @@ fn main() {
 
     let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("bindings.rs");
     bindings.write_to_file(&out).expect("write bindings.rs");
+}
+
+fn verify_zig_version(zig: &std::ffi::OsStr) {
+    let output = Command::new(zig).arg("version").output().unwrap_or_else(|err| {
+        panic!(
+            "failed to run `{} version`: {err}. Run `mise install` or set ZIG=/path/to/zig-{REQUIRED_ZIG_VERSION}",
+            PathBuf::from(zig).display()
+        )
+    });
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let version = stdout.trim();
+    assert!(
+        output.status.success() && version == REQUIRED_ZIG_VERSION,
+        "vendor-ghostty requires Zig {REQUIRED_ZIG_VERSION}, got {} from `{}`. Run `mise install` or set ZIG=/path/to/zig-{REQUIRED_ZIG_VERSION}",
+        if version.is_empty() { "unknown" } else { version },
+        PathBuf::from(zig).display()
+    );
 }

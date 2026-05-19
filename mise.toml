@@ -37,6 +37,10 @@ run = "cargo check -p lmux"
 description = "Run the first-pass macOS smoke test sequence"
 run = "scripts/macos-smoke.sh"
 
+[tasks."doctor:macos"]
+description = "Check macOS build prerequisites before running the port"
+run = "scripts/macos-doctor.sh"
+
 [tasks.terminal]
 description = "Run the lmux terminal"
 env = { RUST_LOG = "lmux=debug" }

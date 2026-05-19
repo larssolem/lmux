@@ -38,7 +38,9 @@ test targets:
 
 ```sh
 mise trust
+brew bundle
 mise install
+mise run doctor:macos
 mise run verify
 mise run terminal
 ```

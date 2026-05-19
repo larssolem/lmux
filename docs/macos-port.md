@@ -18,10 +18,11 @@ Install developer tools and dependencies:
 
 ```sh
 xcode-select --install
-brew install rust zig gtk4 pkg-config
+brew bundle
 ```
 
-The vendored Ghostty build currently expects Zig 0.15.2. If Homebrew has moved ahead, install/pin Zig 0.15.2 or set `ZIG=/path/to/zig-0.15.2` before building.
+The vendored Ghostty build expects Zig 0.15.2. `mise install` pins that version;
+the build script also checks the Zig version before invoking Ghostty's Zig build.
 
 ## Toolchain via mise
 
@@ -29,20 +30,23 @@ This branch pins the build tool versions in `mise.toml`:
 
 ```sh
 mise trust
+brew bundle
 mise install
+mise run doctor:macos
 mise run test:port
 mise run macos:smoke
 mise run terminal
 ```
 
-`mise run macos:smoke` puts the pinned Zig on `PATH`, so the Ghostty build should use Zig 0.15.2 without a manual `ZIG=...` override. Use `mise run verify` on Linux for the formatting and Linux-testable port checks.
+`mise run macos:smoke` puts the pinned Zig on `PATH`, so the Ghostty build should use Zig 0.15.2 without a manual `ZIG=...` override. Use `mise run doctor:macos` before the first build to catch missing Xcode/Homebrew/GTK/pkg-config/Zig prerequisites. Use `mise run verify` on Linux for the formatting and Linux-testable port checks.
 
 ## Build Checks
 
 Fast path:
 
 ```sh
-scripts/macos-smoke.sh
+mise run doctor:macos
+mise run macos:smoke
 ```
 
 Start with the crates that do not require the GTK app binary:
