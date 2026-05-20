@@ -2,6 +2,7 @@ name: macOS Port
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  MACOSX_DEPLOYMENT_TARGET: "14.0"
 
 on:
   push:
@@ -21,6 +22,21 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Configure macOS SDK for Zig
+        run: |
+          SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          CLANG="$(xcrun --find clang)"
+          echo "SDKROOT=$SDKROOT" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=$SDKROOT/usr/lib" >> "$GITHUB_ENV"
+          echo "CPATH=$SDKROOT/usr/include" >> "$GITHUB_ENV"
+          echo "CC=$CLANG" >> "$GITHUB_ENV"
+          echo "CXX=$(xcrun --find clang++)" >> "$GITHUB_ENV"
+          echo "AR=$(xcrun --find ar)" >> "$GITHUB_ENV"
+          echo "RANLIB=$(xcrun --find ranlib)" >> "$GITHUB_ENV"
+          echo "ZIG_SYSTEM_LINKER_HACK=1" >> "$GITHUB_ENV"
+          echo "SDKROOT=$SDKROOT"
+          "$CLANG" --version
 
       - name: Install mise toolchains
         uses: jdx/mise-action@v3
