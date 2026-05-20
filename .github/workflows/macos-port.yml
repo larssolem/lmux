@@ -35,6 +35,9 @@ jobs:
       - name: Install pinned toolchains
         run: mise install
 
+      - name: Install macOS dependencies
+        run: mise run deps:macos
+
       - name: Doctor
         run: mise run doctor:macos
 

@@ -39,6 +39,7 @@ test targets:
 ```sh
 mise trust
 mise install
+mise run deps:macos
 mise run doctor:macos
 mise run verify
 mise run build:app

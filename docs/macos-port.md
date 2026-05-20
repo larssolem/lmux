@@ -34,6 +34,7 @@ This branch pins the build tool versions in `mise.toml`:
 ```sh
 mise trust
 mise install
+mise run deps:macos
 mise run doctor:macos
 mise run test:port
 mise run build:app
@@ -41,7 +42,7 @@ mise run macos:smoke
 mise run terminal
 ```
 
-`mise install` installs the pinned Rust/Zig toolchains and runs `brew bundle` on macOS, including Graphene for `graphene-sys`. `mise run macos:smoke` puts the pinned Zig on `PATH`, so the Ghostty build should use Zig 0.15.2 without a manual `ZIG=...` override. Use `mise run doctor:macos` before the first build to catch missing Xcode/Homebrew/GTK/Graphene/pkg-config/Zig prerequisites. Use `mise run verify` on Linux for the formatting and Linux-testable port checks.
+`mise install` installs the pinned Rust/Zig toolchains and attempts to run the macOS Homebrew dependency hook. If the toolchains are already installed, run `mise run deps:macos` explicitly; the build/start tasks also depend on that task. It runs `brew bundle` on macOS, including Graphene for `graphene-sys`. `mise run macos:smoke` puts the pinned Zig on `PATH`, so the Ghostty build should use Zig 0.15.2 without a manual `ZIG=...` override. Use `mise run doctor:macos` before the first build to catch missing Xcode/Homebrew/GTK/Graphene/pkg-config/Zig prerequisites. Use `mise run verify` on Linux for the formatting and Linux-testable port checks.
 
 ## Build Checks
 
