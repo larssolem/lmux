@@ -2,8 +2,28 @@
 rust = "1.93.0"
 zig = "0.15.2"
 
+[settings]
+experimental = true
+
 [env]
 RUST_BACKTRACE = "1"
+
+[hooks]
+preinstall = { task = "deps:macos" }
+
+[tasks."deps:macos"]
+description = "Install macOS Homebrew dependencies from Brewfile"
+run = '''
+if [ "$(uname -s)" != "Darwin" ]; then
+  echo "Skipping macOS Homebrew dependencies on $(uname -s)"
+  exit 0
+fi
+if ! command -v brew >/dev/null 2>&1; then
+  echo "Homebrew is required for macOS dependencies. Install it from https://brew.sh/" >&2
+  exit 1
+fi
+brew bundle --file Brewfile
+'''
 
 [tasks.fmt]
 description = "Format the Rust workspace"
@@ -32,6 +52,10 @@ depends = ["test:compositor", "test:portable"]
 [tasks."check:app"]
 description = "Check the GTK app binary with the pinned Zig toolchain"
 run = "cargo check -p lmux"
+
+[tasks."build:app"]
+description = "Build the lmux app binary with the pinned Zig toolchain"
+run = "cargo build -p lmux"
 
 [tasks."macos:smoke"]
 description = "Run the first-pass macOS smoke test sequence"

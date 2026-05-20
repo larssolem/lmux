@@ -55,6 +55,18 @@ require_cmd cargo "Run: mise install"
 require_cmd zig "Run: mise install"
 require_cmd pkg-config "Run: brew bundle"
 
+check_pkg_config() {
+  local module="$1"
+  local hint="$2"
+  if command -v pkg-config >/dev/null 2>&1; then
+    if version="$(pkg-config --modversion "$module" 2>/dev/null)"; then
+      ok "$module pkg-config version: $version"
+    else
+      fail "$module pkg-config metadata not found. $hint"
+    fi
+  fi
+}
+
 if command -v zig >/dev/null 2>&1; then
   zig_version="$(zig version 2>/dev/null || true)"
   if [[ "$zig_version" == "$expected_zig" ]]; then
@@ -68,13 +80,8 @@ if command -v rustc >/dev/null 2>&1; then
   ok "$(rustc --version)"
 fi
 
-if command -v pkg-config >/dev/null 2>&1; then
-  if gtk_version="$(pkg-config --modversion gtk4 2>/dev/null)"; then
-    ok "gtk4 pkg-config version: $gtk_version"
-  else
-    fail "gtk4 pkg-config metadata not found. Run: brew bundle"
-  fi
-fi
+check_pkg_config "gtk4" "Run: brew bundle"
+check_pkg_config "graphene-gobject-1.0" "Run: brew bundle; graphene-sys requires this module"
 
 if command -v brew >/dev/null 2>&1 && [[ -f Brewfile ]]; then
   if brew bundle check --file Brewfile >/dev/null 2>&1; then

@@ -22,14 +22,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Homebrew dependencies
-        run: brew bundle --file Brewfile
-
       - name: Install mise toolchains
         uses: jdx/mise-action@v3
         with:
           install: false
           cache: true
+          experimental: true
 
       - name: Trust mise config
         run: mise trust
@@ -45,3 +43,11 @@ jobs:
 
       - name: App compile check
         run: mise run check:app
+
+      - name: App binary build
+        run: mise run build:app
+
+      - name: Verify built binary
+        run: |
+          test -x target/debug/lmux
+          file target/debug/lmux
