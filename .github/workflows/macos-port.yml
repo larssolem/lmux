@@ -2,7 +2,8 @@ name: macOS Port
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  MACOSX_DEPLOYMENT_TARGET: "14.0"
+  XCODE_VERSION: "26.5"
+  MACOSX_DEPLOYMENT_TARGET: "26.5"
 
 on:
   push:
@@ -22,6 +23,22 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Select Xcode 26.5
+        run: |
+          set -euo pipefail
+          echo "Installed Xcode bundles:"
+          ls -1 /Applications | grep -E '^Xcode' || true
+
+          XCODE_PATH="/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
+          if [[ ! -d "$XCODE_PATH" ]]; then
+            echo "::error::Xcode ${XCODE_VERSION} was requested, but $XCODE_PATH is not installed on this runner."
+            exit 1
+          fi
+
+          sudo xcode-select -s "$XCODE_PATH"
+          xcodebuild -version
+          clang --version
 
       - name: Configure macOS SDK for Zig
         run: |
