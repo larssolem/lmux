@@ -23,20 +23,32 @@ fn main() {
         vendor_dir.join("build.zig.zon").display()
     );
     println!("cargo:rerun-if-env-changed=ZIG");
+    println!("cargo:rerun-if-env-changed=SDKROOT");
 
     let zig = env::var_os("ZIG").unwrap_or_else(|| "zig".into());
     verify_zig_version(&zig);
-    let status = Command::new(&zig)
+
+    let macos_sdk = (target_os == "macos").then(macos_sdk_path).flatten();
+    let mut zig_build = Command::new(&zig);
+    zig_build
         .arg("build")
         .arg("--release=fast")
-        .current_dir(&vendor_dir)
-        .status()
-        .unwrap_or_else(|err| {
-            panic!(
-                "failed to run `{} build` for vendor-ghostty: {err}",
-                PathBuf::from(&zig).display()
-            )
-        });
+        .current_dir(&vendor_dir);
+
+    if let Some(sdk) = &macos_sdk {
+        // GitHub's macOS runners may not expose enough SDK information for Zig to
+        // link the build runner against LibSystem automatically. Passing the SDK
+        // explicitly avoids undefined symbols such as _abort, _dispatch_* and
+        // __availability_version_check during `zig build`.
+        zig_build.env("SDKROOT", sdk).arg("--sysroot").arg(sdk);
+    }
+
+    let status = zig_build.status().unwrap_or_else(|err| {
+        panic!(
+            "failed to run `{} build` for vendor-ghostty: {err}",
+            PathBuf::from(&zig).display()
+        )
+    });
     assert!(status.success(), "zig build failed");
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
@@ -63,6 +75,9 @@ fn main() {
         .allowlist_type("Ghostty.*")
         .allowlist_var("GHOSTTY_.*")
         .derive_default(true);
+    if let Some(sdk) = &macos_sdk {
+        bindings = bindings.clang_arg(format!("-isysroot{}", sdk.display()));
+    }
     if let Some(gcc_inc) = gcc_inc {
         bindings = bindings.clang_arg(format!("-isystem{gcc_inc}"));
     }
@@ -70,6 +85,22 @@ fn main() {
 
     let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("bindings.rs");
     bindings.write_to_file(&out).expect("write bindings.rs");
+}
+
+fn macos_sdk_path() -> Option<PathBuf> {
+    env::var_os("SDKROOT")
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .or_else(|| {
+            Command::new("xcrun")
+                .args(["--sdk", "macosx", "--show-sdk-path"])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+                .map(|s| PathBuf::from(s.trim()))
+                .filter(|path| path.exists())
+        })
 }
 
 fn verify_zig_version(zig: &std::ffi::OsStr) {
@@ -83,7 +114,7 @@ fn verify_zig_version(zig: &std::ffi::OsStr) {
     let version = stdout.trim();
     assert!(
         output.status.success() && version == REQUIRED_ZIG_VERSION,
-        "vendor-ghostty requires Zig {REQUIRED_ZIG_VERSION}, got {} from `{}`. Run `mise install` or set ZIG=/path/to/zig-{REQUIRED_ZIG_VERSION}",
+        "vendor-ghostty requires Zig {REQUIRED_ZIG_VERSION}, got {} from `{}`. Run `mise install` or set ZIG=/path/to/zig-{REQUIRED_ZIG_VERSION}`",
         if version.is_empty() { "unknown" } else { version },
         PathBuf::from(zig).display()
     );
