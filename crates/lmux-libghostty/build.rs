@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 const REQUIRED_ZIG_VERSION: &str = "0.15.2";
+const MACOS_DEPLOYMENT_TARGET: &str = "14.0";
 
 fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
@@ -24,6 +25,7 @@ fn main() {
     );
     println!("cargo:rerun-if-env-changed=ZIG");
     println!("cargo:rerun-if-env-changed=SDKROOT");
+    println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
 
     let zig = env::var_os("ZIG").unwrap_or_else(|| "zig".into());
     verify_zig_version(&zig);
@@ -38,9 +40,14 @@ fn main() {
     if let Some(sdk) = &macos_sdk {
         // GitHub's macOS runners may not expose enough SDK information for Zig to
         // link the build runner against LibSystem automatically. Passing the SDK
-        // explicitly avoids undefined symbols such as _abort, _dispatch_* and
-        // __availability_version_check during `zig build`.
-        zig_build.env("SDKROOT", sdk).arg("--sysroot").arg(sdk);
+        // and deployment target explicitly avoids undefined symbols such as
+        // _abort, _dispatch_* and __availability_version_check during `zig build`.
+        zig_build
+            .env("SDKROOT", sdk)
+            .env("MACOSX_DEPLOYMENT_TARGET", deployment_target())
+            .env("LIBRARY_PATH", sdk.join("usr/lib"))
+            .arg("--sysroot")
+            .arg(sdk);
     }
 
     let status = zig_build.status().unwrap_or_else(|err| {
@@ -53,7 +60,12 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=static=ghostty-vt-static");
-    if target_os != "macos" {
+    if target_os == "macos" {
+        println!("cargo:rustc-link-search=native={}", macos_sdk.as_ref().map(|p| p.join("usr/lib")).unwrap_or_default().display());
+        println!("cargo:rustc-link-lib=framework=CoreFoundation");
+        println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=System");
+    } else {
         println!("cargo:rustc-link-lib=m");
         println!("cargo:rustc-link-lib=pthread");
         println!("cargo:rustc-link-lib=dl");
@@ -76,7 +88,9 @@ fn main() {
         .allowlist_var("GHOSTTY_.*")
         .derive_default(true);
     if let Some(sdk) = &macos_sdk {
-        bindings = bindings.clang_arg(format!("-isysroot{}", sdk.display()));
+        bindings = bindings
+            .clang_arg(format!("-isysroot{}", sdk.display()))
+            .clang_arg(format!("-mmacosx-version-min={}", deployment_target()));
     }
     if let Some(gcc_inc) = gcc_inc {
         bindings = bindings.clang_arg(format!("-isystem{gcc_inc}"));
@@ -85,6 +99,10 @@ fn main() {
 
     let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("bindings.rs");
     bindings.write_to_file(&out).expect("write bindings.rs");
+}
+
+fn deployment_target() -> String {
+    env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| MACOS_DEPLOYMENT_TARGET.to_string())
 }
 
 fn macos_sdk_path() -> Option<PathBuf> {
