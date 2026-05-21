@@ -3,6 +3,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gtk4::gdk;
+use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
@@ -38,6 +39,45 @@ frame.pane--anchor.pane--focused {
     font-size: 10pt;
     padding-right: 4px;
 }
+.lmux-window-picker__row {
+    border-radius: 6px;
+}
+.lmux-window-picker__row:hover {
+    background-color: alpha(#3b82f6, 0.12);
+}
+.lmux-window-picker__row--attached-active {
+    background-color: alpha(#10b981, 0.10);
+    border-left: 4px solid #10b981;
+}
+.lmux-window-picker__row--attached-other {
+    background-color: alpha(#f59e0b, 0.10);
+    border-left: 4px solid #f59e0b;
+}
+.lmux-window-picker__preview {
+    background-color: #1f2937;
+    border: 1px solid alpha(#94a3b8, 0.45);
+    border-radius: 6px;
+}
+.lmux-window-picker__preview--missing {
+    background-color: #334155;
+}
+.lmux-window-picker__preview-text {
+    color: #f8fafc;
+    font-size: 10pt;
+    font-weight: 700;
+}
+.lmux-window-picker__meta {
+    color: #64748b;
+    font-size: 9pt;
+}
+.lmux-window-picker__attached-active {
+    color: #047857;
+    font-weight: 700;
+}
+.lmux-window-picker__attached-other {
+    color: #92400e;
+    font-weight: 700;
+}
 /* Rearrange mode: dashed amber border on every pane signals that drag-to-
    reflow is active. The selector intentionally lives on the root container
    so toggling a single class lights up every nested Frame at once. */
@@ -58,7 +98,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::layout::{Dir, Layout, PaneId};
-use crate::pane::Pane;
+use crate::pane::{Pane, ShortcutPrefixCell, TerminalContextAction};
 use crate::sidebar;
 use crate::state::{self, AppState, SharedAppState};
 
@@ -143,17 +183,25 @@ pub fn activate(app: &Application) {
     };
 
     let state: SharedAppState = Rc::new(RefCell::new(app_state));
+    let shortcut_prefix: ShortcutPrefixCell = Rc::new(RefCell::new(load_keymap_prefix()));
     let focus_cb = make_focus_cb(&state);
     let reparent_cb = make_reparent_cb(&state);
+    let terminal_action_cb = make_terminal_action_cb(&state);
     {
         let mut s = state.borrow_mut();
-        s.attach_controllers_for_all(focus_cb.clone());
+        s.attach_controllers_for_all(
+            focus_cb.clone(),
+            terminal_action_cb,
+            shortcut_prefix.clone(),
+        );
         s.attach_rearrange_for_all(reparent_cb);
     }
 
     // Wrap the pane tree in the anchor sidebar + install its refresh hook.
     let sidebar_cfg = sidebar::load_config();
     let root_with_sidebar = sidebar::install(sidebar_cfg, root, state.clone());
+    root_with_sidebar.set_vexpand(true);
+    install_application_menubar(app);
 
     let window = ApplicationWindow::builder()
         .application(app)
@@ -164,14 +212,16 @@ pub fn activate(app: &Application) {
         .build();
     window.set_size_request(400, 300);
 
-    install_window_shortcuts(app, &window, &state);
+    install_window_menu_actions(app, &window, &state, shortcut_prefix.clone());
+    install_window_shortcuts(app, &window, &state, shortcut_prefix.clone());
     install_close_request(app, &window, &state);
     install_control_socket(&window, &state);
     install_notifier(&window, &state);
     install_bus_server(&state);
-    install_config_watch(&window, &state);
+    install_config_watch(&window, &state, shortcut_prefix);
     #[cfg(target_os = "linux")]
     install_wayland_host(&state);
+    crate::launcher::warm_cache();
 
     // Grab focus once the window is mapped so keystrokes reach the initial
     // pane immediately without the user having to click.
@@ -220,6 +270,72 @@ fn make_focus_cb(state: &SharedAppState) -> Rc<dyn Fn(PaneId)> {
     })
 }
 
+fn make_terminal_action_cb(state: &SharedAppState) -> crate::pane::TerminalActionCallback {
+    let weak = Rc::downgrade(state);
+    Rc::new(move |pane_id, action| {
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
+        let Ok(mut state) = state.try_borrow_mut() else {
+            tracing::debug!(
+                pane = pane_id,
+                ?action,
+                "terminal action skipped (state busy)"
+            );
+            return;
+        };
+        state.set_focused(pane_id);
+        match action {
+            TerminalContextAction::SplitRight => state.split_focused(Dir::Vertical),
+            TerminalContextAction::SplitDown => state.split_focused(Dir::Horizontal),
+            TerminalContextAction::ClosePane => state.close_focused(),
+            TerminalContextAction::NewAnchor => state.create_new_anchor(),
+            TerminalContextAction::NextPane => state.cycle_focus(true),
+            TerminalContextAction::PreviousPane => state.cycle_focus(false),
+            TerminalContextAction::ToggleRearrange => {
+                state.toggle_rearrange_mode();
+            }
+        }
+    })
+}
+
+fn install_application_menubar(app: &Application) {
+    let root = gio::Menu::new();
+
+    let window_menu = gio::Menu::new();
+    window_menu.append(Some("Settings"), Some("app.settings"));
+    window_menu.append(Some("Quit"), Some("app.quit"));
+    root.append_submenu(Some("Window"), &window_menu);
+
+    app.set_menubar(Some(&root));
+}
+
+fn install_window_menu_actions(
+    app: &Application,
+    window: &ApplicationWindow,
+    state: &SharedAppState,
+    shortcut_prefix: ShortcutPrefixCell,
+) {
+    let settings = gio::SimpleAction::new("settings", None);
+    let window_for_settings = window.clone();
+    let state_for_settings = state.clone();
+    let prefix_for_settings = shortcut_prefix;
+    settings.connect_activate(move |_, _| {
+        sidebar::open_settings_dialog(
+            &window_for_settings,
+            &state_for_settings,
+            prefix_for_settings.clone(),
+        );
+    });
+    app.add_action(&settings);
+
+    let quit = gio::SimpleAction::new("quit", None);
+    let app_for_quit = app.clone();
+    let state_for_quit = state.clone();
+    quit.connect_activate(move |_, _| run_shutdown(&app_for_quit, &state_for_quit));
+    app.add_action(&quit);
+}
+
 /// tmux-style prefix key handler. Ctrl+B arms the prefix; the next
 /// keystroke is consumed as a command. Uses the Capture phase so we see the
 /// prefix before the focused pane's key controller, preventing the shell
@@ -241,7 +357,12 @@ fn make_focus_cb(state: &SharedAppState) -> Rc<dyn Fn(PaneId)> {
 /// Any other non-modifier key disarms silently (tmux behavior). Modifier-only
 /// presses (Shift/Ctrl/Alt/Super) keep the prefix armed so that e.g.
 /// Shift+`\` → `|` still reaches the command dispatcher.
-fn install_window_shortcuts(app: &Application, window: &ApplicationWindow, state: &SharedAppState) {
+fn install_window_shortcuts(
+    app: &Application,
+    window: &ApplicationWindow,
+    state: &SharedAppState,
+    shortcut_prefix: ShortcutPrefixCell,
+) {
     let armed: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     let key = EventControllerKey::new();
     key.set_propagation_phase(PropagationPhase::Capture);
@@ -265,13 +386,7 @@ fn install_window_shortcuts(app: &Application, window: &ApplicationWindow, state
             return glib::Propagation::Proceed;
         }
         if !armed_cb.get() {
-            // Not armed: watch for Ctrl+B to arm.
-            let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
-            let is_b = keyval
-                .to_unicode()
-                .map(|c| c.eq_ignore_ascii_case(&'b'))
-                .unwrap_or(false);
-            if ctrl && is_b {
+            if is_configured_prefix(&shortcut_prefix.borrow(), keyval, modifier) {
                 arm_prefix(&armed_cb, &window_cb);
                 return glib::Propagation::Stop;
             }
@@ -327,6 +442,13 @@ fn install_window_shortcuts(app: &Application, window: &ApplicationWindow, state
                     crate::switcher::open(&window_cb, &state_cb);
                 }
                 Some('l') => {
+                    #[cfg(target_os = "macos")]
+                    {
+                        tracing::debug!(
+                            "launcher is disabled on macOS; attach an already-open window instead"
+                        );
+                    }
+                    #[cfg(not(target_os = "macos"))]
                     crate::launcher::open(&window_cb, &state_cb);
                 }
                 Some('m') => {
@@ -369,6 +491,88 @@ fn disarm_prefix(armed: &Rc<Cell<bool>>, window: &ApplicationWindow) {
     window.set_title(Some("lmux"));
 }
 
+fn load_keymap_prefix() -> String {
+    lmux_config::config_path()
+        .and_then(|path| lmux_config::load(&path).ok())
+        .map(|cfg| cfg.keymap.prefix)
+        .filter(|prefix| !prefix.trim().is_empty())
+        .unwrap_or_else(|| "ctrl+b".to_string())
+}
+
+fn is_configured_prefix(prefix: &str, keyval: gdk::Key, modifier: gdk::ModifierType) -> bool {
+    let Some(binding) = parse_prefix_binding(prefix) else {
+        return is_default_prefix(keyval, modifier);
+    };
+    if binding.ctrl != modifier.contains(gdk::ModifierType::CONTROL_MASK) {
+        return false;
+    }
+    if binding.shift != modifier.contains(gdk::ModifierType::SHIFT_MASK) {
+        return false;
+    }
+    if binding.alt != modifier.contains(gdk::ModifierType::ALT_MASK) {
+        return false;
+    }
+    if binding.command
+        && !modifier.intersects(gdk::ModifierType::META_MASK | gdk::ModifierType::SUPER_MASK)
+    {
+        return false;
+    }
+    if !binding.command
+        && modifier.intersects(gdk::ModifierType::META_MASK | gdk::ModifierType::SUPER_MASK)
+    {
+        return false;
+    }
+    keyval
+        .to_unicode()
+        .map(|ch| ch.eq_ignore_ascii_case(&binding.key))
+        .unwrap_or(false)
+}
+
+fn is_default_prefix(keyval: gdk::Key, modifier: gdk::ModifierType) -> bool {
+    modifier.contains(gdk::ModifierType::CONTROL_MASK)
+        && keyval
+            .to_unicode()
+            .map(|c| c.eq_ignore_ascii_case(&'b'))
+            .unwrap_or(false)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrefixBinding {
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+    command: bool,
+    key: char,
+}
+
+pub(crate) fn is_valid_prefix_binding(prefix: &str) -> bool {
+    parse_prefix_binding(prefix).is_some()
+}
+
+fn parse_prefix_binding(prefix: &str) -> Option<PrefixBinding> {
+    let mut binding = PrefixBinding {
+        ctrl: false,
+        shift: false,
+        alt: false,
+        command: false,
+        key: '\0',
+    };
+    for part in prefix
+        .split('+')
+        .map(|part| part.trim().to_ascii_lowercase())
+    {
+        match part.as_str() {
+            "ctrl" | "control" => binding.ctrl = true,
+            "shift" => binding.shift = true,
+            "alt" | "option" => binding.alt = true,
+            "cmd" | "command" | "super" | "meta" => binding.command = true,
+            key if key.chars().count() == 1 => binding.key = key.chars().next()?,
+            _ => return None,
+        }
+    }
+    (binding.key != '\0').then_some(binding)
+}
+
 /// Spawn the control-socket server and wire a UI-thread consumer to turn
 /// `AppEvent`s into `AppState` mutations. The `ServerHandle` is stashed on
 /// the window so the socket file is unlinked on drop.
@@ -381,7 +585,11 @@ fn disarm_prefix(armed: &Rc<Cell<bool>>, window: &ApplicationWindow) {
 /// Full propagation (rebuild sidebar, re-apply font, etc.) is a v0.3
 /// follow-up — this version satisfies Epic 10's hot-reload surface by
 /// proving the observer loop runs end-to-end.
-fn install_config_watch(window: &ApplicationWindow, state: &SharedAppState) {
+fn install_config_watch(
+    window: &ApplicationWindow,
+    state: &SharedAppState,
+    shortcut_prefix: ShortcutPrefixCell,
+) {
     let Some(path) = lmux_config::config_path() else {
         tracing::warn!("lmux-config: watcher disabled (no config path)");
         return;
@@ -394,7 +602,10 @@ fn install_config_watch(window: &ApplicationWindow, state: &SharedAppState) {
     // `focus_mode` that don't trigger re-attach take effect before the
     // first reload event.
     match lmux_config::load(&path) {
-        Ok(cfg) => state.borrow().apply_config(&cfg),
+        Ok(cfg) => {
+            *shortcut_prefix.borrow_mut() = cfg.keymap.prefix.clone();
+            state.borrow().apply_config(&cfg);
+        }
         Err(err) => tracing::warn!(error = %err, "lmux-config: initial load failed"),
     }
     // The watcher calls back on its own thread. Send freshly-parsed configs
@@ -426,8 +637,10 @@ fn install_config_watch(window: &ApplicationWindow, state: &SharedAppState) {
     }
 
     let state_apply = state.clone();
+    let shortcut_prefix_apply = shortcut_prefix;
     glib::MainContext::default().spawn_local(async move {
         while let Ok(cfg) = cfg_rx.recv().await {
+            *shortcut_prefix_apply.borrow_mut() = cfg.keymap.prefix.clone();
             state_apply.borrow().apply_config(&cfg);
         }
     });
@@ -448,6 +661,10 @@ fn install_bus_server(state: &SharedAppState) {
     let compositor = build_compositor();
     let satellite_spawn_ok = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let satellite_spawn_fail = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let satellite_counters = crate::bus::SatelliteCounters {
+        spawn_ok: satellite_spawn_ok.clone(),
+        spawn_fail: satellite_spawn_fail.clone(),
+    };
     // Bridge: AppState → compositor (for anchor-driven satellite hide/show).
     let bridge_tx = crate::compositor_bridge::spawn(compositor.clone());
     state.borrow_mut().set_compositor_tx(bridge_tx);
@@ -466,6 +683,7 @@ fn install_bus_server(state: &SharedAppState) {
         write_rx,
         state_home,
         state_for_dispatch,
+        satellite_counters,
     ));
 
     // Keep the atomic in sync with the real count. Can't read `AppState`
@@ -483,20 +701,14 @@ fn install_bus_server(state: &SharedAppState) {
         }));
 }
 
-/// Pick the compositor backend for this cockpit instance. Detects a KDE
-/// Plasma session via `XDG_CURRENT_DESKTOP` (or `KDE_SESSION_VERSION`) and
-/// probes a handful of canonical script paths — `$LMUX_KWIN_SCRIPT`,
-/// `$XDG_DATA_HOME/lmux/kwin/lmux-dock.js`, `/usr/share/lmux/...`, and a
-/// dev-layout fallback next to `CARGO_MANIFEST_DIR`. On any miss we drop
-/// back to `NoopCompositor` so non-KDE users still get a functioning
-/// cockpit (NFR14).
+/// Pick the compositor backend for this cockpit instance.
 fn build_compositor() -> std::sync::Arc<dyn lmux_compositor::CompositorControl> {
     #[cfg(target_os = "macos")]
     {
-        tracing::info!("compositor: macOS detected, using MacWindowCompositor (degraded until helper is available)");
-        return std::sync::Arc::new(lmux_compositor::MacWindowCompositor::degraded());
+        tracing::info!("compositor: macOS detected, using MacWindowCompositor");
+        return std::sync::Arc::new(lmux_compositor::MacWindowCompositor::detect_or_prompt());
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
         if !is_kde_session() {
             tracing::info!("compositor: no KDE session detected, using Noop");
@@ -515,9 +727,14 @@ fn build_compositor() -> std::sync::Arc<dyn lmux_compositor::CompositorControl> 
             }
         }
     }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        tracing::info!("compositor: unsupported target, using Noop");
+        std::sync::Arc::new(lmux_compositor::NoopCompositor::default())
+    }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn is_kde_session() -> bool {
     if std::env::var_os("KDE_SESSION_VERSION").is_some() {
         return true;
@@ -527,7 +744,7 @@ fn is_kde_session() -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn locate_kwin_script() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(override_path) = std::env::var_os("LMUX_KWIN_SCRIPT") {
@@ -708,6 +925,41 @@ fn onboarding_payload() -> Option<OnboardingToast> {
         title: "lmux".into(),
         body,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_configured_prefix() {
+        assert_eq!(
+            parse_prefix_binding("ctrl+b"),
+            Some(PrefixBinding {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                command: false,
+                key: 'b',
+            })
+        );
+        assert_eq!(
+            parse_prefix_binding("cmd+shift+k"),
+            Some(PrefixBinding {
+                ctrl: false,
+                shift: true,
+                alt: false,
+                command: true,
+                key: 'k',
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_prefix() {
+        assert_eq!(parse_prefix_binding("ctrl+"), None);
+        assert_eq!(parse_prefix_binding("ctrl+space"), None);
+    }
 }
 
 /// Intercept the window's close button → run the same shutdown flow as

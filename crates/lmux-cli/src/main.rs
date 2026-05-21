@@ -42,6 +42,10 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum AnchorCommand {
+    /// Create a new anchor pane and make it active.
+    New,
+    /// Activate an existing anchor by its anchor UUID.
+    Activate { uuid: String },
     /// Pause the backing process (SIGSTOP to the process group).
     Pause { uuid: String },
     /// Resume a previously paused anchor (SIGCONT).
@@ -78,6 +82,23 @@ enum SatelliteCommand {
         /// Executable + args.
         #[arg(required = true, trailing_var_arg = true)]
         argv: Vec<String>,
+    },
+    /// Attach the currently focused native macOS window to the active anchor.
+    AttachFocused,
+    /// List native macOS windows that can be attached.
+    ListWindows,
+    /// Attach a specific native macOS window to the active anchor.
+    AttachWindow {
+        #[arg(long)]
+        pid: u32,
+        #[arg(long)]
+        window_id: Option<i64>,
+        #[arg(long)]
+        window_index: Option<u32>,
+        #[arg(long)]
+        bundle_id: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
     },
 }
 
@@ -117,6 +138,8 @@ fn main() -> ExitCode {
         Command::Session(SessionCommand::Rename { from, to }) => run_session_rename(&from, &to),
         Command::Session(SessionCommand::Delete { name }) => run_session_delete(&name),
         Command::Session(SessionCommand::Open { name }) => run_session_open(&name),
+        Command::Anchor(AnchorCommand::New) => run_anchor_new(),
+        Command::Anchor(AnchorCommand::Activate { uuid }) => run_anchor_activate(&uuid),
         Command::Anchor(AnchorCommand::Pause { uuid }) => run_anchor_pause(&uuid),
         Command::Anchor(AnchorCommand::Resume { uuid }) => run_anchor_resume(&uuid),
         Command::Anchor(AnchorCommand::Hide { uuid }) => run_anchor_hide(&uuid),
@@ -127,7 +150,98 @@ fn main() -> ExitCode {
         Command::Satellite(SatelliteCommand::Open { target, argv }) => {
             run_satellite_open(&target, argv)
         }
+        Command::Satellite(SatelliteCommand::AttachFocused) => run_satellite_attach_focused(),
+        Command::Satellite(SatelliteCommand::ListWindows) => run_satellite_list_windows(),
+        Command::Satellite(SatelliteCommand::AttachWindow {
+            pid,
+            window_id,
+            window_index,
+            bundle_id,
+            title,
+        }) => run_satellite_attach_window(pid, window_id, window_index, bundle_id, title),
         Command::Status => run_status(),
+    }
+}
+
+fn run_satellite_attach_focused() -> ExitCode {
+    match run_bus_write(lmux_bus::Kind::SatelliteAttachFocused {}) {
+        Ok(()) => {
+            println!("focused window attached");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("lmux-cli: {err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_satellite_list_windows() -> ExitCode {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("lmux-cli: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    let res = rt.block_on(async {
+        let mut client = lmux_bus::Client::connect_default(lmux_bus::ClientRole::LmuxCli).await?;
+        client
+            .request(lmux_bus::Kind::SatelliteListWindows {})
+            .await
+    });
+    match res {
+        Ok(lmux_bus::Kind::SatelliteListWindowsResult { windows }) => {
+            for window in windows {
+                let window_id = window
+                    .window_id
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".into());
+                let bundle = window.bundle_id.unwrap_or_else(|| "-".into());
+                let title = window.title.unwrap_or_default();
+                println!(
+                    "pid={} window_id={} index={} bundle={} title={}",
+                    window.pid, window_id, window.window_index, bundle, title
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(other) => {
+            eprintln!("lmux-cli: unexpected bus response: {other:?}");
+            ExitCode::from(1)
+        }
+        Err(err) => {
+            eprintln!("lmux-cli: {err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_satellite_attach_window(
+    pid: u32,
+    window_id: Option<i64>,
+    window_index: Option<u32>,
+    bundle_id: Option<String>,
+    title: Option<String>,
+) -> ExitCode {
+    match run_bus_write(lmux_bus::Kind::SatelliteAttachWindow {
+        pid,
+        window_id,
+        window_index,
+        bundle_id,
+        title,
+    }) {
+        Ok(()) => {
+            println!("window attached");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("lmux-cli: {err}");
+            ExitCode::from(1)
+        }
     }
 }
 
@@ -151,6 +265,38 @@ fn run_satellite_open(target: &str, argv: Vec<String>) -> ExitCode {
         Err(err) => {
             eprintln!("lmux-cli: {err}");
             ExitCode::from(1)
+        }
+    }
+}
+
+fn run_anchor_new() -> ExitCode {
+    match run_bus_write(lmux_bus::Kind::AnchorNew {}) {
+        Ok(()) => {
+            println!("anchor created");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("lmux-cli: {err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_anchor_activate(uuid: &str) -> ExitCode {
+    match uuid.parse::<uuid::Uuid>() {
+        Ok(parsed) => match run_bus_write(lmux_bus::Kind::AnchorActivate { pane_id: parsed }) {
+            Ok(()) => {
+                println!("activated: {uuid}");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("lmux-cli: {err}");
+                ExitCode::from(1)
+            }
+        },
+        Err(err) => {
+            eprintln!("lmux-cli: invalid UUID: {err}");
+            ExitCode::from(2)
         }
     }
 }

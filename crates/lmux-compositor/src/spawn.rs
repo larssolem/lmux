@@ -45,19 +45,33 @@ fn is_chromium_family(cmd: &str) -> bool {
         base,
         "chromium"
             | "chromium-browser"
+            | "Chromium"
             | "google-chrome"
             | "google-chrome-stable"
             | "google-chrome-beta"
             | "google-chrome-unstable"
+            | "Google Chrome"
             | "chrome"
             | "brave"
             | "brave-browser"
+            | "Brave Browser"
             | "microsoft-edge"
             | "microsoft-edge-stable"
+            | "Microsoft Edge"
             | "vivaldi"
             | "vivaldi-stable"
+            | "Vivaldi"
             | "opera"
+            | "Opera"
     )
+}
+
+fn is_vscode_family(cmd: &str) -> bool {
+    let base = std::path::Path::new(cmd)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(cmd);
+    matches!(base, "Code" | "Code - Insiders" | "VSCodium" | "codium")
 }
 
 /// Return true if `args` already contains `--flag[=…]` (long-form only).
@@ -66,18 +80,37 @@ fn has_flag(args: &[String], flag: &str) -> bool {
         .any(|a| a == flag || a.starts_with(&format!("{flag}=")))
 }
 
+fn has_jvm_property(args: &[String], key: &str) -> bool {
+    let prefix = format!("-D{key}=");
+    args.iter().any(|arg| arg.starts_with(&prefix))
+}
+
 /// Per-browser persistent lmux profile dir. Keeps bookmarks / cookies across
 /// cockpit restarts while staying isolated from the user's host-side browser.
 fn chromium_profile_dir(cmd: &str) -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
-    let file = std::path::Path::new(cmd)
+    chromium_profile_dir_named(cmd, None)
+}
+
+fn chromium_profile_dir_named(cmd: &str, suffix: Option<&str>) -> Option<PathBuf> {
+    let base = state_base_dir();
+    let mut file = std::path::Path::new(cmd)
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("chromium");
-    let dir = base.join("lmux").join("browser-profiles").join(file);
-    std::fs::create_dir_all(&dir).ok()?;
+        .unwrap_or("chromium")
+        .to_owned();
+    if let Some(suffix) = suffix {
+        file.push('-');
+        file.push_str(suffix);
+    }
+    let mut dir = base.join("lmux").join("app-profiles").join(&file);
+    if std::fs::create_dir_all(&dir).is_err() {
+        let fallback = std::env::temp_dir()
+            .join("lmux-state")
+            .join("app-profiles")
+            .join(&file);
+        std::fs::create_dir_all(&fallback).ok()?;
+        dir = fallback;
+    }
     clear_stale_chromium_singletons(&dir);
     Some(dir)
 }
@@ -123,7 +156,7 @@ fn clear_stale_chromium_singletons(dir: &std::path::Path) {
 /// the old JVM to "open project" and exits silently. If the old JVM was
 /// connected to a now-dead wayland socket, nothing appears on screen.
 /// The cockpit works around this by pointing each JetBrains satellite
-/// at its own isolated config/system/log/plugin dirs via `IDEA_PROPERTIES`.
+/// at its own isolated config/system/log/plugin dirs.
 fn is_jetbrains_family(cmd: &str) -> bool {
     let base = std::path::Path::new(cmd)
         .file_name()
@@ -253,23 +286,78 @@ fn kill_stale_jetbrains_jvms(props_path: &std::path::Path) {
     }
 }
 
+fn clear_stale_jetbrains_profile_locks(props_path: &std::path::Path) {
+    let Some(profile_dir) = props_path.parent() else {
+        return;
+    };
+    let pid_path = profile_dir.join("system").join(".pid");
+    let stale = std::fs::read_to_string(&pid_path)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .map(|pid| !process_is_alive(pid))
+        .unwrap_or(true);
+    if !stale {
+        return;
+    }
+
+    for path in [
+        pid_path,
+        profile_dir.join("system").join(".port"),
+        profile_dir.join("config").join(".lock"),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::info!(?path, "cleared stale JetBrains profile lock"),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::debug!(?path, error = %err, "JetBrains profile lock cleanup failed")
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
+}
+
 /// Persistent per-IDE isolated config dir. Writes an `idea.properties`
 /// file the first time it's needed, then returns that file's path — the
 /// caller sets `IDEA_PROPERTIES=<path>` on the child so the JVM routes
-/// config/system/log/plugins into lmux state. Subsequent launches of
-/// the same IDE share this dir so projects and settings persist across
-/// cockpit restarts, same convention as `chromium_profile_dir`.
+/// config/system/log/plugins into lmux state. On macOS callers pass a
+/// request suffix so every launch gets its own single-instance lock root.
+/// Other platforms keep the persistent per-IDE fallback, same convention
+/// as `chromium_profile_dir`.
 fn jetbrains_properties_file(cmd: &str) -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
-    let file = std::path::Path::new(cmd)
+    jetbrains_properties_file_named(cmd, None)
+}
+
+fn jetbrains_properties_file_named(cmd: &str, suffix: Option<&str>) -> Option<PathBuf> {
+    let base = state_base_dir();
+    let mut file = std::path::Path::new(cmd)
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("jetbrains");
-    let file = file.strip_suffix(".sh").unwrap_or(file);
-    let dir = base.join("lmux").join("jetbrains").join(file);
-    std::fs::create_dir_all(dir.join("config")).ok()?;
+        .unwrap_or("jetbrains")
+        .to_owned();
+    file = file.strip_suffix(".sh").unwrap_or(&file).to_owned();
+    if let Some(suffix) = suffix {
+        file.push('-');
+        file.push_str(suffix);
+    }
+    let mut dir = base.join("lmux").join("app-profiles").join(&file);
+    if std::fs::create_dir_all(dir.join("config")).is_err() {
+        let fallback = std::env::temp_dir()
+            .join("lmux-state")
+            .join("app-profiles")
+            .join(&file);
+        dir = fallback;
+        std::fs::create_dir_all(dir.join("config")).ok()?;
+    }
     std::fs::create_dir_all(dir.join("system")).ok()?;
     std::fs::create_dir_all(dir.join("log")).ok()?;
     std::fs::create_dir_all(dir.join("plugins")).ok()?;
@@ -284,7 +372,31 @@ fn jetbrains_properties_file(cmd: &str) -> Option<PathBuf> {
         );
         std::fs::write(&props_path, contents).ok()?;
     }
+    clear_stale_jetbrains_profile_locks(&props_path);
     Some(props_path)
+}
+
+fn isolated_jetbrains_properties_file(cmd: &str, request_id: Uuid) -> Option<PathBuf> {
+    macos_jetbrains_properties_file(cmd, request_id).or_else(|| jetbrains_properties_file(cmd))
+}
+
+fn apply_jetbrains_isolation_args(
+    cmd: &str,
+    request_id: Uuid,
+    args: &mut Vec<String>,
+) -> Option<PathBuf> {
+    let props = isolated_jetbrains_properties_file(cmd, request_id)?;
+    if !has_jvm_property(args, "idea.properties.file") {
+        args.insert(0, format!("-Didea.properties.file={}", props.display()));
+    }
+    Some(props)
+}
+
+fn state_base_dir() -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+        .unwrap_or_else(|| std::env::temp_dir().join("lmux-state"))
 }
 
 /// Fork+exec `argv` with `LMUX_SATELLITE_ID=<request_id>` set. Returns the
@@ -327,15 +439,27 @@ pub fn spawn_tagged_with_env(
     // + `--ozone-platform=wayland` so we always get a fresh, wayland-backed
     // process we can actually embed. Only applies under the nested socket.
     let mut owned_args: Vec<String> = rest.to_vec();
-    let chromium = wayland_display.is_some() && is_chromium_family(cmd);
+    #[cfg(target_os = "macos")]
+    if is_macos_open_command(cmd) {
+        ensure_macos_open_env(&mut owned_args, SATELLITE_ID_ENV, &request_id.to_string());
+    }
+    let chromium = should_isolate_chromium(wayland_display, cmd);
     if chromium {
         if !has_flag(&owned_args, "--user-data-dir") {
-            if let Some(dir) = chromium_profile_dir(cmd) {
+            let profile_dir =
+                macos_chromium_profile_dir(cmd, request_id).or_else(|| chromium_profile_dir(cmd));
+            if let Some(dir) = profile_dir {
                 owned_args.insert(0, format!("--user-data-dir={}", dir.display()));
             }
         }
-        if !has_flag(&owned_args, "--ozone-platform") {
-            owned_args.insert(0, "--ozone-platform=wayland".into());
+        #[cfg(target_os = "macos")]
+        if !has_flag(&owned_args, "--new-window") {
+            owned_args.insert(0, "--new-window".into());
+        }
+        if wayland_display.is_some() {
+            if !has_flag(&owned_args, "--ozone-platform") {
+                owned_args.insert(0, "--ozone-platform=wayland".into());
+            }
         }
         // --enable-logging=stderr surfaces Chrome's startup chatter to our
         // per-satellite stderr file instead of /var/log; without this Chrome
@@ -345,15 +469,17 @@ pub fn spawn_tagged_with_env(
             owned_args.insert(1, "--v=1".into());
         }
     }
-    // JetBrains IDEs single-instance-dispatch via `idea.lock` under
-    // `~/.config/JetBrains/…`. If a stale JVM from a previous cockpit
-    // run still holds the lock (connected to a now-dead wayland socket),
-    // new launches silently forward to it and nothing shows up in our
-    // nested compositor. Override `IDEA_PROPERTIES` so each cockpit gets
-    // its own config/system/log/plugin root — the lock lives there too,
-    // and stale JVMs from prior runs are invisible.
-    let jetbrains_props = if wayland_display.is_some() && is_jetbrains_family(cmd) {
-        let props = jetbrains_properties_file(cmd);
+    #[cfg(target_os = "macos")]
+    if is_vscode_family(cmd) && !has_flag(&owned_args, "--new-window") {
+        owned_args.insert(0, "--new-window".into());
+    }
+    // JetBrains IDEs single-instance-dispatch via `idea.lock` under the
+    // IDE config root. If a launch reuses the user's normal root, it can
+    // forward to an already-running IntelliJ and exits without creating a
+    // new lmux-owned window. Use a request-scoped `idea.properties` on
+    // macOS so each launch gets a fresh config/system/log/plugin root.
+    let jetbrains_props = if should_isolate_jetbrains(wayland_display, cmd) {
+        let props = apply_jetbrains_isolation_args(cmd, request_id, &mut owned_args);
         if let Some(p) = props.as_deref() {
             kill_stale_jetbrains_jvms(p);
         }
@@ -437,6 +563,65 @@ pub fn spawn_tagged_with_env(
     }
 }
 
+#[cfg(target_os = "macos")]
+fn macos_jetbrains_properties_file(cmd: &str, request_id: Uuid) -> Option<PathBuf> {
+    jetbrains_properties_file_named(cmd, Some(&request_id.to_string()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_jetbrains_properties_file(_cmd: &str, _request_id: Uuid) -> Option<PathBuf> {
+    None
+}
+
+fn should_isolate_chromium(wayland_display: Option<&str>, cmd: &str) -> bool {
+    is_chromium_family(cmd) && (wayland_display.is_some() || macos_target())
+}
+
+fn should_isolate_jetbrains(wayland_display: Option<&str>, cmd: &str) -> bool {
+    is_jetbrains_family(cmd) && (wayland_display.is_some() || macos_target())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_target() -> bool {
+    true
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_target() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn macos_chromium_profile_dir(cmd: &str, request_id: Uuid) -> Option<PathBuf> {
+    chromium_profile_dir_named(cmd, Some(&request_id.to_string()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_chromium_profile_dir(_cmd: &str, _request_id: Uuid) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn is_macos_open_command(cmd: &str) -> bool {
+    std::path::Path::new(cmd)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|name| name == "open")
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_macos_open_env(args: &mut Vec<String>, name: &str, value: &str) {
+    let assignment = format!("{name}={value}");
+    let already_set = args
+        .windows(2)
+        .any(|pair| pair[0] == "--env" && pair[1].starts_with(name));
+    if !already_set {
+        args.insert(0, assignment);
+        args.insert(0, "--env".into());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -455,5 +640,112 @@ mod tests {
             Err(CompositorError::Domain(_)) => {}
             other => panic!("expected Domain error, got {other:?}"),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_open_args_get_explicit_satellite_env() {
+        let mut args = vec!["-n".into(), "/Applications/Finder.app".into()];
+        ensure_macos_open_env(&mut args, SATELLITE_ID_ENV, "abc");
+        assert_eq!(
+            args,
+            vec![
+                "--env".to_string(),
+                "LMUX_SATELLITE_ID=abc".to_string(),
+                "-n".to_string(),
+                "/Applications/Finder.app".to_string()
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_recognizes_app_bundle_chromium_names() {
+        assert!(is_chromium_family(
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        ));
+        assert!(is_chromium_family(
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_recognizes_vscode_app_binary_name() {
+        assert!(is_vscode_family(
+            "/Applications/Visual Studio Code.app/Contents/MacOS/Code"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_chromium_uses_request_scoped_lmux_profile_dir() {
+        let first = macos_chromium_profile_dir("Google Chrome", Uuid::from_u128(0xfeed)).unwrap();
+        let second = macos_chromium_profile_dir("Google Chrome", Uuid::from_u128(0xbeef)).unwrap();
+
+        assert!(first.to_string_lossy().contains("Google Chrome"));
+        assert_ne!(first, second);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_jetbrains_uses_request_scoped_lmux_properties_dir() {
+        let first = macos_jetbrains_properties_file("idea", Uuid::from_u128(0x1234)).unwrap();
+        let second = macos_jetbrains_properties_file("idea", Uuid::from_u128(0x5678)).unwrap();
+
+        assert!(first.to_string_lossy().contains("app-profiles"));
+        assert_ne!(first, second);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_jetbrains_launch_adds_explicit_properties_argument() {
+        let request_id = Uuid::from_u128(0x9012);
+        let mut args = vec!["/tmp/project".to_string()];
+
+        let props = apply_jetbrains_isolation_args("idea", request_id, &mut args).unwrap();
+        let expected = format!("-Didea.properties.file={}", props.display());
+
+        assert_eq!(args.first().map(String::as_str), Some(expected.as_str()));
+        assert_eq!(args.get(1).map(String::as_str), Some("/tmp/project"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_jetbrains_launch_keeps_existing_properties_argument() {
+        let mut args = vec![
+            "-Didea.properties.file=/tmp/custom.properties".to_string(),
+            "/tmp/project".to_string(),
+        ];
+
+        let _props =
+            apply_jetbrains_isolation_args("idea", Uuid::from_u128(0x9013), &mut args).unwrap();
+
+        assert_eq!(
+            args,
+            vec![
+                "-Didea.properties.file=/tmp/custom.properties".to_string(),
+                "/tmp/project".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn clears_dead_jetbrains_profile_locks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path();
+        std::fs::create_dir_all(profile.join("config")).unwrap();
+        std::fs::create_dir_all(profile.join("system")).unwrap();
+        let props = profile.join("idea.properties");
+        std::fs::write(&props, "").unwrap();
+        std::fs::write(profile.join("system").join(".pid"), "999999").unwrap();
+        std::fs::write(profile.join("system").join(".port"), "").unwrap();
+        std::fs::write(profile.join("config").join(".lock"), "").unwrap();
+
+        clear_stale_jetbrains_profile_locks(&props);
+
+        assert!(!profile.join("system").join(".pid").exists());
+        assert!(!profile.join("system").join(".port").exists());
+        assert!(!profile.join("config").join(".lock").exists());
     }
 }

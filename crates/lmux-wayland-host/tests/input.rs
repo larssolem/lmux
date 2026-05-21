@@ -6,6 +6,7 @@
 //! `wl_keyboard` sees the matching key event. Also posts pointer
 //! motion + button and asserts `wl_pointer` sees `enter` + `button`.
 
+#![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used)]
 
 use std::sync::{Arc, Mutex};

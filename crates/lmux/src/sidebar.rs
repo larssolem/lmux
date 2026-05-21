@@ -18,18 +18,42 @@
 //! hook installed in [`install`].
 
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 
+use gtk4::pango::prelude::{FontFamilyExt, FontMapExt};
 use gtk4::prelude::*;
 use gtk4::{
-    gdk, glib, Align, Box as GtkBox, Button, DragSource, DropTarget, Entry, Label, ListBox,
-    Orientation, Paned, Picture, Popover, PositionType, ScrolledWindow,
+    gdk, glib, Align, Box as GtkBox, Button, DragSource, DropDown, DropTarget, Entry, Label,
+    ListBox, Orientation, Paned, Picture, Popover, PositionType, ScrolledWindow, StringObject,
 };
 
 use lmux_config::{Sidebar as SidebarCfg, SidebarPosition};
+#[cfg(target_os = "macos")]
+use lmux_macos_helper::WindowInfo as MacosWindowInfo;
+#[cfg(target_os = "macos")]
+use lmux_macos_helper::WindowPreview as MacosWindowPreview;
 
 use crate::layout::PaneId;
+use crate::pane::ShortcutPrefixCell;
 use crate::state::SharedAppState;
+
+type ActiveRows = Rc<RefCell<HashMap<PaneId, ActiveRow>>>;
+
+#[derive(Clone)]
+struct ActiveRow {
+    row: gtk4::Widget,
+    dot: Label,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct MacosWindowPickerItem {
+    window: MacosWindowInfo,
+    attached: Option<(PaneId, String)>,
+    attached_here: bool,
+}
 
 /// Install the sidebar around `pane_tree_root`. Returns the outer `Paned`
 /// widget the caller should set as the window's child.
@@ -60,20 +84,39 @@ pub fn install(cfg: SidebarCfg, pane_tree_root: GtkBox, state: SharedAppState) -
     new_anchor_btn.connect_clicked(move |_| {
         state_for_new.borrow_mut().create_new_anchor();
     });
-    // Launcher button: spotlight-style popover that scans installed
-    // .desktop entries and spawns the chosen one as a satellite.
-    let launcher_btn = Button::from_icon_name("system-search-symbolic");
-    launcher_btn.add_css_class("flat");
-    launcher_btn.set_tooltip_text(Some("Launch program (Ctrl+B l)"));
-    header.append(&launcher_btn);
-    let state_for_launcher = state.clone();
-    launcher_btn.connect_clicked(move |btn| {
-        if let Some(root) = btn.root() {
-            if let Ok(win) = root.downcast::<gtk4::ApplicationWindow>() {
-                crate::launcher::open(&win, &state_for_launcher);
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Launcher button: spotlight-style popover that scans installed GUI apps
+        // for the current platform and spawns the chosen one as a satellite.
+        let launcher_btn = Button::from_icon_name("system-search-symbolic");
+        launcher_btn.add_css_class("flat");
+        launcher_btn.set_tooltip_text(Some("Launch program (Ctrl+B l)"));
+        header.append(&launcher_btn);
+        let state_for_launcher = state.clone();
+        launcher_btn.connect_clicked(move |btn| {
+            if let Some(root) = btn.root() {
+                if let Ok(win) = root.downcast::<gtk4::ApplicationWindow>() {
+                    crate::launcher::open(&win, &state_for_launcher);
+                }
             }
-        }
-    });
+        });
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let attach_btn = Button::from_icon_name("insert-link-symbolic");
+        attach_btn.add_css_class("flat");
+        attach_btn.set_tooltip_text(Some("Attach macOS window"));
+        header.append(&attach_btn);
+        let state_for_attach = state.clone();
+        attach_btn.connect_clicked(move |btn| {
+            if let Some(root) = btn.root() {
+                if let Ok(win) = root.downcast::<gtk4::ApplicationWindow>() {
+                    open_macos_attach_picker(&win, &state_for_attach);
+                }
+            }
+        });
+    }
     sidebar_box.append(&header);
 
     // Anchor list inside a scroller.
@@ -126,13 +169,26 @@ pub fn install(cfg: SidebarCfg, pane_tree_root: GtkBox, state: SharedAppState) -
         enabled: cfg.preview_enabled,
         refresh_ms: cfg.preview_refresh_ms,
     };
-    refresh_list(&list, &state, preview_cfg);
+    let active_rows: ActiveRows = Rc::new(RefCell::new(HashMap::new()));
+    refresh_list(&list, &state, preview_cfg, &active_rows);
     let list_for_cb = list.clone();
     let state_for_cb = state.clone();
+    let active_rows_for_cb = active_rows.clone();
     state
         .borrow_mut()
         .set_anchors_changed_callback(Rc::new(move || {
-            refresh_list(&list_for_cb, &state_for_cb, preview_cfg);
+            refresh_list(
+                &list_for_cb,
+                &state_for_cb,
+                preview_cfg,
+                &active_rows_for_cb,
+            );
+        }));
+    let active_rows_for_active = active_rows.clone();
+    state
+        .borrow_mut()
+        .add_active_anchor_changed_callback(Rc::new(move |active| {
+            update_active_rows(&active_rows_for_active, active);
         }));
 
     paned.upcast()
@@ -158,10 +214,16 @@ struct PreviewCfg {
 /// set. v1 is flat + grouped — each group becomes a subheader followed by
 /// its anchor rows. Within a group rows are ordered by `sort_key` (ASC),
 /// then display label, so drag-to-reorder writes survive a refresh.
-fn refresh_list(list: &ListBox, state: &SharedAppState, preview: PreviewCfg) {
+fn refresh_list(
+    list: &ListBox,
+    state: &SharedAppState,
+    preview: PreviewCfg,
+    active_rows: &ActiveRows,
+) {
     while let Some(row) = list.first_child() {
         list.remove(&row);
     }
+    active_rows.borrow_mut().clear();
     let s = state.borrow();
     // Build (group, sort_key, pane_id, label) tuples so we can sort by the
     // registry's manual ordering ahead of label.
@@ -177,17 +239,7 @@ fn refresh_list(list: &ListBox, state: &SharedAppState, preview: PreviewCfg) {
         };
         rows.push((group, sort_key, pane_id, label));
     }
-    rows.sort_by(|a, b| {
-        let group_cmp = match (&a.0, &b.0) {
-            (Some(x), Some(y)) => x.cmp(y),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        };
-        group_cmp
-            .then_with(|| a.1.cmp(&b.1))
-            .then_with(|| a.3.cmp(&b.3))
-    });
+    sort_sidebar_rows(&mut rows);
     drop(s);
 
     if rows.is_empty() {
@@ -239,8 +291,35 @@ fn refresh_list(list: &ListBox, state: &SharedAppState, preview: PreviewCfg) {
             is_active,
             state.clone(),
             preview,
+            active_rows.clone(),
         );
         list.append(&row);
+    }
+}
+
+fn sort_sidebar_rows(rows: &mut [(Option<String>, i64, PaneId, String)]) {
+    rows.sort_by(|a, b| {
+        let group_cmp = match (&a.0, &b.0) {
+            (Some(x), Some(y)) => x.cmp(y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        };
+        group_cmp
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+}
+
+fn update_active_rows(active_rows: &ActiveRows, active: Option<PaneId>) {
+    for (pane_id, active_row) in active_rows.borrow().iter() {
+        let is_active = Some(*pane_id) == active;
+        if is_active {
+            active_row.row.add_css_class("lmux-sidebar__row--active");
+        } else {
+            active_row.row.remove_css_class("lmux-sidebar__row--active");
+        }
+        active_row.dot.set_visible(is_active);
     }
 }
 
@@ -255,6 +334,7 @@ fn build_row(
     is_active: bool,
     state: SharedAppState,
     preview: PreviewCfg,
+    active_rows: ActiveRows,
 ) -> gtk4::Widget {
     let row = GtkBox::new(Orientation::Vertical, 2);
     row.add_css_class("lmux-sidebar__row");
@@ -321,11 +401,17 @@ fn build_row(
     title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     header_row.append(&title);
 
-    if is_active {
-        let dot = Label::new(Some("●"));
-        dot.add_css_class("lmux-sidebar__active-dot");
-        header_row.append(&dot);
-    }
+    let dot = Label::new(Some("●"));
+    dot.add_css_class("lmux-sidebar__active-dot");
+    dot.set_visible(is_active);
+    header_row.append(&dot);
+    active_rows.borrow_mut().insert(
+        pane_id,
+        ActiveRow {
+            row: row.clone().upcast(),
+            dot: dot.clone(),
+        },
+    );
 
     if preview.enabled {
         attach_preview(&row, pane_id, &state, preview.refresh_ms);
@@ -400,7 +486,15 @@ fn attach_preview(row: &GtkBox, pane_id: PaneId, state: &SharedAppState, refresh
 
     // Render once immediately so the row doesn't flash blank before the
     // first timer tick.
-    if let Some((cols, rows, bytes)) = state.borrow().pane_thumbnail(pane_id) {
+    let initial = {
+        let state = state.borrow();
+        if !state.pane_in_active_workspace(pane_id) || state.is_anchor_hidden(pane_id) {
+            None
+        } else {
+            state.pane_thumbnail(pane_id)
+        }
+    };
+    if let Some((cols, rows, bytes)) = initial {
         picture.set_paintable(Some(&rgb_texture(cols, rows, bytes)));
     }
 
@@ -415,7 +509,15 @@ fn attach_preview(row: &GtkBox, pane_id: PaneId, state: &SharedAppState, refresh
             let Some(state) = state_weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
-            if let Some((cols, rows, bytes)) = state.borrow().pane_thumbnail(pane_id) {
+            let snapshot = {
+                let state = state.borrow();
+                if !state.pane_in_active_workspace(pane_id) || state.is_anchor_hidden(pane_id) {
+                    None
+                } else {
+                    state.pane_thumbnail(pane_id)
+                }
+            };
+            if let Some((cols, rows, bytes)) = snapshot {
                 picture.set_paintable(Some(&rgb_texture(cols, rows, bytes)));
             }
             glib::ControlFlow::Continue
@@ -433,6 +535,317 @@ fn rgb_texture(cols: u32, rows: u32, bytes: Vec<u8>) -> gdk::MemoryTexture {
         &glib_bytes,
         stride,
     )
+}
+
+#[cfg(target_os = "macos")]
+fn open_macos_attach_picker(parent: &gtk4::ApplicationWindow, state: &SharedAppState) {
+    let dialog = gtk4::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .title("Attach window")
+        .default_width(640)
+        .default_height(460)
+        .build();
+
+    let body = GtkBox::new(Orientation::Vertical, 8);
+    body.set_margin_top(10);
+    body.set_margin_bottom(10);
+    body.set_margin_start(10);
+    body.set_margin_end(10);
+
+    let heading = Label::new(Some("Attach window"));
+    heading.set_xalign(0.0);
+    heading.add_css_class("heading");
+    body.append(&heading);
+
+    let list = ListBox::new();
+    list.set_selection_mode(gtk4::SelectionMode::None);
+    list.set_activate_on_single_click(true);
+    list.add_css_class("lmux-window-picker");
+
+    match lmux_macos_helper::list_windows(None, None) {
+        Ok(windows) if windows.is_empty() => {
+            let empty = Label::new(Some("No windows found"));
+            empty.set_xalign(0.0);
+            empty.add_css_class("dim-label");
+            list.append(&empty);
+        }
+        Ok(windows) => {
+            let items = Rc::new(macos_window_picker_items(windows, state));
+            for item in items.iter() {
+                let row = gtk4::ListBoxRow::new();
+                row.set_activatable(true);
+                row.set_selectable(false);
+                row.set_child(Some(&macos_window_picker_row(item)));
+                list.append(&row);
+            }
+
+            let state_for_activate = state.clone();
+            let items_for_activate = items.clone();
+            let dialog_for_activate = dialog.clone();
+            list.connect_row_activated(move |_, row| {
+                let Ok(index) = usize::try_from(row.index()) else {
+                    return;
+                };
+                let Some(item) = items_for_activate.get(index).cloned() else {
+                    return;
+                };
+                if let Err(err) = state_for_activate
+                    .borrow_mut()
+                    .attach_macos_window_to_active_anchor(item.window)
+                {
+                    tracing::warn!(error = %err, "attach selected macOS window failed");
+                    return;
+                }
+                dialog_for_activate.close();
+            });
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "macOS window picker failed to list windows");
+            let error = Label::new(Some("Could not list windows"));
+            error.set_xalign(0.0);
+            error.add_css_class("dim-label");
+            list.append(&error);
+        }
+    }
+
+    let scroll = ScrolledWindow::new();
+    scroll.set_vexpand(true);
+    scroll.set_hscrollbar_policy(gtk4::PolicyType::Never);
+    scroll.set_child(Some(&list));
+    body.append(&scroll);
+
+    let footer = GtkBox::new(Orientation::Horizontal, 6);
+    footer.set_halign(Align::End);
+    let cancel = Button::with_label("Cancel");
+    footer.append(&cancel);
+    body.append(&footer);
+
+    let dialog_for_cancel = dialog.clone();
+    cancel.connect_clicked(move |_| dialog_for_cancel.close());
+
+    dialog.set_child(Some(&body));
+    dialog.present();
+}
+
+#[cfg(target_os = "macos")]
+fn macos_window_picker_items(
+    windows: Vec<MacosWindowInfo>,
+    state: &SharedAppState,
+) -> Vec<MacosWindowPickerItem> {
+    let state = state.borrow();
+    let active_anchor = state.active_anchor();
+    let mut items: Vec<_> = windows
+        .into_iter()
+        .map(|window| {
+            let attached = state.macos_attached_anchor_for_window(&window);
+            let attached_here = attached
+                .as_ref()
+                .map(|(anchor, _)| Some(*anchor) == active_anchor)
+                .unwrap_or(false);
+            MacosWindowPickerItem {
+                window,
+                attached,
+                attached_here,
+            }
+        })
+        .collect();
+    items.sort_by(|a, b| {
+        macos_window_picker_item_rank(a)
+            .cmp(&macos_window_picker_item_rank(b))
+            .then_with(|| a.window.pid.cmp(&b.window.pid))
+            .then_with(|| a.window.window_index.cmp(&b.window.window_index))
+            .then_with(|| macos_window_title(&a.window).cmp(&macos_window_title(&b.window)))
+    });
+    items
+}
+
+#[cfg(target_os = "macos")]
+fn macos_window_picker_item_rank(item: &MacosWindowPickerItem) -> u8 {
+    if item.attached_here {
+        0
+    } else if item.attached.is_some() {
+        1
+    } else {
+        2
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_window_picker_row(item: &MacosWindowPickerItem) -> gtk4::Widget {
+    let row = GtkBox::new(Orientation::Horizontal, 10);
+    row.add_css_class("lmux-window-picker__row");
+    if item.attached_here {
+        row.add_css_class("lmux-window-picker__row--attached-active");
+    } else if item.attached.is_some() {
+        row.add_css_class("lmux-window-picker__row--attached-other");
+    }
+    row.set_margin_top(6);
+    row.set_margin_bottom(6);
+    row.set_margin_start(6);
+    row.set_margin_end(6);
+
+    row.append(&macos_window_preview_tile(&item.window));
+
+    let text = GtkBox::new(Orientation::Vertical, 3);
+    text.set_hexpand(true);
+    text.set_valign(Align::Center);
+
+    let title = Label::new(Some(&macos_window_title(&item.window)));
+    title.set_xalign(0.0);
+    title.set_hexpand(true);
+    title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    text.append(&title);
+
+    let meta = Label::new(Some(&macos_window_meta(&item.window)));
+    meta.set_xalign(0.0);
+    meta.add_css_class("lmux-window-picker__meta");
+    meta.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    text.append(&meta);
+
+    if let Some((_, label)) = &item.attached {
+        let attached_text = if item.attached_here {
+            "Active anchor".to_string()
+        } else {
+            format!("Other anchor: {label}")
+        };
+        let attached = Label::new(Some(&attached_text));
+        attached.set_xalign(0.0);
+        if item.attached_here {
+            attached.add_css_class("lmux-window-picker__attached-active");
+        } else {
+            attached.add_css_class("lmux-window-picker__attached-other");
+        }
+        text.append(&attached);
+    }
+
+    row.append(&text);
+
+    let attach_text = if item.attached_here {
+        "Active"
+    } else if item.attached.is_some() {
+        "Move here"
+    } else {
+        "Attach"
+    };
+    let attach = Label::new(Some(attach_text));
+    if item.attached_here {
+        attach.add_css_class("lmux-window-picker__attached-active");
+    } else if item.attached.is_some() {
+        attach.add_css_class("lmux-window-picker__attached-other");
+    } else {
+        attach.add_css_class("dim-label");
+    }
+    attach.set_valign(Align::Center);
+    row.append(&attach);
+
+    row.upcast()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_window_preview_tile(window: &MacosWindowInfo) -> gtk4::Widget {
+    let tile = GtkBox::new(Orientation::Vertical, 0);
+    tile.add_css_class("lmux-window-picker__preview");
+    tile.set_size_request(118, 66);
+    tile.set_valign(Align::Center);
+
+    match lmux_macos_helper::window_preview(window, 118, 66) {
+        Ok(Some(preview)) => {
+            let picture = Picture::new();
+            picture.set_content_fit(gtk4::ContentFit::Contain);
+            picture.set_paintable(Some(&bgra_texture(preview)));
+            tile.append(&picture);
+        }
+        Ok(None) => {
+            macos_window_preview_fallback(&tile, window);
+        }
+        Err(err) => {
+            tracing::debug!(error = %err, "macOS window preview capture failed");
+            macos_window_preview_fallback(&tile, window);
+        }
+    }
+
+    tile.upcast()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_window_preview_fallback(tile: &GtkBox, window: &MacosWindowInfo) {
+    tile.add_css_class("lmux-window-picker__preview--missing");
+    let text = format!("{}\nNo preview", macos_window_initials(window));
+    let fallback = Label::new(Some(&text));
+    fallback.add_css_class("lmux-window-picker__preview-text");
+    fallback.set_halign(Align::Center);
+    fallback.set_valign(Align::Center);
+    fallback.set_justify(gtk4::Justification::Center);
+    fallback.set_hexpand(true);
+    fallback.set_vexpand(true);
+    tile.append(&fallback);
+}
+
+#[cfg(target_os = "macos")]
+fn bgra_texture(preview: MacosWindowPreview) -> gdk::MemoryTexture {
+    let glib_bytes = glib::Bytes::from_owned(preview.bgra);
+    gdk::MemoryTexture::new(
+        preview.width as i32,
+        preview.height as i32,
+        gdk::MemoryFormat::B8g8r8a8Premultiplied,
+        &glib_bytes,
+        preview.bytes_per_row,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_window_title(window: &MacosWindowInfo) -> String {
+    window
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or("(untitled window)")
+        .to_string()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_window_meta(window: &MacosWindowInfo) -> String {
+    let app = window
+        .bundle_id
+        .as_deref()
+        .and_then(|bundle| bundle.rsplit('.').next())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("macOS");
+    let id = window
+        .window_id
+        .map(|id| format!("id {id}"))
+        .unwrap_or_else(|| "no id".to_string());
+    format!(
+        "{app} · pid {} · window {} · {id}",
+        window.pid, window.window_index
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_window_initials(window: &MacosWindowInfo) -> String {
+    let source = window
+        .bundle_id
+        .as_deref()
+        .and_then(|bundle| bundle.rsplit('.').next())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| macos_window_title(window));
+    let mut initials = String::new();
+    for word in source.split(|c: char| !c.is_alphanumeric()) {
+        if let Some(ch) = word.chars().next() {
+            initials.extend(ch.to_uppercase());
+        }
+        if initials.chars().count() >= 2 {
+            break;
+        }
+    }
+    if initials.is_empty() {
+        "W".to_string()
+    } else {
+        initials
+    }
 }
 
 fn show_row_popover(
@@ -573,6 +986,253 @@ fn trim_to_option(s: &gtk4::glib::GString) -> Option<String> {
     }
 }
 
+pub(crate) fn open_settings_dialog(
+    parent: &gtk4::ApplicationWindow,
+    state: &SharedAppState,
+    shortcut_prefix: ShortcutPrefixCell,
+) {
+    let dialog = gtk4::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .title("Settings")
+        .default_width(420)
+        .default_height(420)
+        .build();
+
+    let body = GtkBox::new(Orientation::Vertical, 8);
+    body.set_margin_top(12);
+    body.set_margin_bottom(12);
+    body.set_margin_start(12);
+    body.set_margin_end(12);
+
+    let heading = Label::new(Some("Settings"));
+    heading.set_xalign(0.0);
+    heading.add_css_class("heading");
+    body.append(&heading);
+
+    match load_settings_config() {
+        Ok((cfg, path)) => {
+            append_settings_controls(&body, &dialog, state, cfg, path, shortcut_prefix)
+        }
+        Err(message) => append_settings_error(&body, &dialog, &message),
+    }
+
+    let scroll = ScrolledWindow::new();
+    scroll.set_min_content_width(420);
+    scroll.set_min_content_height(320);
+    scroll.set_vexpand(true);
+    scroll.set_hscrollbar_policy(gtk4::PolicyType::Never);
+    scroll.set_child(Some(&body));
+
+    dialog.set_child(Some(&scroll));
+    dialog.present();
+}
+
+fn load_settings_config() -> Result<(lmux_config::Config, PathBuf), String> {
+    let path =
+        lmux_config::config_path().ok_or_else(|| "Could not find a config path".to_string())?;
+    let cfg = lmux_config::load(&path).map_err(|err| format!("Could not load config: {err}"))?;
+    Ok((cfg, path))
+}
+
+fn append_settings_controls(
+    body: &GtkBox,
+    dialog: &gtk4::Window,
+    state: &SharedAppState,
+    cfg: lmux_config::Config,
+    path: PathBuf,
+    shortcut_prefix: ShortcutPrefixCell,
+) {
+    let font_label = Label::new(Some("Font family"));
+    font_label.set_xalign(0.0);
+    font_label.add_css_class("dim-label");
+    body.append(&font_label);
+
+    let font_combo = build_font_combo(body, &cfg.general.font_family);
+    body.append(&font_combo);
+
+    let size_label = Label::new(Some("Font size"));
+    size_label.set_xalign(0.0);
+    size_label.add_css_class("dim-label");
+    body.append(&size_label);
+
+    let size_spin = gtk4::SpinButton::with_range(6.0, 48.0, 1.0);
+    size_spin.set_numeric(true);
+    size_spin.set_digits(0);
+    size_spin.set_value(cfg.general.font_size.clamp(6, 48) as f64);
+    body.append(&size_spin);
+
+    let keymap_heading = Label::new(Some("Keyboard shortcuts"));
+    keymap_heading.set_xalign(0.0);
+    keymap_heading.add_css_class("heading");
+    keymap_heading.set_margin_top(8);
+    body.append(&keymap_heading);
+
+    let prefix_label = Label::new(Some("Prefix"));
+    prefix_label.set_xalign(0.0);
+    prefix_label.add_css_class("dim-label");
+    body.append(&prefix_label);
+
+    let prefix_entry = Entry::new();
+    prefix_entry.set_text(&cfg.keymap.prefix);
+    prefix_entry.set_placeholder_text(Some("ctrl+b"));
+    body.append(&prefix_entry);
+
+    let prefix_error = Label::new(None);
+    prefix_error.set_xalign(0.0);
+    prefix_error.set_wrap(true);
+    prefix_error.add_css_class("error");
+    prefix_error.set_visible(false);
+    body.append(&prefix_error);
+
+    append_shortcut_hint(body, "Split right", "|", &cfg.keymap.prefix);
+    append_shortcut_hint(body, "Split down", "-", &cfg.keymap.prefix);
+    append_shortcut_hint(body, "Close pane", "x", &cfg.keymap.prefix);
+    append_shortcut_hint(body, "Next pane", "o", &cfg.keymap.prefix);
+    append_shortcut_hint(body, "Previous pane", "p", &cfg.keymap.prefix);
+    append_shortcut_hint(body, "Rearrange mode", "m", &cfg.keymap.prefix);
+
+    let footer = GtkBox::new(Orientation::Horizontal, 6);
+    footer.set_halign(Align::End);
+    let cancel = Button::with_label("Cancel");
+    let apply = Button::with_label("Apply");
+    apply.add_css_class("suggested-action");
+    footer.append(&cancel);
+    footer.append(&apply);
+    body.append(&footer);
+
+    let dialog_for_cancel = dialog.clone();
+    cancel.connect_clicked(move |_| dialog_for_cancel.close());
+
+    let cfg_for_apply = cfg.clone();
+    let path_for_apply = path.clone();
+    let state_for_apply = state.clone();
+    let dialog_for_apply = dialog.clone();
+    let font_combo_apply = font_combo.clone();
+    let size_spin_apply = size_spin.clone();
+    let prefix_entry_apply = prefix_entry.clone();
+    let prefix_error_apply = prefix_error.clone();
+    let shortcut_prefix_apply = shortcut_prefix;
+    apply.connect_clicked(move |_| {
+        let applied = apply_settings_config(
+            cfg_for_apply.clone(),
+            path_for_apply.clone(),
+            &state_for_apply,
+            &font_combo_apply,
+            &size_spin_apply,
+            &prefix_entry_apply,
+            &prefix_error_apply,
+            &shortcut_prefix_apply,
+        );
+        if applied {
+            dialog_for_apply.close();
+        }
+    });
+}
+
+fn apply_settings_config(
+    mut cfg: lmux_config::Config,
+    path: PathBuf,
+    state: &SharedAppState,
+    font_combo: &DropDown,
+    size_spin: &gtk4::SpinButton,
+    prefix_entry: &Entry,
+    prefix_error: &Label,
+    shortcut_prefix: &ShortcutPrefixCell,
+) -> bool {
+    if let Some(family) = selected_font_family(font_combo) {
+        cfg.general.font_family = family;
+    }
+    cfg.general.font_size = size_spin.value_as_int().clamp(6, 48) as u32;
+    let prefix = prefix_entry.text().trim().to_string();
+    if !prefix.is_empty() {
+        if !crate::app::is_valid_prefix_binding(&prefix) {
+            prefix_error.set_text("Use a prefix like ctrl+b, ctrl+shift+k, alt+x, or cmd+k.");
+            prefix_error.set_visible(true);
+            prefix_entry.grab_focus();
+            return false;
+        }
+        prefix_error.set_visible(false);
+        cfg.keymap.prefix = prefix.clone();
+        *shortcut_prefix.borrow_mut() = prefix;
+    }
+    state.borrow().apply_config(&cfg);
+    if let Err(err) = lmux_config::save(&path, &cfg) {
+        tracing::warn!(error = %err, path = %path.display(), "settings: config save failed");
+    }
+    true
+}
+
+fn append_shortcut_hint(body: &GtkBox, action: &str, key: &str, prefix: &str) {
+    let row = GtkBox::new(Orientation::Horizontal, 12);
+    let label = Label::new(Some(action));
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    row.append(&label);
+
+    let shortcut = Label::new(Some(&format!("{} {}", prefix.trim(), key)));
+    shortcut.add_css_class("dim-label");
+    shortcut.add_css_class("monospace");
+    row.append(&shortcut);
+    body.append(&row);
+}
+
+fn build_font_combo(source: &GtkBox, current_family: &str) -> DropDown {
+    let mut families = system_font_families(source);
+    if !families.iter().any(|family| family == current_family) {
+        families.insert(0, current_family.to_string());
+    }
+    let family_refs: Vec<_> = families.iter().map(String::as_str).collect();
+    let combo = DropDown::from_strings(&family_refs);
+    combo.set_hexpand(true);
+    combo.set_enable_search(true);
+    combo.set_tooltip_text(Some("System font family"));
+    if let Some(index) = families.iter().position(|family| family == current_family) {
+        combo.set_selected(index as u32);
+    }
+    combo
+}
+
+fn system_font_families(source: &GtkBox) -> Vec<String> {
+    let Some(font_map) = source.pango_context().font_map() else {
+        return Vec::new();
+    };
+    let mut families: Vec<_> = font_map
+        .list_families()
+        .into_iter()
+        .map(|family| family.name().to_string())
+        .filter(|name| !name.trim().is_empty())
+        .collect();
+    families.sort_by_key(|family| family.to_ascii_lowercase());
+    families.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    families
+}
+
+fn selected_font_family(font_combo: &DropDown) -> Option<String> {
+    font_combo
+        .selected_item()
+        .and_then(|item| item.downcast::<StringObject>().ok())
+        .map(|item| item.string().trim().to_string())
+        .filter(|family| !family.is_empty())
+}
+
+fn append_settings_error(body: &GtkBox, dialog: &gtk4::Window, message: &str) {
+    let error = Label::new(Some(message));
+    error.set_xalign(0.0);
+    error.set_wrap(true);
+    error.add_css_class("dim-label");
+    body.append(&error);
+
+    let footer = GtkBox::new(Orientation::Horizontal, 6);
+    footer.set_halign(Align::End);
+    let close = Button::with_label("Close");
+    footer.append(&close);
+    body.append(&footer);
+
+    let dialog_for_close = dialog.clone();
+    close.connect_clicked(move |_| dialog_for_close.close());
+}
+
 /// Dispatcher hook used from `app::activate` when the GTK config reports no
 /// sidebar (future: user disables it). Currently never taken — config
 /// always produces a `Sidebar` — kept for the eventual opt-out.
@@ -600,4 +1260,36 @@ pub fn load_config() -> SidebarCfg {
 #[allow(dead_code)]
 fn _keep_glib_linked() {
     let _ = glib::MainContext::default;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sidebar_sort_tie_breaker_ignores_label() {
+        let mut rows = vec![
+            (None, 0, 2, "Alpha".to_string()),
+            (None, 0, 1, "Zulu".to_string()),
+        ];
+
+        sort_sidebar_rows(&mut rows);
+
+        let pane_ids: Vec<PaneId> = rows.into_iter().map(|(_, _, pane_id, _)| pane_id).collect();
+        assert_eq!(pane_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn sidebar_sort_places_newer_higher_sort_key_later() {
+        let mut rows = vec![
+            (None, 2, 3, "Newest".to_string()),
+            (None, 0, 1, "First".to_string()),
+            (None, 1, 2, "Second".to_string()),
+        ];
+
+        sort_sidebar_rows(&mut rows);
+
+        let pane_ids: Vec<PaneId> = rows.into_iter().map(|(_, _, pane_id, _)| pane_id).collect();
+        assert_eq!(pane_ids, vec![1, 2, 3]);
+    }
 }

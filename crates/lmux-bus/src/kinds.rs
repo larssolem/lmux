@@ -108,6 +108,18 @@ pub enum SatelliteState {
     FloatingFallback,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MacosWindowCandidate {
+    pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_id: Option<i64>,
+    pub window_index: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
 /// The v0.2 bus kind catalog. Tag is the envelope's `kind` field.
 ///
 /// Note: this enum participates in tagged deserialization via
@@ -164,6 +176,10 @@ pub enum Kind {
     // ---- anchor.* ----
     #[serde(rename = "anchor.tag")]
     AnchorTag { pane_id: Uuid },
+    #[serde(rename = "anchor.new")]
+    AnchorNew {},
+    #[serde(rename = "anchor.activate")]
+    AnchorActivate { pane_id: Uuid },
     #[serde(rename = "anchor.untag")]
     AnchorUntag { pane_id: Uuid },
     #[serde(rename = "anchor.pause")]
@@ -191,6 +207,24 @@ pub enum Kind {
     SatelliteDetach { pane_id: Uuid },
     #[serde(rename = "satellite.reattach")]
     SatelliteReattach { pane_id: Uuid },
+    #[serde(rename = "satellite.attach_focused")]
+    SatelliteAttachFocused {},
+    #[serde(rename = "satellite.list_windows")]
+    SatelliteListWindows {},
+    #[serde(rename = "satellite.list_windows.result")]
+    SatelliteListWindowsResult { windows: Vec<MacosWindowCandidate> },
+    #[serde(rename = "satellite.attach_window")]
+    SatelliteAttachWindow {
+        pid: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window_id: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window_index: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bundle_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
     #[serde(rename = "satellite.map")]
     SatelliteMap {
         request_id: Uuid,
@@ -492,6 +526,24 @@ mod tests {
             },
             Kind::SatelliteReattach {
                 pane_id: Uuid::nil(),
+            },
+            Kind::SatelliteAttachFocused {},
+            Kind::SatelliteListWindows {},
+            Kind::SatelliteListWindowsResult {
+                windows: vec![MacosWindowCandidate {
+                    pid: 42,
+                    window_id: Some(1001),
+                    window_index: 1,
+                    bundle_id: Some("com.example.App".into()),
+                    title: Some("Example".into()),
+                }],
+            },
+            Kind::SatelliteAttachWindow {
+                pid: 42,
+                window_id: Some(1001),
+                window_index: Some(1),
+                bundle_id: Some("com.example.App".into()),
+                title: Some("Example".into()),
             },
             Kind::CompositorReinject {},
         ];

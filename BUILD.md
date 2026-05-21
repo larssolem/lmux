@@ -3,7 +3,7 @@
 ## Prerequisites
 
 - **Rust stable ≥ 1.93** — `rustup toolchain install stable`
-- **Zig ≥ 0.15.2** — required to build vendored `libghostty-vt` (fetched from source as a pinned Zig package during the first build)
+- **Zig 0.15.2** — required to build vendored `libghostty-vt` (fetched from source as a pinned Zig package during the first build). On macOS 26+, keep a compatible Command Line Tools SDK such as `MacOSX15.4.sdk` installed; the build script will select it automatically when Xcode's default `MacOSX.sdk` points at a newer SDK that Zig 0.15.2 cannot link against.
 - **GTK 4 ≥ 4.12** with development headers — on Arch/Manjaro: `pacman -S gtk4 pango cairo`; on Debian/Ubuntu: `apt install libgtk-4-dev libpango1.0-dev libcairo2-dev`
 - **Wayland session** (X11 is not exercised; GTK4 still starts but some features are Wayland-first)
 - **pkg-config** — for locating GTK/Pango/Cairo
@@ -52,6 +52,17 @@ macOS work-in-progress notes live in [docs/macos-port.md](docs/macos-port.md).
 The first supported path is a native build on Apple hardware; Docker is not
 used for macOS GUI E2E because the tests need the macOS window server and
 Accessibility permissions.
+
+Chrome-family and JetBrains-family apps launched from lmux use persistent
+lmux-managed profiles under `~/.local/state/lmux/app-profiles/` unless
+`XDG_STATE_HOME` overrides the state base. Remove the relevant app directory
+there to reset an lmux-managed app profile; this does not delete the user's
+normal browser or IDE profile.
+
+macOS GUI ownership is per window, not per bundle. `lmux-macos-helper` lists
+windows with CoreGraphics ids and lmux only controls windows correlated to a
+tracked lmux launch. If a safe launched window is missed, use the sidebar link
+button or the bus kind `satellite.attach_focused` while that window is focused.
 
 ### Pre-commit hook
 
@@ -123,6 +134,7 @@ Verifies p50 ≤ 250 ms and p95 ≤ 500 ms from BEL byte arrival to freedesktop 
 
 ## Troubleshooting
 
-- **`zig: command not found`** — install Zig 0.15.2+; set `ZIG=/path/to/zig` if not on `$PATH`
+- **`zig: command not found`** — install Zig 0.15.2; set `ZIG=/path/to/zig` if not on `$PATH`
+- **macOS 26+: `undefined symbol: _abort` / `_dispatch_*` during `zig build`** — Apple's newer SDKs can omit `arm64-macos` slices that Zig 0.15.2 needs while linking its native build runner. Install Command Line Tools that include a compatible SDK such as `MacOSX15.4.sdk`; `crates/lmux-libghostty/build.rs` detects that SDK and uses a local `xcrun` shim for the Zig process without modifying Apple's SDK files.
 - **`Package gtk4 not found`** — install GTK4 dev headers (see Prereqs)
 - **First build is slow** — Zig downloads + builds libghostty-vt from source; subsequent builds reuse the Zig cache

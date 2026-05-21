@@ -1142,6 +1142,7 @@ dependencies = [
  "lmux-control",
  "lmux-layout",
  "lmux-libghostty",
+ "lmux-macos-helper",
  "lmux-notify",
  "lmux-pty",
  "lmux-session",
@@ -1210,7 +1211,9 @@ dependencies = [
  "async-trait",
  "libc",
  "lmux-bus",
+ "lmux-macos-helper",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -1269,6 +1272,18 @@ name = "lmux-libghostty"
 version = "0.1.0-dev"
 dependencies = [
  "bindgen",
+]
+
+[[package]]
+name = "lmux-macos-helper"
+version = "0.1.0-dev"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

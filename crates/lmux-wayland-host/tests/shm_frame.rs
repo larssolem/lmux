@@ -6,6 +6,7 @@
 //! asserts that `HostEvent::FrameReady` arrives with the same pixels
 //! (byte-swizzled ARGB→RGB) at the correct dimensions.
 
+#![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used)]
 
 use std::io::{Seek, SeekFrom, Write};

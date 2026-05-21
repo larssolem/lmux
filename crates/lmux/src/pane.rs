@@ -8,8 +8,9 @@ use gtk4::glib;
 use gtk4::pango;
 use gtk4::prelude::*;
 use gtk4::{
-    DragSource, DrawingArea, DropTarget, EventControllerMotion, EventControllerScroll,
-    EventControllerScrollFlags, Frame, GestureClick, GestureDrag,
+    Align, Box as GtkBox, Button, DragSource, DrawingArea, DropTarget, EventControllerMotion,
+    EventControllerScroll, EventControllerScrollFlags, Frame, GestureClick, GestureDrag, Label,
+    Orientation, Popover,
 };
 use lmux_config::FocusMode;
 use lmux_libghostty::{
@@ -27,7 +28,18 @@ const INIT_COLS: u16 = 100;
 const INIT_ROWS: u16 = 30;
 const SCROLLBACK: usize = 10_000;
 const READER_CHAN_CAPACITY: usize = 64;
-const FONT_SPEC: &str = "monospace 13";
+#[cfg(target_os = "macos")]
+const DEFAULT_FONT_FAMILY: &str = "JetBrains Mono";
+#[cfg(target_os = "linux")]
+const DEFAULT_FONT_FAMILY: &str = "monospace";
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const DEFAULT_FONT_FAMILY: &str = "monospace";
+#[cfg(target_os = "macos")]
+const DEFAULT_FONT_SIZE_PT: i32 = 13;
+#[cfg(target_os = "linux")]
+const DEFAULT_FONT_SIZE_PT: i32 = 13;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const DEFAULT_FONT_SIZE_PT: i32 = 13;
 
 // Minimum pane geometry — keeps `gtk::Paned` from shrinking a pane so far
 // that it becomes unusable or hidden (FR17, Story 3.4).
@@ -36,6 +48,19 @@ const MIN_ROWS: i32 = 3;
 
 pub type FocusCallback = Rc<dyn Fn(PaneId)>;
 pub type BellCallback = Rc<dyn Fn(PaneId)>;
+pub type TerminalActionCallback = Rc<dyn Fn(PaneId, TerminalContextAction)>;
+pub type ShortcutPrefixCell = Rc<RefCell<String>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalContextAction {
+    SplitRight,
+    SplitDown,
+    ClosePane,
+    NewAnchor,
+    NextPane,
+    PreviousPane,
+    ToggleRearrange,
+}
 
 /// Shared focus-mode cell. Mutated when the cockpit reloads config; every
 /// pane's hover handler checks this on each pointer enter to decide whether
@@ -147,7 +172,7 @@ impl TerminalPane {
             }
         };
 
-        let font_desc = pango::FontDescription::from_string(FONT_SPEC);
+        let font_desc = font_description(DEFAULT_FONT_FAMILY, DEFAULT_FONT_SIZE_PT);
         let drawing_area = DrawingArea::builder().hexpand(true).vexpand(true).build();
         drawing_area.set_focusable(true);
 
@@ -220,8 +245,7 @@ impl TerminalPane {
     /// minimum size so the divider limits track the new cell size, and
     /// queues a redraw. Called from the config hot-reload path (Epic 10).
     pub fn set_font(&self, family: &str, size_pt: i32) {
-        let spec = format!("{family} {size_pt}");
-        let font = pango::FontDescription::from_string(&spec);
+        let font = font_description(family, size_pt);
         let (cell_w, cell_h) = measure_cell(&self.drawing_area, &font);
         // Recompute the grid for the current allocation: changing the cell
         // size without resizing the term + PTY leaves them at the old cols
@@ -320,11 +344,18 @@ impl TerminalPane {
     /// Attach input controllers. The focus callback fires on click, plus on
     /// pointer-enter when `focus_mode` is `Hover`. The mode cell is shared
     /// with the cockpit so a config reload mutates it without re-attaching.
-    pub fn attach_controllers(&self, on_focus: FocusCallback, focus_mode: FocusModeCell) {
+    pub fn attach_controllers(
+        &self,
+        on_focus: FocusCallback,
+        focus_mode: FocusModeCell,
+        on_action: TerminalActionCallback,
+        shortcut_prefix: ShortcutPrefixCell,
+    ) {
         self.attach_key_controller();
         self.attach_scroll_controller();
         self.attach_drag_controller();
         self.attach_focus_click(on_focus.clone());
+        self.attach_context_menu(on_focus.clone(), on_action, shortcut_prefix);
         self.attach_focus_hover(on_focus, focus_mode);
     }
 
@@ -450,6 +481,33 @@ impl TerminalPane {
         self.drawing_area.add_controller(click);
     }
 
+    fn attach_context_menu(
+        &self,
+        on_focus: FocusCallback,
+        on_action: TerminalActionCallback,
+        shortcut_prefix: ShortcutPrefixCell,
+    ) {
+        let click = GestureClick::new();
+        click.set_button(gdk::BUTTON_SECONDARY);
+        let id = self.id;
+        let area = self.drawing_area.clone();
+        let inner = self.inner.clone();
+        click.connect_pressed(move |_g, _n, x, y| {
+            area.grab_focus();
+            on_focus(id);
+            open_terminal_context_menu(
+                &area,
+                &inner,
+                id,
+                x,
+                y,
+                on_action.clone(),
+                shortcut_prefix.borrow().clone(),
+            );
+        });
+        self.drawing_area.add_controller(click);
+    }
+
     fn attach_focus_hover(&self, on_focus: FocusCallback, focus_mode: FocusModeCell) {
         let motion = EventControllerMotion::new();
         let id = self.id;
@@ -462,6 +520,13 @@ impl TerminalPane {
         });
         self.drawing_area.add_controller(motion);
     }
+}
+
+fn font_description(family: &str, size_pt: i32) -> pango::FontDescription {
+    let mut font = pango::FontDescription::new();
+    font.set_family(family);
+    font.set_size(size_pt.max(1) * pango::SCALE);
+    font
 }
 
 /// Shared helper used by both `TerminalPane` and `SatelliteWidget` to
@@ -606,6 +671,194 @@ fn paste_text(inner: &Rc<RefCell<Inner>>, area: &DrawingArea, text: &str) {
     area.queue_draw();
 }
 
+fn open_terminal_context_menu(
+    area: &DrawingArea,
+    inner: &Rc<RefCell<Inner>>,
+    pane_id: PaneId,
+    x: f64,
+    y: f64,
+    on_action: TerminalActionCallback,
+    prefix: String,
+) {
+    let popover = Popover::new();
+    popover.set_has_arrow(true);
+    popover.set_parent(area);
+    popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+
+    let body = GtkBox::new(Orientation::Vertical, 2);
+    body.set_margin_top(6);
+    body.set_margin_bottom(6);
+    body.set_margin_start(6);
+    body.set_margin_end(6);
+
+    let inner_copy = inner.clone();
+    let popover_copy = popover.clone();
+    body.append(&context_menu_button(
+        "Copy",
+        terminal_copy_shortcut(),
+        move || {
+            copy_selection_to_clipboard(&inner_copy);
+            popover_copy.popdown();
+        },
+    ));
+
+    let inner_paste = inner.clone();
+    let area_paste = area.clone();
+    let popover_paste = popover.clone();
+    body.append(&context_menu_button(
+        "Paste",
+        terminal_paste_shortcut(),
+        move || {
+            request_paste_from_clipboard(&area_paste, &inner_paste);
+            popover_paste.popdown();
+        },
+    ));
+
+    append_separator(&body);
+
+    append_action_button(
+        &body,
+        &popover,
+        pane_id,
+        "Split right",
+        &prefixed_shortcut(&prefix, "|"),
+        TerminalContextAction::SplitRight,
+        on_action.clone(),
+    );
+    append_action_button(
+        &body,
+        &popover,
+        pane_id,
+        "Split down",
+        &prefixed_shortcut(&prefix, "-"),
+        TerminalContextAction::SplitDown,
+        on_action.clone(),
+    );
+    append_action_button(
+        &body,
+        &popover,
+        pane_id,
+        "Close pane",
+        &prefixed_shortcut(&prefix, "x"),
+        TerminalContextAction::ClosePane,
+        on_action.clone(),
+    );
+    append_action_button(
+        &body,
+        &popover,
+        pane_id,
+        "New anchor",
+        "",
+        TerminalContextAction::NewAnchor,
+        on_action.clone(),
+    );
+
+    append_separator(&body);
+
+    append_action_button(
+        &body,
+        &popover,
+        pane_id,
+        "Next pane",
+        &prefixed_shortcut(&prefix, "o"),
+        TerminalContextAction::NextPane,
+        on_action.clone(),
+    );
+    append_action_button(
+        &body,
+        &popover,
+        pane_id,
+        "Previous pane",
+        &prefixed_shortcut(&prefix, "p"),
+        TerminalContextAction::PreviousPane,
+        on_action.clone(),
+    );
+    append_action_button(
+        &body,
+        &popover,
+        pane_id,
+        "Rearrange mode",
+        &prefixed_shortcut(&prefix, "m"),
+        TerminalContextAction::ToggleRearrange,
+        on_action,
+    );
+
+    popover.set_child(Some(&body));
+    let popover_cleanup = popover.clone();
+    popover.connect_closed(move |_| {
+        popover_cleanup.unparent();
+    });
+    popover.popup();
+}
+
+fn append_action_button(
+    body: &GtkBox,
+    popover: &Popover,
+    pane_id: PaneId,
+    label: &str,
+    shortcut: &str,
+    action: TerminalContextAction,
+    on_action: TerminalActionCallback,
+) {
+    let popover = popover.clone();
+    body.append(&context_menu_button(label, shortcut, move || {
+        popover.popdown();
+        on_action(pane_id, action);
+    }));
+}
+
+fn context_menu_button(label: &str, shortcut: &str, on_click: impl Fn() + 'static) -> Button {
+    let row = GtkBox::new(Orientation::Horizontal, 16);
+    row.set_hexpand(true);
+
+    let title = Label::new(Some(label));
+    title.set_xalign(0.0);
+    title.set_hexpand(true);
+    row.append(&title);
+
+    if !shortcut.is_empty() {
+        let shortcut = Label::new(Some(shortcut));
+        shortcut.set_xalign(1.0);
+        shortcut.add_css_class("dim-label");
+        shortcut.add_css_class("monospace");
+        row.append(&shortcut);
+    }
+
+    let button = Button::new();
+    button.add_css_class("flat");
+    button.set_halign(Align::Fill);
+    button.set_child(Some(&row));
+    button.connect_clicked(move |_| on_click());
+    button
+}
+
+fn append_separator(body: &GtkBox) {
+    let separator = gtk4::Separator::new(Orientation::Horizontal);
+    separator.set_margin_top(4);
+    separator.set_margin_bottom(4);
+    body.append(&separator);
+}
+
+fn prefixed_shortcut(prefix: &str, key: &str) -> String {
+    format!("{} {}", prefix.trim(), key)
+}
+
+fn terminal_copy_shortcut() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Cmd+C"
+    } else {
+        "Ctrl+Shift+C"
+    }
+}
+
+fn terminal_paste_shortcut() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Cmd+V"
+    } else {
+        "Ctrl+Shift+V"
+    }
+}
+
 /// Save a clipboard image to a temp PNG and return the path. Tools
 /// like `claude` cli accept the file path as an argument-like paste
 /// and load the image themselves. Files land under
@@ -707,8 +960,21 @@ fn measure_cell(area: &DrawingArea, font: &pango::FontDescription) -> (f64, f64)
     // monospace grid.
     if let Ok(mut opts) = gtk4::cairo::FontOptions::new() {
         opts.set_hint_metrics(gtk4::cairo::HintMetrics::On);
-        opts.set_hint_style(gtk4::cairo::HintStyle::Slight);
-        opts.set_antialias(gtk4::cairo::Antialias::Subpixel);
+        #[cfg(target_os = "macos")]
+        {
+            opts.set_hint_style(gtk4::cairo::HintStyle::None);
+            opts.set_antialias(gtk4::cairo::Antialias::Gray);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            opts.set_hint_style(gtk4::cairo::HintStyle::Slight);
+            opts.set_antialias(gtk4::cairo::Antialias::Subpixel);
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            opts.set_hint_style(gtk4::cairo::HintStyle::Slight);
+            opts.set_antialias(gtk4::cairo::Antialias::Subpixel);
+        }
         pangocairo::functions::context_set_font_options(&pctx, Some(&opts));
     }
     // Use Pango font metrics for the cell advance width — the recommended
@@ -980,9 +1246,15 @@ impl Pane {
         }
     }
 
-    pub fn attach_controllers(&self, cb: FocusCallback, focus_mode: FocusModeCell) {
+    pub fn attach_controllers(
+        &self,
+        cb: FocusCallback,
+        focus_mode: FocusModeCell,
+        on_action: TerminalActionCallback,
+        shortcut_prefix: ShortcutPrefixCell,
+    ) {
         match self {
-            Self::Terminal(t) => t.attach_controllers(cb, focus_mode),
+            Self::Terminal(t) => t.attach_controllers(cb, focus_mode, on_action, shortcut_prefix),
             // Satellites install pointer/keyboard/scroll controllers at
             // construction time, but the cockpit's focus callback isn't
             // known until the pane is spliced in — wire it now so
