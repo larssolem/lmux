@@ -65,6 +65,10 @@ impl MacWindowCompositor {
         Self::new(accessibility_permission_state(true))
     }
 
+    pub fn accessibility_permission_state(prompt: bool) -> PermissionState {
+        accessibility_permission_state(prompt)
+    }
+
     pub async fn recorded_commands(&self) -> Vec<MacHelperCommand> {
         self.recorded.lock().await.clone()
     }
