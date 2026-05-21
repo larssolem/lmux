@@ -51,9 +51,9 @@ depends = ["deps:macos"]
 run = "cargo build -p lmux"
 
 [tasks."install:local"]
-description = "Install the lmux app binary into Cargo's local bin directory"
+description = "Install lmux locally and register it with the OS app launcher"
 depends = ["deps:macos"]
-run = "cargo install --path crates/lmux --force"
+run = "scripts/install-local.sh"
 
 [tasks."macos:smoke"]
 description = "Run the first-pass macOS smoke test sequence"
