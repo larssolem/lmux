@@ -53,6 +53,8 @@ case "$os" in
   <string>13.0</string>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>lmux uses System Events to list windows that can be attached to anchors.</string>
 </dict>
 </plist>
 PLIST

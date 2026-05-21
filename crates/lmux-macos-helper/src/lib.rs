@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
 use std::sync::Mutex;
 use std::{
+    collections::HashMap,
     io::{BufRead, Write},
     process::Command,
     time::Instant,
@@ -258,8 +259,7 @@ fn list_windows_inner(
 ) -> Result<Vec<WindowInfo>, HelperError> {
     #[cfg(target_os = "macos")]
     {
-        let _ = bundle_id;
-        return list_windows_accessibility(pid);
+        return list_windows_accessibility(pid, bundle_id.as_deref());
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -428,11 +428,39 @@ end tell"#
 }
 
 #[cfg(target_os = "macos")]
-fn list_windows_accessibility(pid_filter: Option<u32>) -> Result<Vec<WindowInfo>, HelperError> {
-    let pids = match pid_filter {
-        Some(pid) => vec![pid],
-        None => visible_window_pids()?,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppProcess {
+    pid: u32,
+    bundle_id: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+fn list_windows_accessibility(
+    pid_filter: Option<u32>,
+    bundle_filter: Option<&str>,
+) -> Result<Vec<WindowInfo>, HelperError> {
+    let processes = match pid_filter {
+        Some(pid) => vec![AppProcess {
+            pid,
+            bundle_id: bundle_filter.map(str::to_owned),
+        }],
+        None => match application_processes_system_events(bundle_filter) {
+            Ok(processes) if !processes.is_empty() => processes,
+            Ok(_) | Err(_) if bundle_filter.is_none() => visible_window_pids()?
+                .into_iter()
+                .map(|pid| AppProcess {
+                    pid,
+                    bundle_id: None,
+                })
+                .collect(),
+            Ok(_) => Vec::new(),
+            Err(err) => return Err(err),
+        },
     };
+    let bundle_by_pid: HashMap<u32, Option<String>> = processes
+        .iter()
+        .map(|process| (process.pid, process.bundle_id.clone()))
+        .collect();
     let windows_attr = create_cf_string(c"AXWindows")?;
     let title_attr = create_cf_string(c"AXTitle")?;
     let window_number_attr = create_cf_string(c"AXWindowNumber")?;
@@ -440,7 +468,8 @@ fn list_windows_accessibility(pid_filter: Option<u32>) -> Result<Vec<WindowInfo>
     let size_attr = create_cf_string(c"AXSize")?;
     let mut windows = Vec::new();
 
-    for pid in pids {
+    for process in processes {
+        let pid = process.pid;
         let app = unsafe { AXUIElementCreateApplication(pid as libc::pid_t) };
         if app.is_null() {
             continue;
@@ -472,7 +501,7 @@ fn list_windows_accessibility(pid_filter: Option<u32>) -> Result<Vec<WindowInfo>
             windows.push(WindowInfo {
                 window_id,
                 pid,
-                bundle_id: None,
+                bundle_id: bundle_by_pid.get(&pid).cloned().flatten(),
                 window_index: u32::try_from(index + 1).unwrap_or(u32::MAX),
                 title,
             });
@@ -491,6 +520,54 @@ fn list_windows_accessibility(pid_filter: Option<u32>) -> Result<Vec<WindowInfo>
         CFRelease(size_attr as CFTypeRef);
     }
     Ok(windows)
+}
+
+#[cfg(target_os = "macos")]
+fn application_processes_system_events(
+    bundle_filter: Option<&str>,
+) -> Result<Vec<AppProcess>, HelperError> {
+    let bundle_filter = apple_script_string(bundle_filter.unwrap_or(""));
+    let script = format!(
+        r#"tell application "System Events"
+    set out to ""
+    set bundleFilter to {bundle_filter}
+    repeat with p in application processes
+        set processPid to 0
+        set processBundle to ""
+        try
+            set processPid to unix id of p
+        end try
+        try
+            set processBundle to bundle identifier of p
+        end try
+        if processPid is not 0 and (bundleFilter is "" or processBundle is bundleFilter) then
+            set out to out & (processPid as text) & tab & processBundle & linefeed
+        end if
+    end repeat
+    return out
+end tell"#
+    );
+    parse_application_processes(&run_osascript(&script)?)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_application_processes(output: &str) -> Result<Vec<AppProcess>, HelperError> {
+    let mut processes = Vec::new();
+    for line in output.lines() {
+        let mut parts = line.splitn(2, '\t');
+        let Some(pid) = parts.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        let bundle_id = parts.next().and_then(non_empty_string);
+        if processes
+            .iter()
+            .any(|existing: &AppProcess| existing.pid == pid)
+        {
+            continue;
+        }
+        processes.push(AppProcess { pid, bundle_id });
+    }
+    Ok(processes)
 }
 
 #[cfg(target_os = "macos")]
@@ -1554,6 +1631,29 @@ mod tests {
         let decoded: HelperResponse = serde_json::from_str(&json).unwrap();
 
         assert_eq!(decoded, response);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parses_application_processes_and_deduplicates_pids() {
+        let processes = parse_application_processes(
+            "42\tcom.example.First\n42\tcom.example.First\n77\tmissing value\nbad\trow\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            processes,
+            vec![
+                AppProcess {
+                    pid: 42,
+                    bundle_id: Some("com.example.First".into()),
+                },
+                AppProcess {
+                    pid: 77,
+                    bundle_id: None,
+                },
+            ]
+        );
     }
 
     #[cfg(target_os = "macos")]
