@@ -3,6 +3,7 @@
 //! dropped. Doesn't connect a real wayland-client yet — protocol-level
 //! assertions ride the xdg_shell task (Task #8) where handlers exist.
 
+#![cfg(target_os = "linux")]
 #![allow(clippy::expect_used)]
 
 use std::time::Duration;

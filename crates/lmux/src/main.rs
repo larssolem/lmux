@@ -58,11 +58,14 @@ mod tracing_setup;
 
 use anyhow::Result;
 use gtk4::prelude::*;
-use gtk4::{gio, Application};
+use gtk4::{gio, glib, Application};
 
 const APP_ID: &str = "no.jpro.lmux";
 
 fn main() -> Result<()> {
+    glib::set_prgname(Some("lmux"));
+    glib::set_application_name("lmux");
+
     // Hidden subcommand: `lmux --exec-pty <cmd> <args...>`. Used internally
     // as a trampoline by `lmux-pty::spawn` so every PTY child has
     // `PR_SET_PDEATHSIG(SIGTERM)` set before it execs the real shell

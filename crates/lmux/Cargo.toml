@@ -40,5 +40,8 @@ uuid.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 lmux-wayland-host = { path = "../lmux-wayland-host" }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+lmux-macos-helper = { path = "../lmux-macos-helper" }
+
 [dev-dependencies]
 tempfile = "3"

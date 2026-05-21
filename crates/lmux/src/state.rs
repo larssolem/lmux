@@ -6,19 +6,22 @@
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
+use std::time::Instant;
 
 #[cfg(target_os = "linux")]
 use async_channel::Sender;
 use gtk4::prelude::*;
-use gtk4::{Orientation, Paned, Widget};
+use gtk4::{Orientation, Paned, Stack, Widget};
 use lmux_anchor::{Anchor, AnchorRegistry};
 use lmux_compositor::{FocusPolicy, SatelliteWindowId, WindowBackend};
+#[cfg(target_os = "macos")]
+use lmux_macos_helper::WindowInfo as MacosWindowInfo;
 #[cfg(target_os = "linux")]
 use lmux_wayland_host::{HostCommand, HostEvent, HostHandle, SurfaceId};
 use uuid::Uuid;
 
 use crate::layout::{Dir, Layout, PaneId};
-use crate::pane::{BellCallback, FocusCallback, Pane};
+use crate::pane::{BellCallback, FocusCallback, Pane, ShortcutPrefixCell, TerminalActionCallback};
 #[cfg(target_os = "linux")]
 use crate::satellite::SatelliteWidget;
 
@@ -45,9 +48,273 @@ fn default_window_backend() -> WindowBackend {
     {
         WindowBackend::Macos
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
         WindowBackend::Kwin
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        WindowBackend::Noop
+    }
+}
+
+fn satellite_visibility_for_active(
+    active: Option<PaneId>,
+    windows_by_anchor: &HashMap<PaneId, Vec<SatelliteWindowId>>,
+) -> (Vec<SatelliteWindowId>, Vec<SatelliteWindowId>) {
+    let mut hide = Vec::new();
+    let mut show = Vec::new();
+    for (anchor, windows) in windows_by_anchor {
+        if Some(*anchor) == active {
+            show.extend(windows.iter().cloned());
+        } else {
+            hide.extend(windows.iter().cloned());
+        }
+    }
+    (hide, show)
+}
+
+fn remove_satellite_request(
+    windows_by_anchor: &mut HashMap<PaneId, Vec<SatelliteWindowId>>,
+    request_id: Uuid,
+) {
+    for windows in windows_by_anchor.values_mut() {
+        windows.retain(|existing| existing.request_id != Some(request_id));
+    }
+}
+
+fn remove_satellite_backend_window(
+    windows_by_anchor: &mut HashMap<PaneId, Vec<SatelliteWindowId>>,
+    backend_window_id: &str,
+) {
+    for windows in windows_by_anchor.values_mut() {
+        windows.retain(|existing| existing.backend_window_id != backend_window_id);
+    }
+}
+
+fn insert_satellite_window_for_anchor(
+    windows_by_anchor: &mut HashMap<PaneId, Vec<SatelliteWindowId>>,
+    anchor: PaneId,
+    window: SatelliteWindowId,
+) {
+    if let Some(request_id) = window.request_id {
+        remove_satellite_request(windows_by_anchor, request_id);
+    }
+    remove_satellite_backend_window(windows_by_anchor, &window.backend_window_id);
+    windows_by_anchor.entry(anchor).or_default().push(window);
+}
+
+fn noop_terminal_action_callback() -> TerminalActionCallback {
+    Rc::new(|_, _| {})
+}
+
+#[cfg(target_os = "macos")]
+fn macos_backend_window_id(window: &MacosWindowInfo) -> String {
+    match window.window_id {
+        Some(window_id) => format!("macos-window-id:{window_id}:index:{}", window.window_index),
+        None => format!(
+            "macos-window-pid:{}:index:{}",
+            window.pid, window.window_index
+        ),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_satellite_for_window(
+    request_id: Uuid,
+    bundle_id: Option<String>,
+    window: &MacosWindowInfo,
+) -> SatelliteWindowId {
+    SatelliteWindowId {
+        backend: WindowBackend::Macos,
+        request_id: Some(request_id),
+        pid: Some(window.pid),
+        backend_window_id: macos_backend_window_id(window),
+        bundle_id: window.bundle_id.clone().or(bundle_id),
+        title: window.title.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn satellite_visibility_follows_active_anchor() {
+        let active_window =
+            SatelliteWindowId::for_spawn(WindowBackend::Macos, Uuid::from_u128(1), 10);
+        let inactive_window =
+            SatelliteWindowId::for_spawn(WindowBackend::Macos, Uuid::from_u128(2), 20);
+        let mut windows = HashMap::new();
+        windows.insert(1, vec![active_window.clone()]);
+        windows.insert(2, vec![inactive_window.clone()]);
+
+        let (hide, show) = satellite_visibility_for_active(Some(1), &windows);
+
+        assert_eq!(show, vec![active_window]);
+        assert_eq!(hide, vec![inactive_window]);
+    }
+
+    #[test]
+    fn satellite_request_replacement_removes_old_owner_records() {
+        let request_id = Uuid::from_u128(42);
+        let old_window = SatelliteWindowId::for_spawn(WindowBackend::Macos, request_id, 10);
+        let other_window =
+            SatelliteWindowId::for_spawn(WindowBackend::Macos, Uuid::from_u128(43), 20);
+        let mut windows = HashMap::new();
+        windows.insert(1, vec![old_window]);
+        windows.insert(2, vec![other_window.clone()]);
+
+        remove_satellite_request(&mut windows, request_id);
+
+        assert!(windows.get(&1).is_some_and(Vec::is_empty));
+        assert_eq!(windows.get(&2), Some(&vec![other_window]));
+    }
+
+    #[test]
+    fn satellite_backend_window_removal_drops_only_matching_window() {
+        let old_window = SatelliteWindowId {
+            backend: WindowBackend::Macos,
+            request_id: Some(Uuid::from_u128(42)),
+            pid: Some(10),
+            backend_window_id: "macos-window-id:100:index:1".into(),
+            bundle_id: None,
+            title: None,
+        };
+        let keep_window = SatelliteWindowId {
+            backend: WindowBackend::Macos,
+            request_id: Some(Uuid::from_u128(43)),
+            pid: Some(10),
+            backend_window_id: "macos-window-id:101:index:2".into(),
+            bundle_id: None,
+            title: None,
+        };
+        let mut windows = HashMap::new();
+        windows.insert(1, vec![old_window, keep_window.clone()]);
+
+        remove_satellite_backend_window(&mut windows, "macos-window-id:100:index:1");
+
+        assert_eq!(windows.get(&1), Some(&vec![keep_window]));
+    }
+
+    #[test]
+    fn satellite_backend_window_insert_moves_existing_window_between_anchors() {
+        let window = SatelliteWindowId {
+            backend: WindowBackend::Macos,
+            request_id: Some(Uuid::from_u128(42)),
+            pid: Some(10),
+            backend_window_id: "macos-window-id:100:index:1".into(),
+            bundle_id: Some("com.example.App".into()),
+            title: Some("Example".into()),
+        };
+        let mut windows = HashMap::new();
+        windows.insert(1, vec![window.clone()]);
+
+        insert_satellite_window_for_anchor(&mut windows, 2, window.clone());
+
+        assert_eq!(windows.get(&1), Some(&Vec::new()));
+        assert_eq!(windows.get(&2), Some(&vec![window]));
+    }
+
+    #[test]
+    fn two_chrome_windows_on_different_anchors_switch_independently() {
+        let chrome_a = SatelliteWindowId {
+            backend: WindowBackend::Macos,
+            request_id: Some(Uuid::from_u128(1)),
+            pid: Some(100),
+            backend_window_id: "macos-window-id:1001:index:1".into(),
+            bundle_id: Some("com.google.Chrome".into()),
+            title: Some("Chrome A".into()),
+        };
+        let chrome_b = SatelliteWindowId {
+            backend: WindowBackend::Macos,
+            request_id: Some(Uuid::from_u128(2)),
+            pid: Some(100),
+            backend_window_id: "macos-window-id:1002:index:2".into(),
+            bundle_id: Some("com.google.Chrome".into()),
+            title: Some("Chrome B".into()),
+        };
+        let mut windows = HashMap::new();
+        windows.insert(1, vec![chrome_a.clone()]);
+        windows.insert(2, vec![chrome_b.clone()]);
+
+        let (hide, show) = satellite_visibility_for_active(Some(1), &windows);
+
+        assert_eq!(show, vec![chrome_a]);
+        assert_eq!(hide, vec![chrome_b]);
+    }
+
+    #[test]
+    fn two_intellij_windows_on_different_anchors_switch_independently() {
+        let idea_a = SatelliteWindowId {
+            backend: WindowBackend::Macos,
+            request_id: Some(Uuid::from_u128(3)),
+            pid: Some(200),
+            backend_window_id: "macos-window-id:2001:index:1".into(),
+            bundle_id: Some("com.jetbrains.intellij".into()),
+            title: Some("Project A".into()),
+        };
+        let idea_b = SatelliteWindowId {
+            backend: WindowBackend::Macos,
+            request_id: Some(Uuid::from_u128(4)),
+            pid: Some(200),
+            backend_window_id: "macos-window-id:2002:index:2".into(),
+            bundle_id: Some("com.jetbrains.intellij".into()),
+            title: Some("Project B".into()),
+        };
+        let mut windows = HashMap::new();
+        windows.insert(1, vec![idea_a.clone()]);
+        windows.insert(2, vec![idea_b.clone()]);
+
+        let (hide, show) = satellite_visibility_for_active(Some(2), &windows);
+
+        assert_eq!(show, vec![idea_b]);
+        assert_eq!(hide, vec![idea_a]);
+    }
+
+    #[test]
+    fn set_active_anchor_hot_path_has_no_inline_macos_reconciliation() {
+        let source = include_str!("state.rs");
+        let start = source.find("pub fn set_active_anchor").unwrap();
+        let tail = &source[start..];
+        let end = tail.find("    /// Sidebar accessor").unwrap();
+        let body = &tail[..end];
+
+        assert!(!body.contains("reconcile_macos"));
+        assert!(!body.contains("lmux_macos_helper"));
+        assert!(!body.contains("list_windows("));
+    }
+
+    #[test]
+    fn next_anchor_sort_key_appends_within_group() {
+        let mut registry = AnchorRegistry::default();
+        let mut first = Anchor::new_manual(Uuid::new_v4(), vec!["zsh".into()], String::new());
+        first.sort_key = Some(0);
+        let first_id = first.id;
+        registry.insert(first);
+
+        let mut second = Anchor::new_manual(Uuid::new_v4(), vec!["zsh".into()], String::new());
+        second.sort_key = Some(1);
+        let second_id = second.id;
+        registry.insert(second);
+
+        let mut grouped = Anchor::new_manual(Uuid::new_v4(), vec!["zsh".into()], String::new());
+        grouped.group = Some("Work".into());
+        grouped.sort_key = Some(9);
+        let grouped_id = grouped.id;
+        registry.insert(grouped);
+
+        assert_eq!(
+            next_anchor_sort_key_for([first_id, second_id, grouped_id], &registry, None),
+            2
+        );
+        assert_eq!(
+            next_anchor_sort_key_for([first_id, second_id, grouped_id], &registry, Some("Work")),
+            10
+        );
     }
 }
 
@@ -100,6 +367,7 @@ pub struct AppState {
     /// (subject to the usual workspace-membership filter).
     hidden_anchors: BTreeSet<PaneId>,
     root_container: gtk4::Box,
+    workspace_stack: RefCell<Option<Stack>>,
     focus_cb: Option<FocusCallback>,
     /// Shared focus-mode cell cloned into every pane's hover handler. Live
     /// config reload mutates this via `apply_config`; no re-attach needed.
@@ -112,6 +380,8 @@ pub struct AppState {
     /// in rearrange mode reaches `AppState::reparent_pane`. Cached so
     /// panes added later (splits, satellites) can be wired identically.
     reparent_cb: Option<crate::pane::ReparentCallback>,
+    terminal_action_cb: Option<TerminalActionCallback>,
+    shortcut_prefix: ShortcutPrefixCell,
     bell_cb: Option<BellCallback>,
     /// Notification ids per-pane, so the next bell from a pane replaces the
     /// previous toast rather than stacking. Story 6.2.
@@ -122,6 +392,9 @@ pub struct AppState {
     /// status.get handler registers here to keep its atomic anchor count
     /// in sync.
     on_anchors_changed: Vec<AnchorsChangedCallback>,
+    /// Fires when only the active anchor changes. Sidebar rows use this to
+    /// update active styling without rebuilding the full anchor list.
+    on_active_anchor_changed: Vec<ActiveAnchorChangedCallback>,
     /// Name of the session whose on-disk snapshot we're currently
     /// editing. `None` means "unnamed / legacy v0.1 single-session mode"
     /// — the switcher sets it to `Some(name)` on the first swap, and
@@ -132,6 +405,7 @@ pub struct AppState {
     /// `set_active_anchor` so satellites share the lifecycle of their
     /// owning anchor (hide on switch-away, show on switch-back).
     satellite_windows_by_anchor: HashMap<PaneId, Vec<SatelliteWindowId>>,
+    satellite_visibility_seq: u64,
     /// Sender to the compositor bridge thread. `None` in unit tests and
     /// on the snapshot-restore path before the cockpit wires one up.
     compositor_tx: Option<crate::compositor_bridge::CompositorSender>,
@@ -166,6 +440,7 @@ pub struct AppState {
 }
 
 pub type AnchorsChangedCallback = Rc<dyn Fn()>;
+pub type ActiveAnchorChangedCallback = Rc<dyn Fn(Option<PaneId>)>;
 
 pub type SharedAppState = Rc<RefCell<AppState>>;
 
@@ -189,16 +464,21 @@ impl AppState {
             active_anchor: None,
             hidden_anchors: BTreeSet::new(),
             root_container,
+            workspace_stack: RefCell::new(None),
             focus_cb: None,
             focus_mode: Rc::new(std::cell::Cell::new(lmux_config::FocusMode::default())),
             rearrange_mode: Rc::new(std::cell::Cell::new(false)),
             reparent_cb: None,
+            terminal_action_cb: None,
+            shortcut_prefix: Rc::new(RefCell::new("ctrl+b".to_string())),
             bell_cb: None,
             last_notif_id: HashMap::new(),
             phase: Phase::Running,
             on_anchors_changed: Vec::new(),
+            on_active_anchor_changed: Vec::new(),
             current_session: None,
             satellite_windows_by_anchor: HashMap::new(),
+            satellite_visibility_seq: 0,
             compositor_tx: None,
             #[cfg(target_os = "linux")]
             wayland_host: None,
@@ -240,16 +520,21 @@ impl AppState {
             active_anchor: None,
             hidden_anchors: BTreeSet::new(),
             root_container,
+            workspace_stack: RefCell::new(None),
             focus_cb: None,
             focus_mode: Rc::new(std::cell::Cell::new(lmux_config::FocusMode::default())),
             rearrange_mode: Rc::new(std::cell::Cell::new(false)),
             reparent_cb: None,
+            terminal_action_cb: None,
+            shortcut_prefix: Rc::new(RefCell::new("ctrl+b".to_string())),
             bell_cb: None,
             last_notif_id: HashMap::new(),
             phase: Phase::Running,
             on_anchors_changed: Vec::new(),
+            on_active_anchor_changed: Vec::new(),
             current_session: None,
             satellite_windows_by_anchor: HashMap::new(),
+            satellite_visibility_seq: 0,
             compositor_tx: None,
             #[cfg(target_os = "linux")]
             wayland_host: None,
@@ -374,6 +659,35 @@ impl AppState {
         self.anchors.len() as u32
     }
 
+    fn satellite_window_count(&self) -> usize {
+        self.satellite_windows_by_anchor
+            .values()
+            .map(Vec::len)
+            .sum()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn macos_attached_anchor_for_window(
+        &self,
+        window: &MacosWindowInfo,
+    ) -> Option<(PaneId, String)> {
+        let backend_window_id = macos_backend_window_id(window);
+        self.satellite_windows_by_anchor
+            .iter()
+            .find_map(|(anchor, windows)| {
+                windows
+                    .iter()
+                    .any(|existing| existing.backend_window_id == backend_window_id)
+                    .then(|| {
+                        let label = self
+                            .anchor_for_pane(*anchor)
+                            .map(|anchor| anchor.display_label().to_string())
+                            .unwrap_or_else(|| format!("pane {anchor}"));
+                        (*anchor, label)
+                    })
+            })
+    }
+
     /// Reverse of `pane_anchor_ids`: given the UUID stored on the `Anchor`
     /// registry entry, return the pane that currently owns it. Used by the
     /// bus dispatcher to route `anchor.pause` / `anchor.resume` kinds that
@@ -440,10 +754,41 @@ impl AppState {
     /// The compositor bridge will be notified on subsequent anchor switches
     /// so the satellite hides when its owner is inactive and shows again
     /// when it becomes active.
+    #[allow(dead_code)]
     pub fn register_satellite(&mut self, anchor: PaneId, pid: u32) {
         self.register_satellite_window(
             anchor,
             SatelliteWindowId::for_pid(default_window_backend(), pid),
+        );
+    }
+
+    #[allow(dead_code)]
+    pub fn register_satellite_spawn(
+        &mut self,
+        anchor: PaneId,
+        request_id: uuid::Uuid,
+        pid: u32,
+        bundle_id: Option<String>,
+    ) {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = (request_id, bundle_id);
+            tracing::warn!(
+                anchor,
+                pid,
+                "register_satellite_spawn ignored on macOS; use explicit window attach"
+            );
+            return;
+        }
+        #[cfg(not(target_os = "macos"))]
+        self.register_satellite_window(
+            anchor,
+            SatelliteWindowId::for_spawn_with_bundle(
+                default_window_backend(),
+                request_id,
+                pid,
+                bundle_id,
+            ),
         );
     }
 
@@ -456,11 +801,69 @@ impl AppState {
             );
             return;
         }
-        self.satellite_windows_by_anchor
-            .entry(anchor)
-            .or_default()
-            .push(window.clone());
+        insert_satellite_window_for_anchor(
+            &mut self.satellite_windows_by_anchor,
+            anchor,
+            window.clone(),
+        );
         tracing::info!(anchor, window = ?window, "registered satellite under anchor");
+        self.broadcast_satellite_visibility();
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn attach_focused_macos_window_to_active_anchor(&mut self) -> Result<(), String> {
+        let anchor = self
+            .active_anchor
+            .ok_or_else(|| "no active anchor".to_string())?;
+        let focused = lmux_macos_helper::focused_window()
+            .map_err(|err| format!("focused window helper failed: {err}"))?
+            .ok_or_else(|| "no focused macOS window".to_string())?;
+        if focused.window_id.is_none() {
+            return Err(format!(
+                "focused macOS window for pid {} has no stable window id",
+                focused.pid
+            ));
+        }
+
+        let request_id = Uuid::new_v4();
+        let window = macos_satellite_for_window(request_id, focused.bundle_id.clone(), &focused);
+        self.register_satellite_window(anchor, window.clone());
+        tracing::info!(
+            anchor,
+            request_id = %request_id,
+            pid = focused.pid,
+            window = ?window,
+            "attached focused macOS window to active anchor"
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn attach_macos_window_to_active_anchor(
+        &mut self,
+        window: MacosWindowInfo,
+    ) -> Result<(), String> {
+        let anchor = self
+            .active_anchor
+            .ok_or_else(|| "no active anchor".to_string())?;
+        if window.window_id.is_none() && window.window_index == 0 {
+            return Err(format!(
+                "macOS window for pid {} has no stable window id or window index",
+                window.pid
+            ));
+        }
+
+        let request_id = Uuid::new_v4();
+        let satellite = macos_satellite_for_window(request_id, window.bundle_id.clone(), &window);
+        self.register_satellite_window(anchor, satellite.clone());
+        tracing::info!(
+            anchor,
+            request_id = %request_id,
+            pid = window.pid,
+            window = ?satellite,
+            "attached selected macOS window to active anchor"
+        );
+        Ok(())
     }
 
     /// Wire up the bridge so anchor-switch side effects reach KWin.
@@ -471,27 +874,33 @@ impl AppState {
     /// Emit a visibility command for each known satellite based on
     /// `active_anchor`: satellites under the active anchor become visible,
     /// satellites under every other anchor get hidden.
-    fn broadcast_satellite_visibility(&self) {
-        let Some(tx) = self.compositor_tx.as_ref() else {
+    fn broadcast_satellite_visibility(&mut self) {
+        let Some(tx) = self.compositor_tx.as_ref().cloned() else {
             return;
         };
-        let active = self.active_anchor;
-        let mut hide = Vec::new();
-        let mut show = Vec::new();
-        for (anchor, windows) in &self.satellite_windows_by_anchor {
-            if Some(*anchor) == active {
-                show.extend(windows.iter().cloned());
-            } else {
-                hide.extend(windows.iter().cloned());
-            }
-        }
-        let _ = tx.send_blocking(
-            crate::compositor_bridge::CompositorCommand::ApplyWindowGroupSwitch {
-                hide,
-                show,
-                focus_policy: FocusPolicy::Terminal,
-            },
+        self.satellite_visibility_seq = self.satellite_visibility_seq.saturating_add(1);
+        let sequence = self.satellite_visibility_seq;
+        let (hide, show) =
+            satellite_visibility_for_active(self.active_anchor, &self.satellite_windows_by_anchor);
+        tracing::info!(
+            operation = "anchor.satellite_visibility",
+            sequence,
+            active_anchor = ?self.active_anchor,
+            hide = hide.len(),
+            show = show.len(),
+            hide_windows = ?hide,
+            show_windows = ?show,
+            "satellite visibility command queued"
         );
+        let command = crate::compositor_bridge::CompositorCommand::ApplyWindowGroupSwitch {
+            sequence,
+            hide,
+            show,
+            focus_policy: FocusPolicy::Terminal,
+        };
+        if let Err(err) = tx.try_send(command.clone()) {
+            tracing::debug!(error = %err, "satellite visibility command dropped");
+        }
     }
 
     /// Install the nested-Wayland compositor handle + command channel
@@ -523,6 +932,7 @@ impl AppState {
     }
 
     #[cfg(not(target_os = "linux"))]
+    #[allow(dead_code)]
     pub fn wayland_display_name(&self) -> Option<&str> {
         None
     }
@@ -769,7 +1179,14 @@ impl AppState {
             self.pane_workspace.insert(pane_id, owner);
         }
         if let Some(cb) = &self.focus_cb {
-            pane.attach_controllers(cb.clone(), self.focus_mode.clone());
+            pane.attach_controllers(
+                cb.clone(),
+                self.focus_mode.clone(),
+                self.terminal_action_cb
+                    .clone()
+                    .unwrap_or_else(noop_terminal_action_callback),
+                self.shortcut_prefix.clone(),
+            );
         }
         if let Some(cb) = &self.reparent_cb {
             pane.attach_rearrange_controllers(self.rearrange_mode.clone(), cb.clone());
@@ -945,7 +1362,8 @@ impl AppState {
             return false;
         }
         let (argv, cwd) = self.anchor_spawn_metadata(target);
-        let anchor = Anchor::new_manual(Uuid::new_v4(), argv, cwd);
+        let mut anchor = Anchor::new_manual(Uuid::new_v4(), argv, cwd);
+        anchor.sort_key = Some(self.next_anchor_sort_key(anchor.group.as_deref()));
         let anchor_id = anchor.id;
         self.anchor_registry.insert(anchor);
         self.pane_anchor_ids.insert(target, anchor_id);
@@ -957,6 +1375,30 @@ impl AppState {
         true
     }
 
+    fn next_anchor_sort_key(&self, group: Option<&str>) -> i64 {
+        next_anchor_sort_key_for(
+            self.pane_anchor_ids.values().copied(),
+            &self.anchor_registry,
+            group,
+        )
+    }
+}
+
+fn next_anchor_sort_key_for(
+    anchor_ids: impl IntoIterator<Item = Uuid>,
+    registry: &AnchorRegistry,
+    group: Option<&str>,
+) -> i64 {
+    anchor_ids
+        .into_iter()
+        .filter_map(|anchor_id| registry.get(anchor_id))
+        .filter(|anchor| anchor.group.as_deref() == group)
+        .map(|anchor| anchor.sort_key.unwrap_or(0))
+        .max()
+        .map_or(0, |max| max.saturating_add(1))
+}
+
+impl AppState {
     /// Remove `target` from the anchor set and drop its registry entry.
     /// Idempotent. If `target` was the active anchor, promotes an
     /// arbitrary remaining anchor to active (or clears `active_anchor`
@@ -999,6 +1441,7 @@ impl AppState {
     /// hidden. `None` clears the active slot. A pane passed in that is
     /// not currently tagged is silently ignored.
     pub fn set_active_anchor(&mut self, target: Option<PaneId>) {
+        let started = Instant::now();
         if let Some(id) = target {
             if !self.anchors.contains(&id) {
                 tracing::warn!(pane_id = id, "set_active_anchor: not a tagged anchor");
@@ -1006,6 +1449,18 @@ impl AppState {
             }
         }
         if self.active_anchor == target {
+            tracing::debug!(
+                operation = "anchor.switch.local",
+                duration_ms = elapsed_ms(started),
+                target = ?target,
+                active = ?self.active_anchor,
+                anchors = self.anchors.len(),
+                panes = self.panes.len(),
+                satellite_windows = self.satellite_window_count(),
+                changed = false,
+                gtk_rebuild = false,
+                "anchor switch skipped"
+            );
             return;
         }
         self.active_anchor = target;
@@ -1041,7 +1496,12 @@ impl AppState {
         // `self.layout` actually drops the inactive anchors' subtrees
         // out of GTK — visibility toggling alone leaves GtkPaned
         // allocating space for hidden children.
-        self.rebuild_widget_tree();
+        let gtk_rebuild = if self.switch_workspace_view() {
+            false
+        } else {
+            self.rebuild_widget_tree();
+            true
+        };
         if let Some(id) = self.active_anchor {
             if let Some(pane) = self.panes.get(&id) {
                 pane.grab_focus();
@@ -1049,7 +1509,19 @@ impl AppState {
         }
         self.refresh_focus_css();
         self.broadcast_satellite_visibility();
-        self.notify_anchors_changed();
+        self.notify_active_anchor_changed();
+        tracing::info!(
+            operation = "anchor.switch.local",
+            duration_ms = elapsed_ms(started),
+            target = ?target,
+            active = ?self.active_anchor,
+            anchors = self.anchors.len(),
+            panes = self.panes.len(),
+            satellite_windows = self.satellite_window_count(),
+            changed = true,
+            gtk_rebuild,
+            "anchor switched locally"
+        );
     }
 
     /// Sidebar accessor: resolve the `Anchor` metadata for a tagged pane.
@@ -1164,6 +1636,13 @@ impl AppState {
         self.hidden_anchors.contains(&pane_id)
     }
 
+    pub fn pane_in_active_workspace(&self, pane_id: PaneId) -> bool {
+        match self.active_anchor {
+            None => true,
+            Some(active) => self.pane_workspace.get(&pane_id) == Some(&active),
+        }
+    }
+
     /// Rename a tagged pane's anchor. `None`/empty clears the override so
     /// the sidebar falls back to argv-derived labels. Fires the refresh
     /// hook so the UI re-renders.
@@ -1264,7 +1743,14 @@ impl AppState {
         // would miss the focus callback.
         if let Some(cb) = self.focus_cb.clone() {
             for pane in panes.values() {
-                pane.attach_controllers(cb.clone(), self.focus_mode.clone());
+                pane.attach_controllers(
+                    cb.clone(),
+                    self.focus_mode.clone(),
+                    self.terminal_action_cb
+                        .clone()
+                        .unwrap_or_else(noop_terminal_action_callback),
+                    self.shortcut_prefix.clone(),
+                );
             }
         }
         if let Some(cb) = self.reparent_cb.clone() {
@@ -1418,12 +1904,23 @@ impl AppState {
         self.on_anchors_changed.push(cb);
     }
 
+    pub fn add_active_anchor_changed_callback(&mut self, cb: ActiveAnchorChangedCallback) {
+        self.on_active_anchor_changed.push(cb);
+    }
+
     fn notify_anchors_changed(&self) {
         // Defer to the next idle tick so callers already inside a
         // `borrow_mut()` don't trigger a RefCell reentrancy panic when a
         // listener re-borrows `AppState`.
         for cb in self.on_anchors_changed.iter().cloned() {
             gtk4::glib::idle_add_local_once(move || cb());
+        }
+    }
+
+    fn notify_active_anchor_changed(&self) {
+        let active = self.active_anchor;
+        for cb in self.on_active_anchor_changed.iter().cloned() {
+            gtk4::glib::idle_add_local_once(move || cb(active));
         }
     }
 
@@ -1462,9 +1959,21 @@ impl AppState {
         None
     }
 
-    pub fn attach_controllers_for_all(&mut self, cb: FocusCallback) {
+    pub fn attach_controllers_for_all(
+        &mut self,
+        cb: FocusCallback,
+        terminal_action_cb: TerminalActionCallback,
+        shortcut_prefix: ShortcutPrefixCell,
+    ) {
+        self.terminal_action_cb = Some(terminal_action_cb.clone());
+        self.shortcut_prefix = shortcut_prefix.clone();
         for pane in self.panes.values() {
-            pane.attach_controllers(cb.clone(), self.focus_mode.clone());
+            pane.attach_controllers(
+                cb.clone(),
+                self.focus_mode.clone(),
+                terminal_action_cb.clone(),
+                shortcut_prefix.clone(),
+            );
         }
         self.focus_cb = Some(cb);
     }
@@ -1623,7 +2132,14 @@ impl AppState {
             return;
         };
         if let Some(cb) = &self.focus_cb {
-            new_pane.attach_controllers(cb.clone(), self.focus_mode.clone());
+            new_pane.attach_controllers(
+                cb.clone(),
+                self.focus_mode.clone(),
+                self.terminal_action_cb
+                    .clone()
+                    .unwrap_or_else(noop_terminal_action_callback),
+                self.shortcut_prefix.clone(),
+            );
         }
         if let Some(cb) = &self.reparent_cb {
             new_pane.attach_rearrange_controllers(self.rearrange_mode.clone(), cb.clone());
@@ -1734,6 +2250,8 @@ impl AppState {
     /// unparented first so we can splice them freely into new `gtk::Paned`
     /// nodes without GTK complaining about already-having-a-parent.
     fn rebuild_widget_tree(&self) {
+        let started = Instant::now();
+        self.workspace_stack.borrow_mut().take();
         // Unparent any existing child of the root container.
         while let Some(child) = self.root_container.first_child() {
             self.root_container.remove(&child);
@@ -1757,16 +2275,18 @@ impl AppState {
             }
         }
 
-        // Prune the layout to only the active workspace's panes. With
-        // multi-anchor sessions the shared `self.layout` tree contains
-        // every anchor's subtree; if we hand the whole thing to GTK,
-        // GtkPaned still allocates space for hidden children, producing
-        // empty white slots that squish the visible pane. Filtering the
-        // tree by `pane_workspace == active_anchor` collapses splits that
-        // would otherwise be one-sided.
-        let pruned = match self.active_anchor {
-            None => Some(self.layout.clone()),
-            Some(active) => prune_to_workspace(&self.layout, active, &self.pane_workspace),
+        // Prune the layout to workspace pages. With multi-anchor sessions
+        // the shared `self.layout` tree contains every anchor's subtree; if
+        // we hand the whole thing to GTK, GtkPaned still allocates space for
+        // hidden children. A GtkStack keeps each anchor's mounted workspace
+        // around so later active-anchor switches only flip pages.
+        let pruned = if self.anchors.is_empty() {
+            match self.active_anchor {
+                None => Some(self.layout.clone()),
+                Some(active) => prune_to_workspace(&self.layout, active, &self.pane_workspace),
+            }
+        } else {
+            None
         };
         tracing::debug!(
             active = ?self.active_anchor,
@@ -1775,16 +2295,74 @@ impl AppState {
             ?pruned,
             "rebuild_widget_tree"
         );
-        let widget = pruned.as_ref().and_then(|l| build_widget(l, &self.panes));
-        if let Some(w) = widget {
-            self.root_container.append(&w);
+        if self.anchors.is_empty() {
+            let widget = pruned.as_ref().and_then(|l| build_widget(l, &self.panes));
+            if let Some(w) = widget {
+                self.root_container.append(&w);
+            }
+        } else {
+            let stack = Stack::new();
+            stack.set_hexpand(true);
+            stack.set_vexpand(true);
+            for anchor in &self.anchors {
+                let Some(pruned) = prune_to_workspace(&self.layout, *anchor, &self.pane_workspace)
+                else {
+                    continue;
+                };
+                let Some(widget) = build_widget(&pruned, &self.panes) else {
+                    continue;
+                };
+                stack.add_named(&widget, Some(&workspace_page_name(*anchor)));
+            }
+            if let Some(active) = self
+                .active_anchor
+                .or_else(|| self.anchors.iter().copied().next())
+            {
+                stack.set_visible_child_name(&workspace_page_name(active));
+            }
+            self.root_container.append(&stack);
+            *self.workspace_stack.borrow_mut() = Some(stack);
         }
         // Diagnostic: walk the actual GTK tree under root_container so we
         // can confirm only the pruned leaves are present.
         let mut walk: Vec<String> = Vec::new();
         walk_tree(self.root_container.upcast_ref::<Widget>(), 0, &mut walk);
-        tracing::debug!(tree = walk.join(" | ").as_str(), "post-rebuild tree");
+        tracing::debug!(
+            operation = "gtk.workspace.switch",
+            duration_ms = elapsed_ms(started),
+            active = ?self.active_anchor,
+            panes = self.panes.len(),
+            anchors = self.anchors.len(),
+            satellite_windows = self.satellite_window_count(),
+            mounted_widgets = walk.len(),
+            tree = walk.join(" | ").as_str(),
+            "post-rebuild tree"
+        );
     }
+
+    fn switch_workspace_view(&self) -> bool {
+        let Some(active) = self.active_anchor else {
+            return false;
+        };
+        let Some(stack) = self.workspace_stack.borrow().as_ref().cloned() else {
+            return false;
+        };
+        let page = workspace_page_name(active);
+        if stack.child_by_name(&page).is_none() {
+            return false;
+        }
+        stack.set_visible_child_name(&page);
+        true
+    }
+}
+
+fn workspace_page_name(anchor: PaneId) -> String {
+    format!("anchor-{anchor}")
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    let millis = started.elapsed().as_millis();
+    millis.min(u128::from(u64::MAX)) as u64
 }
 
 fn walk_tree(w: &Widget, depth: usize, out: &mut Vec<String>) {

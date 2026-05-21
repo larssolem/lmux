@@ -1,29 +1,176 @@
 //! GUI-program launcher (Epic 9 UX): a spotlight-style popover that scans
-//! installed `.desktop` files and spawns the chosen entry as a satellite
-//! via [`lmux_compositor::spawn::spawn_tagged`].
+//! installed GUI apps and spawns the chosen entry as a satellite via
+//! [`lmux_compositor::spawn::spawn_tagged`].
+//!
+//! Platform scanners stay in `launcher/linux.rs` and `launcher/macos.rs` so
+//! Linux `.desktop` handling and macOS `.app` handling do not bleed together.
 //!
 //! Triggered by `Ctrl+B l` or the launcher button in the sidebar header.
 //! Keyboard-only: type to filter, Up/Down to navigate, Enter to pick,
 //! Esc to dismiss.
 
-use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+#![cfg_attr(target_os = "macos", allow(dead_code))]
+
+use std::cell::RefCell;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use gtk4::prelude::*;
+#[cfg(not(target_os = "macos"))]
+use gtk4::{gdk, EventControllerKey, ScrolledWindow, SelectionMode};
 use gtk4::{
-    gdk, glib, ApplicationWindow, Box as GtkBox, Entry, EventControllerKey, Label, ListBox,
-    ListBoxRow, Orientation, ScrolledWindow, SelectionMode, Window,
+    glib, ApplicationWindow, Box as GtkBox, Entry, Label, ListBox, ListBoxRow, Orientation, Window,
 };
 
 use crate::state::SharedAppState;
 
-/// One resolved `.desktop` entry.
+#[cfg(any(target_os = "linux", test))]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+
+/// One resolved launchable GUI entry from the current platform.
 #[derive(Debug, Clone)]
-pub struct DesktopEntry {
+pub struct LaunchEntry {
     pub name: String,
     pub exec: String,
     pub comment: Option<String>,
+    pub bundle_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchCacheStatus {
+    Empty,
+    Refreshing,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+struct LaunchCacheSnapshot {
+    entries: Vec<LaunchEntry>,
+    status: LaunchCacheStatus,
+    generation: u64,
+    last_error: Option<String>,
+}
+
+#[derive(Debug)]
+struct LaunchEntryCache {
+    entries: Vec<LaunchEntry>,
+    status: LaunchCacheStatus,
+    generation: u64,
+    last_refresh: Option<SystemTime>,
+    last_error: Option<String>,
+}
+
+impl Default for LaunchEntryCache {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            status: LaunchCacheStatus::Empty,
+            generation: 0,
+            last_refresh: None,
+            last_error: None,
+        }
+    }
+}
+
+static LAUNCH_CACHE: OnceLock<Mutex<LaunchEntryCache>> = OnceLock::new();
+#[cfg(test)]
+static TEST_SCAN_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+fn launch_cache() -> &'static Mutex<LaunchEntryCache> {
+    LAUNCH_CACHE.get_or_init(|| Mutex::new(LaunchEntryCache::default()))
+}
+
+fn cache_snapshot() -> LaunchCacheSnapshot {
+    match launch_cache().lock() {
+        Ok(cache) => LaunchCacheSnapshot {
+            entries: cache.entries.clone(),
+            status: cache.status,
+            generation: cache.generation,
+            last_error: cache.last_error.clone(),
+        },
+        Err(err) => {
+            tracing::warn!(error = %err, "launcher.cache: poisoned lock");
+            LaunchCacheSnapshot {
+                entries: Vec::new(),
+                status: LaunchCacheStatus::Failed,
+                generation: 0,
+                last_error: Some("launcher cache lock poisoned".into()),
+            }
+        }
+    }
+}
+
+/// Start a background refresh of launchable applications. This function is
+/// intentionally cheap enough to call from UI paths; actual platform scanning
+/// happens on a worker thread.
+pub fn warm_cache() {
+    let should_spawn = match launch_cache().lock() {
+        Ok(mut cache) => {
+            if cache.status == LaunchCacheStatus::Refreshing {
+                false
+            } else {
+                cache.status = LaunchCacheStatus::Refreshing;
+                cache.generation = cache.generation.saturating_add(1);
+                cache.last_error = None;
+                true
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "launcher.cache: warm skipped");
+            false
+        }
+    };
+    if !should_spawn {
+        return;
+    }
+
+    let spawn_started = Instant::now();
+    match std::thread::Builder::new()
+        .name("lmux-launcher-scan".into())
+        .spawn(move || {
+            let started = Instant::now();
+            let mut entries = scan_launch_entries();
+            entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            let count = entries.len();
+            match launch_cache().lock() {
+                Ok(mut cache) => {
+                    cache.entries = entries;
+                    cache.status = LaunchCacheStatus::Ready;
+                    cache.generation = cache.generation.saturating_add(1);
+                    cache.last_refresh = Some(SystemTime::now());
+                    cache.last_error = None;
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "launcher.cache: failed to store scan results");
+                }
+            }
+            tracing::info!(
+                operation = "launcher.scan",
+                duration_ms = elapsed_ms(started),
+                entries = count,
+                ui_path = false,
+                "launcher scan completed"
+            );
+        }) {
+        Ok(_) => tracing::debug!(
+            operation = "launcher.cache.warm",
+            duration_ms = elapsed_ms(spawn_started),
+            "launcher cache refresh started"
+        ),
+        Err(err) => {
+            if let Ok(mut cache) = launch_cache().lock() {
+                cache.status = LaunchCacheStatus::Failed;
+                cache.generation = cache.generation.saturating_add(1);
+                cache.last_error = Some(err.to_string());
+            }
+            tracing::warn!(error = %err, "launcher.cache: worker spawn failed");
+        }
+    }
 }
 
 /// Open the launcher dialog over `anchor`. Implemented as a modal
@@ -31,10 +178,33 @@ pub struct DesktopEntry {
 /// ApplicationWindow position their anchor rect at (0,0), which on some
 /// KWin/Wayland setups lands the popup offscreen. A modal window renders
 /// reliably regardless of surface.
+#[cfg(target_os = "macos")]
 pub fn open(anchor: &ApplicationWindow, state: &SharedAppState) {
-    let mut entries = scan_desktop_entries();
-    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    tracing::info!(count = entries.len(), "launcher: scanned desktop entries");
+    let _ = (anchor, state);
+    tracing::debug!(
+        operation = "launcher.open",
+        "launcher is disabled on macOS; attach an already-open window instead"
+    );
+}
+
+/// Open the launcher dialog over `anchor`. Implemented as a modal
+/// transient-for Window rather than a Popover: Popovers parented to an
+/// ApplicationWindow position their anchor rect at (0,0), which on some
+/// KWin/Wayland setups lands the popup offscreen. A modal window renders
+/// reliably regardless of surface.
+#[cfg(not(target_os = "macos"))]
+pub fn open(anchor: &ApplicationWindow, state: &SharedAppState) {
+    let opened_at = Instant::now();
+    let snapshot = launcher_open_snapshot();
+    let entries = std::rc::Rc::new(RefCell::new(snapshot.entries));
+    let status = std::rc::Rc::new(RefCell::new(snapshot.status));
+    tracing::debug!(
+        operation = "launcher.open",
+        cache_status = ?snapshot.status,
+        cache_generation = snapshot.generation,
+        entries = entries.borrow().len(),
+        "launcher open using cache snapshot"
+    );
 
     let dialog = Window::builder()
         .transient_for(anchor)
@@ -62,18 +232,29 @@ pub fn open(anchor: &ApplicationWindow, state: &SharedAppState) {
     scroller.set_child(Some(&list));
     body.append(&scroller);
 
-    let empty_label = Label::new(Some("(no matches)"));
+    let empty_label = Label::new(Some(empty_state_text(
+        snapshot.status,
+        entries.borrow().is_empty(),
+        "",
+    )));
     empty_label.add_css_class("dim-label");
 
-    rebuild_rows(&list, &empty_label, &entries, "");
+    rebuild_rows(&list, &empty_label, snapshot.status, &entries.borrow(), "");
     dialog.set_child(Some(&body));
 
     let entry_list = list.clone();
     let entry_empty = empty_label.clone();
     let entry_entries = entries.clone();
+    let entry_status = status.clone();
     entry.connect_changed(move |e| {
         let query = e.text().to_string();
-        rebuild_rows(&entry_list, &entry_empty, &entry_entries, &query);
+        rebuild_rows(
+            &entry_list,
+            &entry_empty,
+            *entry_status.borrow(),
+            &entry_entries.borrow(),
+            &query,
+        );
     });
 
     let dialog_activate = dialog.clone();
@@ -83,7 +264,7 @@ pub fn open(anchor: &ApplicationWindow, state: &SharedAppState) {
     let commit = move || {
         if let Some(row) = list_activate.selected_row() {
             if let Some(origin) = row_origin_index(&row) {
-                if let Some(de) = entries_for_commit.get(origin) {
+                if let Some(de) = entries_for_commit.borrow().get(origin) {
                     spawn_entry(de, &state_for_commit);
                 }
             }
@@ -119,18 +300,98 @@ pub fn open(anchor: &ApplicationWindow, state: &SharedAppState) {
 
     dialog.present();
     entry.grab_focus();
+
+    install_cache_refresh_poll(
+        &dialog,
+        &entry,
+        &list,
+        &empty_label,
+        entries,
+        status,
+        snapshot.generation,
+    );
+    tracing::info!(
+        operation = "launcher.open",
+        duration_ms = elapsed_ms(opened_at),
+        cache_status = ?snapshot.status,
+        cache_generation = snapshot.generation,
+        entries = cache_snapshot().entries.len(),
+        ui_path = true,
+        "launcher opened"
+    );
+}
+
+fn launcher_open_snapshot() -> LaunchCacheSnapshot {
+    warm_cache();
+    cache_snapshot()
+}
+
+fn install_cache_refresh_poll(
+    dialog: &Window,
+    entry: &Entry,
+    list: &ListBox,
+    empty_label: &Label,
+    entries: std::rc::Rc<RefCell<Vec<LaunchEntry>>>,
+    status: std::rc::Rc<RefCell<LaunchCacheStatus>>,
+    initial_generation: u64,
+) {
+    let dialog_weak = dialog.downgrade();
+    let entry = entry.clone();
+    let list = list.clone();
+    let empty_label = empty_label.clone();
+    let mut seen_generation = initial_generation;
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        if dialog_weak.upgrade().is_none() {
+            return glib::ControlFlow::Break;
+        }
+        let snapshot = cache_snapshot();
+        if snapshot.generation != seen_generation {
+            seen_generation = snapshot.generation;
+            *status.borrow_mut() = snapshot.status;
+            *entries.borrow_mut() = snapshot.entries;
+            let query = entry.text().to_string();
+            rebuild_rows(
+                &list,
+                &empty_label,
+                snapshot.status,
+                &entries.borrow(),
+                &query,
+            );
+            tracing::debug!(
+                operation = "launcher.cache.refresh_visible",
+                cache_status = ?snapshot.status,
+                cache_generation = snapshot.generation,
+                entries = entries.borrow().len(),
+                error = ?snapshot.last_error,
+                "launcher rows refreshed from cache"
+            );
+        }
+        if matches!(
+            snapshot.status,
+            LaunchCacheStatus::Ready | LaunchCacheStatus::Failed
+        ) {
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
 }
 
 /// Rebuild list rows from `entries` filtered by `query` (substring,
 /// case-insensitive, matches against Name + Comment). Row `index()` maps
 /// back into `entries` via the filtered-index table stored on each row as
 /// a GObject data key.
-fn rebuild_rows(list: &ListBox, empty_label: &Label, entries: &[DesktopEntry], query: &str) {
+fn rebuild_rows(
+    list: &ListBox,
+    empty_label: &Label,
+    status: LaunchCacheStatus,
+    entries: &[LaunchEntry],
+    query: &str,
+) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
     }
     let needle = query.trim().to_lowercase();
-    let filtered: Vec<(usize, &DesktopEntry)> = entries
+    let filtered: Vec<(usize, &LaunchEntry)> = entries
         .iter()
         .enumerate()
         .filter(|(_, de)| {
@@ -147,6 +408,7 @@ fn rebuild_rows(list: &ListBox, empty_label: &Label, entries: &[DesktopEntry], q
         })
         .collect();
     if filtered.is_empty() {
+        empty_label.set_label(empty_state_text(status, entries.is_empty(), query));
         list.append(empty_label);
         return;
     }
@@ -182,6 +444,18 @@ fn rebuild_rows(list: &ListBox, empty_label: &Label, entries: &[DesktopEntry], q
     }
 }
 
+fn empty_state_text(status: LaunchCacheStatus, entries_empty: bool, query: &str) -> &'static str {
+    if entries_empty && query.trim().is_empty() {
+        match status {
+            LaunchCacheStatus::Empty | LaunchCacheStatus::Refreshing => "(loading applications...)",
+            LaunchCacheStatus::Failed => "(could not load applications)",
+            LaunchCacheStatus::Ready => "(no launchable applications)",
+        }
+    } else {
+        "(no matches)"
+    }
+}
+
 fn row_origin_index(row: &ListBoxRow) -> Option<usize> {
     // SAFETY: we set this data with `set_data::<usize>` in `rebuild_rows`;
     // only `usize` is ever stored under this key.
@@ -200,7 +474,7 @@ fn move_selection(list: &ListBox, delta: i32) {
     }
 }
 
-fn spawn_entry(de: &DesktopEntry, state: &SharedAppState) {
+fn spawn_entry(de: &LaunchEntry, state: &SharedAppState) {
     let argv = match parse_exec(&de.exec) {
         Some(v) if !v.is_empty() => v,
         _ => {
@@ -208,11 +482,14 @@ fn spawn_entry(de: &DesktopEntry, state: &SharedAppState) {
             return;
         }
     };
+    let anchor_at_launch = state.borrow().active_anchor();
+
     // Pin the child onto the nested-compositor socket (ADR-0018). When
     // the cockpit's wayland host hasn't started (e.g. CI, or bind
     // failure) we fall back to inheriting WAYLAND_DISPLAY, which means
     // the satellite docks to the *outer* compositor like in v0.1.
     let nested_display = state.borrow().wayland_display_name().map(|s| s.to_string());
+
     let spawn_res =
         lmux_compositor::spawn::spawn_tagged_with_env(&argv, None, nested_display.as_deref());
     match spawn_res {
@@ -228,11 +505,12 @@ fn spawn_entry(de: &DesktopEntry, state: &SharedAppState) {
             // so it hides on anchor switch-away and returns on switch-back,
             // mirroring terminal pane workspace membership.
             let mut s = state.borrow_mut();
-            if let Some(anchor) = s.active_anchor() {
-                s.register_satellite(anchor, pid);
+            if let Some(anchor) = anchor_at_launch {
+                s.register_satellite_spawn(anchor, id, pid, de.bundle_id.clone());
             } else {
                 tracing::warn!(pid, "launcher: no active anchor — satellite is unmanaged");
             }
+            drop(s);
         }
         Err(err) => tracing::warn!(name = %de.name, error = %err, "launcher: spawn failed"),
     }
@@ -293,117 +571,40 @@ pub fn parse_exec(exec: &str) -> Option<Vec<String>> {
     }
 }
 
-/// Scan every `.desktop` file found on the XDG application search path.
-/// Duplicate file IDs (e.g. system entry overridden by a user one) are
-/// resolved by taking whichever path appears first — mirroring the
-/// freedesktop override rule: earlier dirs on `$XDG_DATA_DIRS` shadow
-/// later ones, and `$XDG_DATA_HOME` shadows everything.
-pub fn scan_desktop_entries() -> Vec<DesktopEntry> {
-    scan_desktop_entries_in(&application_dirs())
+/// Scan launchable GUI entries for the current platform.
+pub fn scan_launch_entries() -> Vec<LaunchEntry> {
+    #[cfg(test)]
+    TEST_SCAN_CALLS.fetch_add(1, Ordering::SeqCst);
+    let started = Instant::now();
+    let entries = scan_launch_entries_inner();
+    tracing::debug!(
+        operation = "launcher.scan",
+        duration_ms = elapsed_ms(started),
+        entries = entries.len(),
+        ui_path = false,
+        "launcher scan finished"
+    );
+    entries
 }
 
-/// Same as [`scan_desktop_entries`] but with an explicit list of search
-/// directories. Extracted so tests can point at a tempdir without
-/// mutating process-wide environment variables.
-pub fn scan_desktop_entries_in(dirs: &[PathBuf]) -> Vec<DesktopEntry> {
-    let mut seen: HashMap<String, DesktopEntry> = HashMap::new();
-    for dir in dirs {
-        let Ok(rd) = fs::read_dir(dir) else { continue };
-        for entry in rd.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("desktop") {
-                continue;
-            }
-            let id = match path.file_name().and_then(|s| s.to_str()) {
-                Some(n) => n.to_string(),
-                None => continue,
-            };
-            if seen.contains_key(&id) {
-                continue;
-            }
-            if let Some(de) = parse_desktop_file(&path) {
-                seen.insert(id, de);
-            }
-        }
+fn scan_launch_entries_inner() -> Vec<LaunchEntry> {
+    #[cfg(target_os = "macos")]
+    {
+        return macos::scan_launch_entries();
     }
-    seen.into_values().collect()
+    #[cfg(target_os = "linux")]
+    {
+        return linux::scan_launch_entries();
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Vec::new()
+    }
 }
 
-fn application_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("XDG_DATA_HOME") {
-        dirs.push(PathBuf::from(home).join("applications"));
-    } else if let Some(home) = std::env::var_os("HOME") {
-        dirs.push(PathBuf::from(home).join(".local/share/applications"));
-    }
-    let data_dirs = std::env::var("XDG_DATA_DIRS")
-        .unwrap_or_else(|_| "/usr/local/share:/usr/share".to_string());
-    for d in data_dirs.split(':') {
-        if d.is_empty() {
-            continue;
-        }
-        dirs.push(PathBuf::from(d).join("applications"));
-    }
-    dirs
-}
-
-/// Minimal parser for the `[Desktop Entry]` section. Skips entries where
-/// `NoDisplay=true`, `Hidden=true`, `Type != Application`, or `Terminal=true`
-/// (terminal apps want a terminal — not our problem to host them as a
-/// satellite window).
-fn parse_desktop_file(path: &Path) -> Option<DesktopEntry> {
-    let content = fs::read_to_string(path).ok()?;
-    let mut in_section = false;
-    let mut name: Option<String> = None;
-    let mut exec: Option<String> = None;
-    let mut comment: Option<String> = None;
-    let mut kind: Option<String> = None;
-    let mut no_display = false;
-    let mut hidden = false;
-    let mut terminal = false;
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if line.starts_with('[') && line.ends_with(']') {
-            in_section = line == "[Desktop Entry]";
-            continue;
-        }
-        if !in_section {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        // Prefer the plain key over locale-suffixed variants (Name[nb_NO]=).
-        // If we've already captured a plain value, skip locale variants.
-        match key.trim() {
-            "Name" if name.is_none() => name = Some(value.trim().to_string()),
-            "Exec" if exec.is_none() => exec = Some(value.trim().to_string()),
-            "Comment" if comment.is_none() => comment = Some(value.trim().to_string()),
-            "Type" => kind = Some(value.trim().to_string()),
-            "NoDisplay" => no_display = value.trim().eq_ignore_ascii_case("true"),
-            "Hidden" => hidden = value.trim().eq_ignore_ascii_case("true"),
-            "Terminal" => terminal = value.trim().eq_ignore_ascii_case("true"),
-            _ => {}
-        }
-    }
-
-    if no_display || hidden || terminal {
-        return None;
-    }
-    if kind.as_deref() != Some("Application") {
-        return None;
-    }
-    let name = name?;
-    let exec = exec?;
-    Some(DesktopEntry {
-        name,
-        exec,
-        comment,
-    })
+fn elapsed_ms(started: Instant) -> u64 {
+    let millis = started.elapsed().as_millis();
+    millis.min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(test)]
@@ -438,105 +639,26 @@ mod tests {
         assert!(parse_exec("   ").is_none());
     }
 
-    fn write_desktop(dir: &std::path::Path, name: &str, body: &str) {
-        let path = dir.join(format!("{name}.desktop"));
-        std::fs::write(path, body).unwrap();
-    }
-
-    #[test]
-    fn scan_picks_up_application_entries() {
-        let tmp = tempfile::tempdir().unwrap();
-        let apps = tmp.path().to_path_buf();
-        write_desktop(
-            &apps,
-            "chrome",
-            "[Desktop Entry]\nType=Application\nName=Chrome\nExec=google-chrome %U\n",
-        );
-        write_desktop(
-            &apps,
-            "firefox",
-            "[Desktop Entry]\nType=Application\nName=Firefox\nExec=firefox %u\nComment=Web browser\n",
-        );
-        let entries = scan_desktop_entries_in(&[apps]);
-        assert_eq!(entries.len(), 2);
-        let mut names: Vec<_> = entries.iter().map(|e| e.name.clone()).collect();
-        names.sort();
-        assert_eq!(names, vec!["Chrome".to_string(), "Firefox".to_string()]);
-    }
-
-    #[test]
-    fn scan_skips_nodisplay_hidden_terminal_and_nonapp() {
-        let tmp = tempfile::tempdir().unwrap();
-        let apps = tmp.path().to_path_buf();
-        write_desktop(
-            &apps,
-            "hidden",
-            "[Desktop Entry]\nType=Application\nName=Hidden\nExec=x\nHidden=true\n",
-        );
-        write_desktop(
-            &apps,
-            "nodisplay",
-            "[Desktop Entry]\nType=Application\nName=ND\nExec=x\nNoDisplay=true\n",
-        );
-        write_desktop(
-            &apps,
-            "term",
-            "[Desktop Entry]\nType=Application\nName=TermApp\nExec=x\nTerminal=true\n",
-        );
-        write_desktop(
-            &apps,
-            "link",
-            "[Desktop Entry]\nType=Link\nName=Link\nURL=https://example.com\n",
-        );
-        write_desktop(
-            &apps,
-            "good",
-            "[Desktop Entry]\nType=Application\nName=Good\nExec=ok\n",
-        );
-        let entries = scan_desktop_entries_in(&[apps]);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "Good");
-    }
-
-    #[test]
-    fn scan_resolves_override_by_first_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let user = tmp.path().join("user");
-        let sys = tmp.path().join("sys");
-        std::fs::create_dir_all(&user).unwrap();
-        std::fs::create_dir_all(&sys).unwrap();
-        write_desktop(
-            &user,
-            "chrome",
-            "[Desktop Entry]\nType=Application\nName=Chrome (user override)\nExec=chrome\n",
-        );
-        write_desktop(
-            &sys,
-            "chrome",
-            "[Desktop Entry]\nType=Application\nName=Chrome\nExec=chrome\n",
-        );
-        let entries = scan_desktop_entries_in(&[user, sys]);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "Chrome (user override)");
-    }
-
     #[test]
     fn substring_filter_matches_name_prefix() {
         let entries = [
-            DesktopEntry {
+            LaunchEntry {
                 name: "Chromium".into(),
                 exec: "chromium".into(),
                 comment: None,
+                bundle_id: None,
             },
-            DesktopEntry {
+            LaunchEntry {
                 name: "Firefox".into(),
                 exec: "firefox".into(),
                 comment: Some("Web browser".into()),
+                bundle_id: None,
             },
-            DesktopEntry {
+            LaunchEntry {
                 name: "Kate".into(),
                 exec: "kate".into(),
                 comment: None,
+                bundle_id: None,
             },
         ];
         let matches: Vec<_> = entries
@@ -557,10 +679,11 @@ mod tests {
 
     #[test]
     fn substring_filter_also_matches_comment() {
-        let entries = [DesktopEntry {
+        let entries = [LaunchEntry {
             name: "Firefox".into(),
             exec: "firefox".into(),
             comment: Some("Web browser".into()),
+            bundle_id: None,
         }];
         let needle = "browser".to_lowercase();
         let matches = entries
@@ -575,5 +698,55 @@ mod tests {
             })
             .count();
         assert_eq!(matches, 1);
+    }
+
+    #[test]
+    fn launcher_cache_snapshot_does_not_scan() {
+        let before = TEST_SCAN_CALLS.load(Ordering::SeqCst);
+        let _ = cache_snapshot();
+        assert_eq!(TEST_SCAN_CALLS.load(Ordering::SeqCst), before);
+    }
+
+    #[test]
+    fn launcher_open_snapshot_renders_loading_cache_without_scanning_inline() {
+        {
+            let mut cache = launch_cache().lock().unwrap();
+            cache.entries.clear();
+            cache.status = LaunchCacheStatus::Refreshing;
+            cache.generation = 42;
+            cache.last_error = None;
+        }
+        let before = TEST_SCAN_CALLS.load(Ordering::SeqCst);
+
+        let snapshot = launcher_open_snapshot();
+
+        assert_eq!(TEST_SCAN_CALLS.load(Ordering::SeqCst), before);
+        assert_eq!(snapshot.status, LaunchCacheStatus::Refreshing);
+        assert!(snapshot.entries.is_empty());
+        assert_eq!(
+            empty_state_text(snapshot.status, snapshot.entries.is_empty(), ""),
+            "(loading applications...)"
+        );
+    }
+
+    #[test]
+    fn launcher_empty_state_reports_cache_failure_without_scanning() {
+        {
+            let mut cache = launch_cache().lock().unwrap();
+            cache.entries.clear();
+            cache.status = LaunchCacheStatus::Failed;
+            cache.generation = 43;
+            cache.last_error = Some("boom".into());
+        }
+        let before = TEST_SCAN_CALLS.load(Ordering::SeqCst);
+
+        let snapshot = cache_snapshot();
+
+        assert_eq!(TEST_SCAN_CALLS.load(Ordering::SeqCst), before);
+        assert_eq!(snapshot.status, LaunchCacheStatus::Failed);
+        assert_eq!(
+            empty_state_text(snapshot.status, snapshot.entries.is_empty(), ""),
+            "(could not load applications)"
+        );
     }
 }

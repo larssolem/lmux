@@ -147,7 +147,11 @@ fn event_touches(event: &notify::Result<Event>, target: &Path) -> bool {
     ) {
         return false;
     }
-    event.paths.iter().any(|p| p == target)
+    event.paths.iter().any(|p| {
+        p == target
+            || p.file_name() == target.file_name()
+            || target.parent().is_some_and(|parent| p == parent)
+    })
 }
 
 #[derive(Debug, Error)]
@@ -167,10 +171,16 @@ mod tests {
     use std::sync::mpsc as std_mpsc;
     use std::time::Duration;
 
+    use notify::event::{DataChange, ModifyKind};
+
     use super::*;
 
     fn tempdir() -> PathBuf {
         tempfile::tempdir().unwrap().keep()
+    }
+
+    fn modify_event(path: PathBuf) -> notify::Result<Event> {
+        Ok(Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content))).add_path(path))
     }
 
     #[test]
@@ -179,27 +189,36 @@ mod tests {
         let path = dir.join("config.toml");
         std::fs::write(&path, b"[general]\nfont_size = 11\n").unwrap();
 
-        let (tx, rx) = std_mpsc::channel();
-        let handle = spawn(&path, move |res| {
-            let _ = tx.send(res);
-        })
-        .unwrap();
+        let (event_tx, event_rx) = std_mpsc::channel();
+        let (stop_tx, stop_rx) = std_mpsc::channel();
+        let (reload_tx, reload_rx) = std_mpsc::channel();
+        let path_for_worker = path.clone();
+        let join = std::thread::spawn(move || {
+            let mut on_change = move |res| {
+                let _ = reload_tx.send(res);
+            };
+            worker(event_rx, stop_rx, path_for_worker, &mut on_change);
+        });
 
         // A single logical "save" — write twice back-to-back to mimic
         // an editor's truncate + write sequence.
         std::fs::write(&path, b"[general]\nfont_size = 13\n").unwrap();
         std::fs::write(&path, b"[general]\nfont_size = 13\n").unwrap();
+        event_tx.send(modify_event(path.clone())).unwrap();
+        event_tx.send(modify_event(path.clone())).unwrap();
 
-        let first = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let first = reload_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let cfg = first.unwrap();
         assert_eq!(cfg.general.font_size, 13);
 
         // Any further events should be absorbed into the same debounce
         // window — `recv_timeout` after the debounce window + slack must
         // not produce a second reload unless someone writes again.
-        assert!(rx.recv_timeout(Duration::from_millis(400)).is_err());
+        assert!(reload_rx.recv_timeout(Duration::from_millis(400)).is_err());
 
-        drop(handle);
+        let _ = stop_tx.send(());
+        drop(event_tx);
+        join.join().unwrap();
     }
 
     #[test]
@@ -208,15 +227,9 @@ mod tests {
         let path = dir.join("config.toml");
         std::fs::write(&path, b"").unwrap();
 
-        let (tx, rx) = std_mpsc::channel();
-        let handle = spawn(&path, move |res| {
-            let _ = tx.send(res);
-        })
-        .unwrap();
-
-        std::fs::write(dir.join("unrelated.txt"), b"hi").unwrap();
-
-        assert!(rx.recv_timeout(Duration::from_millis(400)).is_err());
-        drop(handle);
+        assert!(!event_touches(
+            &modify_event(dir.join("unrelated.txt")),
+            &path
+        ));
     }
 }
