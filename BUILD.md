@@ -43,6 +43,7 @@ mise run deps:macos
 mise run doctor:macos
 mise run verify
 mise run build:app
+mise run install:local
 mise run terminal
 ```
 

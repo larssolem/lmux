@@ -50,6 +50,11 @@ description = "Build the lmux app binary with the pinned Zig toolchain"
 depends = ["deps:macos"]
 run = "cargo build -p lmux"
 
+[tasks."install:local"]
+description = "Install the lmux app binary into Cargo's local bin directory"
+depends = ["deps:macos"]
+run = "cargo install --path crates/lmux --force"
+
 [tasks."macos:smoke"]
 description = "Run the first-pass macOS smoke test sequence"
 depends = ["deps:macos"]
