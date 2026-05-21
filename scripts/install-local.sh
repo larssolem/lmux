@@ -40,7 +40,7 @@ case "$os" in
   <key>CFBundleExecutable</key>
   <string>lmux</string>
   <key>CFBundleIdentifier</key>
-  <string>dev.lmux.lmux</string>
+  <string>no.jpro.lmux</string>
   <key>CFBundleName</key>
   <string>lmux</string>
   <key>CFBundlePackageType</key>
@@ -57,10 +57,7 @@ case "$os" in
 </plist>
 PLIST
 
-    cat >"$macos_dir/lmux" <<APP
-#!/usr/bin/env bash
-exec "$lmux_bin" "\$@"
-APP
+    cp "$lmux_bin" "$macos_dir/lmux"
     chmod +x "$macos_dir/lmux"
 
     lsregister="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
@@ -68,6 +65,10 @@ APP
       "$lsregister" -f "$app_dir" >/dev/null 2>&1 || true
     fi
     echo "Installed app launcher: $app_dir"
+    if command -v open >/dev/null 2>&1; then
+      echo "Requesting macOS Accessibility permission for $app_dir"
+      open "$app_dir" --args --request-permissions >/dev/null 2>&1 || true
+    fi
     ;;
   Linux)
     data_home="${XDG_DATA_HOME:-$HOME/.local/share}"

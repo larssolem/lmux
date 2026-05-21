@@ -304,6 +304,7 @@ fn install_application_menubar(app: &Application) {
 
     let window_menu = gio::Menu::new();
     window_menu.append(Some("Settings"), Some("app.settings"));
+    window_menu.append(Some("Request Permissions"), Some("app.request-permissions"));
     window_menu.append(Some("Quit"), Some("app.quit"));
     root.append_submenu(Some("Window"), &window_menu);
 
@@ -329,11 +330,28 @@ fn install_window_menu_actions(
     });
     app.add_action(&settings);
 
+    let request_permissions = gio::SimpleAction::new("request-permissions", None);
+    request_permissions.connect_activate(move |_, _| {
+        request_platform_permissions();
+    });
+    app.add_action(&request_permissions);
+
     let quit = gio::SimpleAction::new("quit", None);
     let app_for_quit = app.clone();
     let state_for_quit = state.clone();
     quit.connect_activate(move |_, _| run_shutdown(&app_for_quit, &state_for_quit));
     app.add_action(&quit);
+}
+
+#[cfg(target_os = "macos")]
+fn request_platform_permissions() {
+    let state = lmux_compositor::MacWindowCompositor::accessibility_permission_state(true);
+    tracing::info!(?state, "macOS Accessibility permission requested");
+}
+
+#[cfg(not(target_os = "macos"))]
+fn request_platform_permissions() {
+    tracing::info!("no platform permissions are required for this build");
 }
 
 /// tmux-style prefix key handler. Ctrl+B arms the prefix; the next

@@ -71,8 +71,14 @@ fn main() -> Result<()> {
     // `PR_SET_PDEATHSIG(SIGTERM)` set before it execs the real shell
     // (Story 7.3 / FR34 / NFR8). Not user-facing.
     let mut args_iter = std::env::args_os().skip(1);
-    if args_iter.next().as_deref() == Some(std::ffi::OsStr::new("--exec-pty")) {
-        pty_trampoline(args_iter.collect());
+    if let Some(first) = args_iter.next() {
+        if first.as_os_str() == std::ffi::OsStr::new("--exec-pty") {
+            pty_trampoline(args_iter.collect());
+        }
+        if first.as_os_str() == std::ffi::OsStr::new("--request-permissions") {
+            request_permissions();
+            return Ok(());
+        }
     }
 
     let _log_guard = tracing_setup::init();
@@ -92,6 +98,17 @@ fn main() -> Result<()> {
         anyhow::bail!("gtk::Application exited with status {code}");
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn request_permissions() {
+    let state = lmux_compositor::MacWindowCompositor::accessibility_permission_state(true);
+    println!("macOS Accessibility permission: {state:?}");
+}
+
+#[cfg(not(target_os = "macos"))]
+fn request_permissions() {
+    println!("No platform permissions are required for this build.");
 }
 
 fn pty_trampoline(rest: Vec<std::ffi::OsString>) -> ! {
