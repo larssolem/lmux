@@ -47,6 +47,10 @@ mise run install:local
 mise run terminal
 ```
 
+`mise run install:local` installs the `lmux` binary into Cargo's local bin
+directory and registers an OS launcher entry: `~/Applications/lmux.app` on
+macOS, or `~/.local/share/applications/lmux.desktop` on Linux.
+
 ### macOS port branch
 
 macOS work-in-progress notes live in [docs/macos-port.md](docs/macos-port.md).
