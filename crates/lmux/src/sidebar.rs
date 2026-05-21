@@ -17,7 +17,7 @@
 //! [`AppState::remove_anchor`] fires via the `set_anchors_changed_callback`
 //! hook installed in [`install`].
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -25,8 +25,9 @@ use std::rc::Rc;
 use gtk4::pango::prelude::{FontFamilyExt, FontMapExt};
 use gtk4::prelude::*;
 use gtk4::{
-    gdk, glib, Align, Box as GtkBox, Button, DragSource, DropDown, DropTarget, Entry, Label,
-    ListBox, Orientation, Paned, Picture, Popover, PositionType, ScrolledWindow, StringObject,
+    gdk, glib, Align, Box as GtkBox, Button, DragSource, DropDown, DropTarget, Entry,
+    EventControllerMotion, Label, ListBox, Orientation, Paned, Picture, Popover, PositionType,
+    ScrolledWindow, StringObject,
 };
 
 use lmux_config::{Sidebar as SidebarCfg, SidebarPosition};
@@ -72,6 +73,8 @@ pub fn install(cfg: SidebarCfg, pane_tree_root: GtkBox, state: SharedAppState) -
     title.set_xalign(0.0);
     title.set_hexpand(true);
     header.append(&title);
+    let mut expanded_only: Vec<gtk4::Widget> = vec![title.clone().upcast()];
+
     // "+" button: spawn a fresh pane and tag it as a new anchor in its own
     // workspace. Needed because `add_anchor` refuses to promote satellites —
     // without this the user has no way to create a second anchor once every
@@ -80,6 +83,7 @@ pub fn install(cfg: SidebarCfg, pane_tree_root: GtkBox, state: SharedAppState) -
     new_anchor_btn.add_css_class("flat");
     new_anchor_btn.set_tooltip_text(Some("New anchor"));
     header.append(&new_anchor_btn);
+    expanded_only.push(new_anchor_btn.clone().upcast());
     let state_for_new = state.clone();
     new_anchor_btn.connect_clicked(move |_| {
         state_for_new.borrow_mut().create_new_anchor();
@@ -93,6 +97,7 @@ pub fn install(cfg: SidebarCfg, pane_tree_root: GtkBox, state: SharedAppState) -
         launcher_btn.add_css_class("flat");
         launcher_btn.set_tooltip_text(Some("Launch program (Ctrl+B l)"));
         header.append(&launcher_btn);
+        expanded_only.push(launcher_btn.clone().upcast());
         let state_for_launcher = state.clone();
         launcher_btn.connect_clicked(move |btn| {
             if let Some(root) = btn.root() {
@@ -108,6 +113,7 @@ pub fn install(cfg: SidebarCfg, pane_tree_root: GtkBox, state: SharedAppState) -
         attach_btn.add_css_class("flat");
         attach_btn.set_tooltip_text(Some("Attach macOS window"));
         header.append(&attach_btn);
+        expanded_only.push(attach_btn.clone().upcast());
         let state_for_attach = state.clone();
         attach_btn.connect_clicked(move |btn| {
             if let Some(root) = btn.root() {
@@ -128,6 +134,7 @@ pub fn install(cfg: SidebarCfg, pane_tree_root: GtkBox, state: SharedAppState) -
     scroll.set_hscrollbar_policy(gtk4::PolicyType::Never);
     scroll.set_child(Some(&list));
     sidebar_box.append(&scroll);
+    expanded_only.push(scroll.clone().upcast());
 
     // Horizontal split: sidebar + pane tree. Order depends on config.
     let paned = Paned::new(Orientation::Horizontal);
@@ -149,20 +156,78 @@ pub fn install(cfg: SidebarCfg, pane_tree_root: GtkBox, state: SharedAppState) -
         }
     }
 
-    // Collapsed state is a simple width swap — the widget stays visible but
-    // renders at `collapsed_width` with its label hidden.
-    let collapsed = Rc::new(RefCell::new(cfg.collapsed));
-    apply_collapsed(&sidebar_box, &title, &cfg, *collapsed.borrow());
+    // Collapsed state is a compact rail. Hovering the rail temporarily expands
+    // it so the anchor list remains quickly reachable without permanently
+    // taking horizontal space from the workspace.
+    let collapsed = Rc::new(Cell::new(cfg.collapsed));
+    let hover_expanded = Rc::new(Cell::new(false));
+    let expanded_only = Rc::new(expanded_only);
+    apply_collapsed(
+        &sidebar_box,
+        &paned,
+        &cfg,
+        collapsed.get(),
+        hover_expanded.get(),
+        &expanded_only,
+    );
 
     let sb_for_btn = sidebar_box.clone();
-    let title_for_btn = title.clone();
+    let paned_for_btn = paned.clone();
     let cfg_for_btn = cfg.clone();
     let collapsed_for_btn = collapsed.clone();
+    let hover_for_btn = hover_expanded.clone();
+    let expanded_only_for_btn = expanded_only.clone();
     collapse_btn.connect_clicked(move |_| {
-        let mut c = collapsed_for_btn.borrow_mut();
-        *c = !*c;
-        apply_collapsed(&sb_for_btn, &title_for_btn, &cfg_for_btn, *c);
+        collapsed_for_btn.set(!collapsed_for_btn.get());
+        hover_for_btn.set(false);
+        apply_collapsed(
+            &sb_for_btn,
+            &paned_for_btn,
+            &cfg_for_btn,
+            collapsed_for_btn.get(),
+            hover_for_btn.get(),
+            &expanded_only_for_btn,
+        );
     });
+
+    let hover = EventControllerMotion::new();
+    let sb_for_enter = sidebar_box.clone();
+    let paned_for_enter = paned.clone();
+    let cfg_for_enter = cfg.clone();
+    let collapsed_for_enter = collapsed.clone();
+    let hover_for_enter = hover_expanded.clone();
+    let expanded_only_for_enter = expanded_only.clone();
+    hover.connect_enter(move |_, _, _| {
+        if collapsed_for_enter.get() {
+            hover_for_enter.set(true);
+            apply_collapsed(
+                &sb_for_enter,
+                &paned_for_enter,
+                &cfg_for_enter,
+                collapsed_for_enter.get(),
+                hover_for_enter.get(),
+                &expanded_only_for_enter,
+            );
+        }
+    });
+    let sb_for_leave = sidebar_box.clone();
+    let paned_for_leave = paned.clone();
+    let cfg_for_leave = cfg.clone();
+    let collapsed_for_leave = collapsed.clone();
+    let hover_for_leave = hover_expanded.clone();
+    let expanded_only_for_leave = expanded_only.clone();
+    hover.connect_leave(move |_| {
+        hover_for_leave.set(false);
+        apply_collapsed(
+            &sb_for_leave,
+            &paned_for_leave,
+            &cfg_for_leave,
+            collapsed_for_leave.get(),
+            hover_for_leave.get(),
+            &expanded_only_for_leave,
+        );
+    });
+    sidebar_box.add_controller(hover);
 
     // Initial fill + install the refresh hook on AppState.
     let preview_cfg = PreviewCfg {
@@ -194,14 +259,34 @@ pub fn install(cfg: SidebarCfg, pane_tree_root: GtkBox, state: SharedAppState) -
     paned.upcast()
 }
 
-fn apply_collapsed(sidebar: &GtkBox, title: &Label, cfg: &SidebarCfg, collapsed: bool) {
-    if collapsed {
-        sidebar.set_width_request(cfg.collapsed_width as i32);
-        title.set_visible(false);
+fn apply_collapsed(
+    sidebar: &GtkBox,
+    paned: &Paned,
+    cfg: &SidebarCfg,
+    collapsed: bool,
+    hover_expanded: bool,
+    expanded_only: &[gtk4::Widget],
+) {
+    let expanded = !collapsed || hover_expanded;
+    let width = if expanded {
+        cfg.width
     } else {
-        sidebar.set_width_request(cfg.width as i32);
-        title.set_visible(true);
+        cfg.collapsed_width
     }
+    .max(32) as i32;
+    sidebar.set_width_request(width);
+    for widget in expanded_only {
+        widget.set_visible(expanded);
+    }
+    match cfg.position {
+        SidebarPosition::Left => paned.set_position(width),
+        SidebarPosition::Right => {
+            let paned_width = paned.width();
+            if paned_width > width {
+                paned.set_position(paned_width - width);
+            }
+        }
+    };
 }
 
 #[derive(Clone, Copy)]
