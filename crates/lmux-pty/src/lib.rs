@@ -1,6 +1,8 @@
 //! PTY spawn + IO plumbing on top of portable-pty.
 
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
+#[cfg(unix)]
+use std::ffi::CStr;
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -129,7 +131,11 @@ fn trampoline_path() -> Option<std::path::PathBuf> {
 }
 
 pub fn detect_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+    std::env::var("SHELL")
+        .ok()
+        .filter(|shell| !shell.trim().is_empty())
+        .or_else(login_shell_from_passwd)
+        .unwrap_or_else(|| "/bin/sh".to_string())
 }
 
 /// Open a new PTY, spawn `shell` in it, and return the pane handle plus a
@@ -157,9 +163,16 @@ pub fn spawn(opts: SpawnOpts<'_>) -> Result<(Pane, Box<dyn Read + Send>), Error>
         let mut c = CommandBuilder::new(&trampoline);
         c.arg("--exec-pty");
         c.arg(&opts.shell);
+        for arg in login_shell_args(&opts.shell) {
+            c.arg(arg);
+        }
         c
     } else {
-        CommandBuilder::new(&opts.shell)
+        let mut c = CommandBuilder::new(&opts.shell);
+        for arg in login_shell_args(&opts.shell) {
+            c.arg(arg);
+        }
+        c
     };
     cmd.env("TERM", "xterm-256color");
     if let Some(cwd) = opts.cwd {
@@ -189,4 +202,58 @@ pub fn spawn(opts: SpawnOpts<'_>) -> Result<(Pane, Box<dyn Read + Send>), Error>
         },
         reader,
     ))
+}
+
+#[cfg(unix)]
+fn login_shell_from_passwd() -> Option<String> {
+    // SAFETY: getpwuid returns a borrowed pointer to process-global passwd
+    // storage. We immediately copy the shell string before returning.
+    let uid = unsafe { libc::getuid() };
+    let passwd = unsafe { libc::getpwuid(uid) };
+    if passwd.is_null() {
+        return None;
+    }
+    let shell = unsafe { (*passwd).pw_shell };
+    if shell.is_null() {
+        return None;
+    }
+    unsafe { CStr::from_ptr(shell) }
+        .to_str()
+        .ok()
+        .map(str::trim)
+        .filter(|shell| !shell.is_empty())
+        .map(str::to_owned)
+}
+
+#[cfg(not(unix))]
+fn login_shell_from_passwd() -> Option<String> {
+    None
+}
+
+fn login_shell_args(shell: &str) -> &'static [&'static str] {
+    let name = Path::new(shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(shell);
+    match name {
+        "bash" | "zsh" | "fish" => &["-l"],
+        _ => &[],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_shell_args_cover_common_user_shells() {
+        assert_eq!(login_shell_args("/bin/zsh"), &["-l"]);
+        assert_eq!(login_shell_args("/opt/homebrew/bin/bash"), &["-l"]);
+        assert_eq!(login_shell_args("/opt/homebrew/bin/fish"), &["-l"]);
+    }
+
+    #[test]
+    fn login_shell_args_skip_plain_sh() {
+        assert!(login_shell_args("/bin/sh").is_empty());
+    }
 }
