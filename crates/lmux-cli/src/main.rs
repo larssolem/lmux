@@ -18,24 +18,22 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Promote the pane running this command to the session's anchor.
-    /// Equivalent to pressing `Super+A` on the pane (FR19 / FR36).
+    /// Equivalent to pressing `Ctrl+B` then `a` in the pane.
     MarkAnchor,
-    /// Session management (FR1-FR6, FR63).
+    /// Session management.
     #[command(subcommand)]
     Session(SessionCommand),
-    /// Anchor control (FR19 / FR36). Target anchor by UUID — shown under
-    /// each entry in the sidebar popover.
+    /// Anchor control. Target anchors by UUID, shown in the sidebar popover.
     #[command(subcommand)]
     Anchor(AnchorCommand),
     /// Live pane inventory. Lists every pane's UUID so the user can feed
     /// it into `anchor tag` without having to copy from the sidebar.
     #[command(subcommand)]
     Pane(PaneCommand),
-    /// GUI satellite control (Epic 9). v0.2 ships `open` only — `detach`
-    /// and geometry follow with v0.3.
+    /// GUI satellite control.
     #[command(subcommand)]
     Satellite(SatelliteCommand),
-    /// Cockpit snapshot: pid, version, anchor count, session count,
+    /// lmux process snapshot: pid, version, anchor count, session count,
     /// compositor state. Routed through the bus (`status.get`).
     Status,
 }
@@ -69,10 +67,8 @@ enum PaneCommand {
 
 #[derive(Subcommand, Debug)]
 enum SatelliteCommand {
-    /// Spawn a GUI satellite. The first positional argument is the
-    /// executable, remaining args are forwarded. The cockpit stamps
-    /// `LMUX_SATELLITE_ID=<uuid>` on the child's environment so the
-    /// compositor script can correlate the new window.
+    /// Legacy spawn path. Prefer `list-windows` + `attach-window`.
+    #[command(hide = true)]
     Open {
         /// Target pane UUID the satellite should dock to once the KWin
         /// script-side correlation lands (v0.3). v0.2 accepts it but
@@ -85,12 +81,16 @@ enum SatelliteCommand {
     },
     /// Attach the currently focused native macOS window to the active anchor.
     AttachFocused,
-    /// List native macOS windows that can be attached.
+    /// List native windows that can be attached.
     ListWindows,
-    /// Attach a specific native macOS window to the active anchor.
+    /// Attach a specific native window to the active anchor.
     AttachWindow {
+        #[arg(long, default_value = "macos")]
+        backend: String,
         #[arg(long)]
-        pid: u32,
+        backend_window_id: Option<String>,
+        #[arg(long)]
+        pid: Option<u32>,
         #[arg(long)]
         window_id: Option<i64>,
         #[arg(long)]
@@ -98,15 +98,32 @@ enum SatelliteCommand {
         #[arg(long)]
         bundle_id: Option<String>,
         #[arg(long)]
+        app_identity_kind: Option<String>,
+        #[arg(long)]
+        app_identity_value: Option<String>,
+        #[arg(long)]
         title: Option<String>,
     },
+}
+
+#[derive(Debug)]
+struct AttachWindowOptions {
+    backend: String,
+    backend_window_id: Option<String>,
+    pid: Option<u32>,
+    window_id: Option<i64>,
+    window_index: Option<u32>,
+    bundle_id: Option<String>,
+    app_identity_kind: Option<String>,
+    app_identity_value: Option<String>,
+    title: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
 enum SessionCommand {
     /// List sessions, most-recently-opened first.
     List,
-    /// Create a new empty session. Routed through the bus so the cockpit
+    /// Create a new empty session. Routed through the bus so lmux
     /// sees the new entry without a rescan.
     New {
         /// Session name — letters, digits, `-`, `_` only.
@@ -117,7 +134,7 @@ enum SessionCommand {
     /// Delete a session. The snapshot on disk is removed along with the
     /// index entry.
     Delete { name: String },
-    /// Swap the cockpit's live pane tree for the named session's
+    /// Swap lmux's live pane tree for the named session's
     /// snapshot. Equivalent to picking it in the Ctrl+B s switcher.
     Open { name: String },
 }
@@ -153,12 +170,26 @@ fn main() -> ExitCode {
         Command::Satellite(SatelliteCommand::AttachFocused) => run_satellite_attach_focused(),
         Command::Satellite(SatelliteCommand::ListWindows) => run_satellite_list_windows(),
         Command::Satellite(SatelliteCommand::AttachWindow {
+            backend,
+            backend_window_id,
             pid,
             window_id,
             window_index,
             bundle_id,
+            app_identity_kind,
+            app_identity_value,
             title,
-        }) => run_satellite_attach_window(pid, window_id, window_index, bundle_id, title),
+        }) => run_satellite_attach_window(AttachWindowOptions {
+            backend,
+            backend_window_id,
+            pid,
+            window_id,
+            window_index,
+            bundle_id,
+            app_identity_kind,
+            app_identity_value,
+            title,
+        }),
         Command::Status => run_status(),
     }
 }
@@ -196,15 +227,15 @@ fn run_satellite_list_windows() -> ExitCode {
     match res {
         Ok(lmux_bus::Kind::SatelliteListWindowsResult { windows }) => {
             for window in windows {
-                let window_id = window
-                    .window_id
+                let pid = window
+                    .pid
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".into());
-                let bundle = window.bundle_id.unwrap_or_else(|| "-".into());
+                let app = format_app_identity(window.app_identity.as_ref());
                 let title = window.title.unwrap_or_default();
                 println!(
-                    "pid={} window_id={} index={} bundle={} title={}",
-                    window.pid, window_id, window.window_index, bundle, title
+                    "backend={:?} backend_window_id={} pid={} app={} title={}",
+                    window.backend, window.backend_window_id, pid, app, title
                 );
             }
             ExitCode::SUCCESS
@@ -220,19 +251,49 @@ fn run_satellite_list_windows() -> ExitCode {
     }
 }
 
-fn run_satellite_attach_window(
-    pid: u32,
-    window_id: Option<i64>,
-    window_index: Option<u32>,
-    bundle_id: Option<String>,
-    title: Option<String>,
-) -> ExitCode {
-    match run_bus_write(lmux_bus::Kind::SatelliteAttachWindow {
+fn run_satellite_attach_window(options: AttachWindowOptions) -> ExitCode {
+    let AttachWindowOptions {
+        backend,
+        backend_window_id,
         pid,
         window_id,
         window_index,
         bundle_id,
+        app_identity_kind,
+        app_identity_value,
         title,
+    } = options;
+    let backend = match parse_window_backend(&backend) {
+        Ok(backend) => backend,
+        Err(err) => {
+            eprintln!("lmux-cli: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    let backend_window_id = match backend_window_id
+        .or_else(|| legacy_macos_backend_window_id(pid, window_id, window_index))
+    {
+        Some(value) => value,
+        None => {
+            eprintln!("lmux-cli: --backend-window-id is required");
+            return ExitCode::from(2);
+        }
+    };
+    let app_identity = match parse_app_identity(bundle_id, app_identity_kind, app_identity_value) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("lmux-cli: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    match run_bus_write(lmux_bus::Kind::SatelliteAttachWindow {
+        backend,
+        backend_window_id,
+        pid,
+        app_identity,
+        title,
+        workspace: None,
+        output: None,
     }) {
         Ok(()) => {
             println!("window attached");
@@ -242,6 +303,75 @@ fn run_satellite_attach_window(
             eprintln!("lmux-cli: {err}");
             ExitCode::from(1)
         }
+    }
+}
+
+fn parse_window_backend(backend: &str) -> Result<lmux_bus::kinds::WindowCandidateBackend, String> {
+    match backend {
+        "macos" => Ok(lmux_bus::kinds::WindowCandidateBackend::Macos),
+        "kwin" => Ok(lmux_bus::kinds::WindowCandidateBackend::Kwin),
+        "x11" => Ok(lmux_bus::kinds::WindowCandidateBackend::X11),
+        "hyprland" => Ok(lmux_bus::kinds::WindowCandidateBackend::Hyprland),
+        "sway" => Ok(lmux_bus::kinds::WindowCandidateBackend::Sway),
+        "noop" => Ok(lmux_bus::kinds::WindowCandidateBackend::Noop),
+        "unsupported" => Ok(lmux_bus::kinds::WindowCandidateBackend::Unsupported),
+        other => Err(format!("unknown window backend: {other}")),
+    }
+}
+
+fn legacy_macos_backend_window_id(
+    pid: Option<u32>,
+    window_id: Option<i64>,
+    window_index: Option<u32>,
+) -> Option<String> {
+    match (pid, window_id, window_index) {
+        (_, Some(window_id), Some(index)) => {
+            Some(format!("macos-window-id:{window_id}:index:{index}"))
+        }
+        (Some(pid), None, Some(index)) => Some(format!("macos-window-pid:{pid}:index:{index}")),
+        _ => None,
+    }
+}
+
+fn parse_app_identity(
+    bundle_id: Option<String>,
+    kind: Option<String>,
+    value: Option<String>,
+) -> Result<Option<lmux_bus::kinds::WindowAppIdentity>, String> {
+    if let Some(bundle_id) = bundle_id {
+        return Ok(Some(lmux_bus::kinds::WindowAppIdentity::BundleId(
+            bundle_id,
+        )));
+    }
+    let Some(kind) = kind else {
+        return Ok(None);
+    };
+    let Some(value) = value else {
+        return Err("--app-identity-value is required with --app-identity-kind".into());
+    };
+    let identity = match kind.as_str() {
+        "bundle_id" | "bundle-id" => lmux_bus::kinds::WindowAppIdentity::BundleId(value),
+        "desktop_entry" | "desktop-entry" => {
+            lmux_bus::kinds::WindowAppIdentity::DesktopEntry(value)
+        }
+        "wm_class" | "wm-class" => lmux_bus::kinds::WindowAppIdentity::WmClass(value),
+        "app_id" | "app-id" => lmux_bus::kinds::WindowAppIdentity::AppId(value),
+        "other" => lmux_bus::kinds::WindowAppIdentity::Other(value),
+        other => return Err(format!("unknown app identity kind: {other}")),
+    };
+    Ok(Some(identity))
+}
+
+fn format_app_identity(identity: Option<&lmux_bus::kinds::WindowAppIdentity>) -> String {
+    match identity {
+        Some(lmux_bus::kinds::WindowAppIdentity::BundleId(value)) => format!("bundle_id:{value}"),
+        Some(lmux_bus::kinds::WindowAppIdentity::DesktopEntry(value)) => {
+            format!("desktop_entry:{value}")
+        }
+        Some(lmux_bus::kinds::WindowAppIdentity::WmClass(value)) => format!("wm_class:{value}"),
+        Some(lmux_bus::kinds::WindowAppIdentity::AppId(value)) => format!("app_id:{value}"),
+        Some(lmux_bus::kinds::WindowAppIdentity::Other(value)) => format!("other:{value}"),
+        None => "-".into(),
     }
 }
 

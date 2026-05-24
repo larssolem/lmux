@@ -172,6 +172,7 @@ async fn serve_connection<H: Handler>(
         return Ok(());
     }
 
+    let mut handshake_complete = false;
     loop {
         let frame = match read_frame(&mut stream).await {
             Ok(f) => f,
@@ -193,6 +194,17 @@ async fn serve_connection<H: Handler>(
             }
         };
 
+        if !handshake_complete && envelope.kind != "hello" {
+            let payload = ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "hello handshake required before other requests".into(),
+                kind_received: Some(envelope.kind.clone()),
+                in_reply_to: Some(envelope.id),
+            };
+            write_error(&mut stream, envelope.id, payload).await?;
+            continue;
+        }
+
         // Try to parse the full kind; unknown-kind surfaces as serde error,
         // which we map back to `error.unknown_kind` carrying the received
         // tag so clients can introspect.
@@ -213,6 +225,7 @@ async fn serve_connection<H: Handler>(
         let response_kind = match &kind {
             Kind::Hello { client, pid } => {
                 debug!(?client, pid, "lmux-bus: hello");
+                handshake_complete = true;
                 Kind::HelloAck {
                     cockpit_version: handler.cockpit_version(),
                 }

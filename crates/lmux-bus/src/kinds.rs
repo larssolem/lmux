@@ -108,16 +108,46 @@ pub enum SatelliteState {
     FloatingFallback,
 }
 
+/// Window-manager backend namespace for native windows that can be explicitly
+/// attached to an anchor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MacosWindowCandidate {
-    pub pid: u32,
+#[serde(rename_all = "snake_case")]
+pub enum WindowCandidateBackend {
+    Macos,
+    Kwin,
+    X11,
+    Hyprland,
+    Sway,
+    Noop,
+    Unsupported,
+}
+
+/// Optional app identity attached to a native window candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum WindowAppIdentity {
+    BundleId(String),
+    DesktopEntry(String),
+    WmClass(String),
+    AppId(String),
+    Other(String),
+}
+
+/// One native GUI window that can be attached to an anchor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowCandidate {
+    pub backend: WindowCandidateBackend,
+    pub backend_window_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub window_id: Option<i64>,
-    pub window_index: u32,
+    pub pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bundle_id: Option<String>,
+    pub app_identity: Option<WindowAppIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
 }
 
 /// The v0.2 bus kind catalog. Tag is the envelope's `kind` field.
@@ -212,18 +242,21 @@ pub enum Kind {
     #[serde(rename = "satellite.list_windows")]
     SatelliteListWindows {},
     #[serde(rename = "satellite.list_windows.result")]
-    SatelliteListWindowsResult { windows: Vec<MacosWindowCandidate> },
+    SatelliteListWindowsResult { windows: Vec<WindowCandidate> },
     #[serde(rename = "satellite.attach_window")]
     SatelliteAttachWindow {
-        pid: u32,
+        backend: WindowCandidateBackend,
+        backend_window_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        window_id: Option<i64>,
+        pid: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        window_index: Option<u32>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        bundle_id: Option<String>,
+        app_identity: Option<WindowAppIdentity>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
     },
     #[serde(rename = "satellite.map")]
     SatelliteMap {
@@ -283,6 +316,24 @@ mod tests {
         obj.insert("id".into(), serde_json::json!(Uuid::new_v4().to_string()));
         let bytes = serde_json::to_vec(&v).unwrap();
         parse_payload(&bytes).unwrap()
+    }
+
+    fn candidate(
+        backend: WindowCandidateBackend,
+        backend_window_id: &str,
+        pid: Option<u32>,
+        app_identity: Option<WindowAppIdentity>,
+        title: &str,
+    ) -> WindowCandidate {
+        WindowCandidate {
+            backend,
+            backend_window_id: backend_window_id.into(),
+            pid,
+            app_identity,
+            title: Some(title.into()),
+            workspace: None,
+            output: None,
+        }
     }
 
     #[test]
@@ -470,6 +521,77 @@ mod tests {
     }
 
     #[test]
+    fn satellite_list_windows_platform_neutral_roundtrip() {
+        let k = Kind::SatelliteListWindowsResult {
+            windows: vec![
+                candidate(
+                    WindowCandidateBackend::Macos,
+                    "macos-window-id:1001:index:1",
+                    Some(42),
+                    Some(WindowAppIdentity::BundleId("com.example.App".into())),
+                    "macOS App",
+                ),
+                candidate(
+                    WindowCandidateBackend::Kwin,
+                    "kwin:9ec5",
+                    Some(77),
+                    Some(WindowAppIdentity::DesktopEntry("org.kde.kate".into())),
+                    "Kate",
+                ),
+                candidate(
+                    WindowCandidateBackend::X11,
+                    "x11:0x03a00007",
+                    Some(88),
+                    Some(WindowAppIdentity::WmClass("firefox".into())),
+                    "Firefox",
+                ),
+                WindowCandidate {
+                    backend: WindowCandidateBackend::Unsupported,
+                    backend_window_id: "unsupported:none".into(),
+                    pid: None,
+                    app_identity: None,
+                    title: Some("Unsupported compositor".into()),
+                    workspace: None,
+                    output: None,
+                },
+            ],
+        };
+        assert_eq!(wrap_and_roundtrip(k.clone()), k);
+    }
+
+    #[test]
+    fn satellite_attach_window_platform_neutral_roundtrip() {
+        for (backend, backend_window_id, app_identity) in [
+            (
+                WindowCandidateBackend::Macos,
+                "macos-window-id:1001:index:1",
+                WindowAppIdentity::BundleId("com.example.App".into()),
+            ),
+            (
+                WindowCandidateBackend::Kwin,
+                "kwin:9ec5",
+                WindowAppIdentity::DesktopEntry("org.kde.kate".into()),
+            ),
+            (
+                WindowCandidateBackend::X11,
+                "x11:0x03a00007",
+                WindowAppIdentity::WmClass("firefox".into()),
+            ),
+        ] {
+            let k = Kind::SatelliteAttachWindow {
+                backend,
+                backend_window_id: backend_window_id.into(),
+                pid: Some(42),
+                app_identity: Some(app_identity),
+                title: Some("Window".into()),
+                workspace: Some("1".into()),
+                output: Some("HDMI-A-1".into()),
+            };
+            assert_eq!(wrap_and_roundtrip(k.clone()), k);
+        }
+    }
+
+    #[test]
     fn all_known_kinds_parse() {
         // Sanity: every branch at least round-trips one instance.
         let kinds = vec![
@@ -530,20 +652,22 @@ mod tests {
             Kind::SatelliteAttachFocused {},
             Kind::SatelliteListWindows {},
             Kind::SatelliteListWindowsResult {
-                windows: vec![MacosWindowCandidate {
-                    pid: 42,
-                    window_id: Some(1001),
-                    window_index: 1,
-                    bundle_id: Some("com.example.App".into()),
-                    title: Some("Example".into()),
-                }],
+                windows: vec![candidate(
+                    WindowCandidateBackend::Macos,
+                    "macos-window-id:1001:index:1",
+                    Some(42),
+                    Some(WindowAppIdentity::BundleId("com.example.App".into())),
+                    "Example",
+                )],
             },
             Kind::SatelliteAttachWindow {
-                pid: 42,
-                window_id: Some(1001),
-                window_index: Some(1),
-                bundle_id: Some("com.example.App".into()),
+                backend: WindowCandidateBackend::Macos,
+                backend_window_id: "macos-window-id:1001:index:1".into(),
+                pid: Some(42),
+                app_identity: Some(WindowAppIdentity::BundleId("com.example.App".into())),
                 title: Some("Example".into()),
+                workspace: None,
+                output: None,
             },
             Kind::CompositorReinject {},
         ];

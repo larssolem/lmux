@@ -18,9 +18,12 @@ use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
+#[cfg(target_os = "macos")]
+use crate::WindowAppIdentity;
 use crate::{
     CompositorControl, CompositorError, FocusPolicy, Health, Rect, SatelliteWindowId,
-    WindowBackend, WindowGroupSwitch, WindowId, WindowOpResult,
+    WindowBackend, WindowCandidate, WindowCandidateBackend, WindowControlCapabilities,
+    WindowGroupSwitch, WindowId, WindowOpResult,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +101,16 @@ impl CompositorControl for MacWindowCompositor {
         }
     }
 
+    fn window_control_capabilities(&self) -> WindowControlCapabilities {
+        let available = self.accessibility == PermissionState::Granted;
+        WindowControlCapabilities {
+            list_windows: available,
+            attach_window: available,
+            set_visible: available,
+            raise_window: false,
+        }
+    }
+
     async fn spawn_satellite(
         &self,
         argv: &[String],
@@ -116,6 +129,61 @@ impl CompositorControl for MacWindowCompositor {
 
     async fn attach(&self, _window: &WindowId) -> Result<(), CompositorError> {
         Ok(())
+    }
+
+    async fn list_windows(&self) -> Result<Vec<WindowCandidate>, CompositorError> {
+        #[cfg(target_os = "macos")]
+        {
+            let windows =
+                tokio::task::spawn_blocking(|| lmux_macos_helper::list_windows(None, None))
+                    .await
+                    .map_err(|err| {
+                        CompositorError::Domain(format!("macOS list task failed: {err}"))
+                    })?
+                    .map_err(|err| CompositorError::Domain(format!("macOS list windows: {err}")))?;
+            return Ok(windows
+                .into_iter()
+                .map(|window| WindowCandidate {
+                    backend: WindowCandidateBackend::Macos,
+                    backend_window_id: macos_candidate_backend_window_id(&window),
+                    pid: Some(window.pid),
+                    app_identity: window.bundle_id.map(WindowAppIdentity::BundleId),
+                    title: window.title,
+                    workspace: None,
+                    output: None,
+                })
+                .collect());
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(CompositorError::Unsupported(
+                "macOS window listing is only available on macOS".into(),
+            ))
+        }
+    }
+
+    async fn attach_window(
+        &self,
+        candidate: &WindowCandidate,
+    ) -> Result<SatelliteWindowId, CompositorError> {
+        if candidate.backend != WindowCandidateBackend::Macos {
+            return Err(CompositorError::Domain(format!(
+                "macOS backend cannot attach {:?} windows",
+                candidate.backend
+            )));
+        }
+        if !candidate.backend_window_id.starts_with("macos-window-id:")
+            && !candidate.backend_window_id.starts_with("macos-window-pid:")
+            && !candidate
+                .backend_window_id
+                .starts_with("macos-window-index:")
+        {
+            return Err(CompositorError::Domain(format!(
+                "unsupported macOS window identity: {}",
+                candidate.backend_window_id
+            )));
+        }
+        Ok(SatelliteWindowId::for_attached(candidate))
     }
 
     async fn set_window_visible(
@@ -191,7 +259,7 @@ impl MacWindowCompositor {
                     failures = 0usize,
                     "macOS window group switch applied"
                 );
-                return Ok(results);
+                Ok(results)
             }
             Ok(results) => {
                 let failures = results.iter().filter(|result| !result.ok).count();
@@ -209,11 +277,11 @@ impl MacWindowCompositor {
                     failures,
                     "macOS window group switch partially failed"
                 );
-                return Ok(results);
+                Ok(results)
             }
             Err(err) => {
                 tracing::warn!(error = %err, "macOS helper group visibility failed");
-                return Err(err);
+                Err(err)
             }
         }
     }
@@ -229,7 +297,7 @@ async fn set_app_visible(window: &SatelliteWindowId, visible: bool) -> Result<()
     #[cfg(test)]
     {
         let _ = (window, visible);
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(test))]
     {
@@ -268,7 +336,7 @@ async fn apply_app_visibility_group(
             ok: true,
             error: None,
         }));
-        return Ok(out);
+        Ok(out)
     }
     #[cfg(not(test))]
     {
@@ -301,6 +369,17 @@ fn helper_window_ref(window: &SatelliteWindowId) -> WindowRef {
         window_index: macos_window_index(&window.backend_window_id),
         window_id: macos_window_id(&window.backend_window_id),
         title: window.title.clone(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_candidate_backend_window_id(window: &lmux_macos_helper::WindowInfo) -> String {
+    match window.window_id {
+        Some(window_id) => format!("macos-window-id:{window_id}:index:{}", window.window_index),
+        None => format!(
+            "macos-window-pid:{}:index:{}",
+            window.pid, window.window_index
+        ),
     }
 }
 

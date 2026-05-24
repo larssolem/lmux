@@ -13,7 +13,7 @@ use async_channel::Sender;
 use gtk4::prelude::*;
 use gtk4::{Orientation, Paned, Stack, Widget};
 use lmux_anchor::{Anchor, AnchorRegistry};
-use lmux_compositor::{FocusPolicy, SatelliteWindowId, WindowBackend};
+use lmux_compositor::{FocusPolicy, SatelliteWindowId, WindowBackend, WindowCandidate};
 #[cfg(target_os = "macos")]
 use lmux_macos_helper::WindowInfo as MacosWindowInfo;
 #[cfg(target_os = "linux")]
@@ -688,6 +688,26 @@ impl AppState {
             })
     }
 
+    pub fn attached_anchor_for_backend_window(
+        &self,
+        backend_window_id: &str,
+    ) -> Option<(PaneId, String)> {
+        self.satellite_windows_by_anchor
+            .iter()
+            .find_map(|(anchor, windows)| {
+                windows
+                    .iter()
+                    .any(|existing| existing.backend_window_id == backend_window_id)
+                    .then(|| {
+                        let label = self
+                            .anchor_for_pane(*anchor)
+                            .map(|anchor| anchor.display_label().to_string())
+                            .unwrap_or_else(|| format!("pane {anchor}"));
+                        (*anchor, label)
+                    })
+            })
+    }
+
     /// Reverse of `pane_anchor_ids`: given the UUID stored on the `Anchor`
     /// registry entry, return the pane that currently owns it. Used by the
     /// bus dispatcher to route `anchor.pause` / `anchor.resume` kinds that
@@ -810,6 +830,28 @@ impl AppState {
         self.broadcast_satellite_visibility();
     }
 
+    pub fn attach_native_window_to_active_anchor(
+        &mut self,
+        candidate: &WindowCandidate,
+        window: SatelliteWindowId,
+    ) -> Result<(), String> {
+        let anchor = self
+            .active_anchor
+            .ok_or_else(|| "no active anchor".to_string())?;
+        if candidate.backend_window_id.trim().is_empty() {
+            return Err("native window has no backend window id".into());
+        }
+        self.register_satellite_window(anchor, window.clone());
+        tracing::info!(
+            anchor,
+            backend = ?candidate.backend,
+            backend_window_id = %candidate.backend_window_id,
+            window = ?window,
+            "attached native window to active anchor"
+        );
+        Ok(())
+    }
+
     #[cfg(target_os = "macos")]
     pub fn attach_focused_macos_window_to_active_anchor(&mut self) -> Result<(), String> {
         let anchor = self
@@ -926,6 +968,7 @@ impl AppState {
     /// for use as `WAYLAND_DISPLAY` in satellite child env. `None` when
     /// the host never started or no Ready event has been dispatched yet.
     /// Populated by `handle_host_event` on `HostEvent::Ready`.
+    #[allow(dead_code)]
     #[cfg(target_os = "linux")]
     pub fn wayland_display_name(&self) -> Option<&str> {
         self.wayland_display_name.as_deref()

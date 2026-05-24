@@ -6,10 +6,8 @@ classification:
   complexity: high
   projectContext: brownfield
 inputDocuments:
-  - _bmad-output/planning-artifacts/prd-v0.1.md
-  - _bmad-output/planning-artifacts/architecture.md
-  - _bmad-output/planning-artifacts/product-brief-lmux.md
-  - _bmad-output/planning-artifacts/product-brief-lmux-distillate.md
+  - docs/history/product-brief.md
+  - docs/history/product-brief-distillate.md
   - spikes/compositor-ipc/FINDINGS.md
   - docs/adr/0001-rendering-stack.md
   - docs/adr/0002-anchor-satellites-bus.md
@@ -392,7 +390,7 @@ The v0.2 MVP feature list and Post-MVP / Vision roadmap are the canonical lists 
 - *v0.2 scope creep erodes the 2026-07-31 target.* Mitigation: FRs below are the locked surface; any new feature request goes on the v0.3 list, not into v0.2.
 
 **Resource risks.**
-- *Solo developer with variable availability.* Mitigation: epic breakdown (bmad-create-epics-and-stories in a later step) sequenced so "half-done v0.2" is still a useful product — e.g., sessions + anchors without satellites is shippable for self-use.
+- *Solo developer with variable availability.* Mitigation: epic breakdown sequenced so "half-done v0.2" is still a useful product — e.g., sessions + anchors without satellites is shippable for self-use.
 - *Agentic coding productivity regression (AI assistant degrades).* Mitigation: explicit v0.2 crate boundaries keep the blast radius of any one module bounded; tests per v0.1 standard keep regressions observable.
 
 ## Functional Requirements

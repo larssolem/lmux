@@ -12,10 +12,9 @@ This branch contains the foundation for the macOS port:
 ## Current Scope
 
 The branch is intended to run native terminal panes and controlled macOS GUI
-satellites. GUI ownership is intentionally conservative: lmux tracks launches
-by request id and spawned PID, promotes matching windows from candidate to
-primary when the helper sees a better window, and leaves ambiguous windows
-unmanaged instead of falling back to bundle-wide control.
+satellites. GUI ownership is intentionally conservative: lmux controls only
+windows the user explicitly attaches, keyed by CoreGraphics window id. Ambiguous
+windows are left unmanaged instead of falling back to bundle-wide control.
 
 ## macOS Prerequisites
 
@@ -88,19 +87,16 @@ mise run terminal
 1. Start `lmux`.
 2. Verify the initial terminal pane opens and accepts input.
 3. Split panes and switch anchors with the normal prefix keybindings.
-4. Open the launcher and launch Safari or VS Code. The first usable window
-   should follow the active anchor.
-5. Launch Chrome or IntelliJ. Setup/project chooser windows may be tracked as
-   candidates; when the real window appears it should replace the candidate
-   for the same request id.
+4. Open Safari or VS Code normally, then attach the exact window to the active
+   anchor.
+5. Open Chrome or IntelliJ normally, then attach the real work window rather
+   than setup or project chooser windows.
 
-## Managed App Profiles
+## App Profiles
 
-Chrome-family and JetBrains-family apps launched from lmux use persistent
-lmux-managed profiles. The goal is to keep lmux-owned app windows separate
-from the user's normal desktop apps without forcing setup on every launch.
-
-Profile data is stored under the platform state directory:
+The old lmux launcher flow is disabled on macOS. Open apps normally and attach
+the specific window lmux should manage. Any legacy lmux-managed app profiles are
+stored under the platform state directory:
 
 ```text
 $XDG_STATE_HOME/lmux/app-profiles/<app-key>/
@@ -130,30 +126,18 @@ Ambiguous native windows are left unmanaged rather than guessed by bundle id.
 
 ## macOS Window Ownership Model
 
-Every macOS GUI launch creates a tracked intent:
-
-```text
-pending -> candidate -> primary -> closed | unmanaged
-```
-
-lmux reconciles pending launches shortly after spawn and again on anchor
-switch. A transient setup/project chooser window can become a candidate. A
-later primary work window with the same launch PID replaces the candidate, so
-the request id stays attached to one anchor instead of spreading the app over
-multiple anchors.
-
 Anchor switching asks the helper to apply grouped visibility operations only
 for windows already registered as lmux-owned. Existing user windows from the
-same bundle are not hidden or restored unless they were launched and tracked
-through lmux.
+same bundle are not hidden or restored unless the user attached that exact
+window.
 
-If automatic matching misses a safe lmux-launched window, focus that window and
-press the sidebar link button. The manual attach path only accepts focused
-windows whose PID matches a known lmux launch.
+To attach a window, focus it and press the sidebar link button or use the
+`satellite.attach_focused` bus kind. The manual attach path records the exact
+native window identity and does not infer ownership from bundle id alone.
 
 ## macOS Keyboard Shortcuts
 
-The cockpit prefix remains `Ctrl+B` on macOS so the pane-management model
+The lmux prefix remains `Ctrl+B` on macOS so the pane-management model
 matches Linux and tmux:
 
 - `Ctrl+B`, then `|` / `\` / `+` splits vertically.
@@ -161,7 +145,6 @@ matches Linux and tmux:
 - `Ctrl+B`, then `o` / `]` cycles focus forward.
 - `Ctrl+B`, then `p` / `[` cycles focus backward.
 - `Ctrl+B`, then `s` opens the session switcher.
-- `Ctrl+B`, then `l` opens the GUI launcher.
 - `Ctrl+B`, then `x` closes the focused pane.
 - `Ctrl+B`, then `q` shuts down lmux.
 
@@ -184,14 +167,15 @@ Full GUI-window E2E needs a real macOS desktop session, not Xcode Simulator:
 
 Manual managed-window smoke:
 
-1. Start cockpit.
+1. Start lmux.
 2. Create anchor A and anchor B.
-3. Under anchor A, launch Chrome from lmux. Complete any setup window and open
-   a normal browser window.
+3. Under anchor A, open Chrome normally, complete any setup window, then attach
+   the normal browser window.
 4. Switch to B and assert only A's Chrome window is minimized.
-5. Under anchor B, launch another Chrome window. Switch between A and B and
-   assert the two Chrome windows alternate independently.
+5. Under anchor B, open and attach another Chrome window. Switch between A and
+   B and assert the two Chrome windows alternate independently.
 6. Repeat the same flow with IntelliJ: project chooser first, then a real
-   project window, then a second IntelliJ window on the other anchor.
+   project window, attach the real project window, then attach a second IntelliJ
+   window on the other anchor.
 7. Close a tracked window and switch anchors; lmux should stop trying to
    restore the closed window.

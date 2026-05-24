@@ -2,7 +2,6 @@ mod app;
 mod bus;
 mod compositor_bridge;
 mod keymap;
-mod launcher;
 mod layout;
 mod pane;
 mod render;

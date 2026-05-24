@@ -7,6 +7,7 @@ os="$(uname -s)"
 echo "Installing lmux locally for $os"
 
 cargo install --path "$repo_root/crates/lmux" --force
+cargo install --path "$repo_root/crates/lmux-cli" --force
 
 if [[ -n "${CARGO_INSTALL_ROOT:-}" ]]; then
   lmux_bin="$CARGO_INSTALL_ROOT/bin/lmux"
@@ -75,8 +76,12 @@ PLIST
   Linux)
     data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
     applications_dir="$data_home/applications"
-    desktop_file="$applications_dir/lmux.desktop"
+    kwin_dir="$data_home/lmux/kwin"
+    desktop_file="$applications_dir/no.jpro.lmux.desktop"
     mkdir -p "$applications_dir"
+    mkdir -p "$kwin_dir"
+    cp "$repo_root/share/lmux/kwin/lmux-dock.js" "$kwin_dir/lmux-dock.js"
+    chmod 0644 "$kwin_dir/lmux-dock.js"
 
     cat >"$desktop_file" <<DESKTOP
 [Desktop Entry]
@@ -88,6 +93,8 @@ Icon=utilities-terminal
 Terminal=false
 Categories=System;TerminalEmulator;Utility;
 StartupNotify=true
+StartupWMClass=no.jpro.lmux
+X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
 DESKTOP
 
     chmod 0644 "$desktop_file"
@@ -95,6 +102,7 @@ DESKTOP
       update-desktop-database "$applications_dir" >/dev/null 2>&1 || true
     fi
     echo "Installed desktop launcher: $desktop_file"
+    echo "Installed KWin script: $kwin_dir/lmux-dock.js"
     ;;
   *)
     echo "Installed lmux binary: $lmux_bin"

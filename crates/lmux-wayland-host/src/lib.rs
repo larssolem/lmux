@@ -1,7 +1,8 @@
 //! Nested Wayland compositor hosted inside the lmux cockpit (ADR-0018).
 //!
 //! Each GUI satellite the user launches from Ctrl+B l is a Wayland client
-//! that connects to *this* compositor (via `WAYLAND_DISPLAY=lmux-<pid>`);
+//! that connects to *this* compositor (via the `WAYLAND_DISPLAY` name
+//! emitted in [`HostEvent::Ready`]);
 //! its surfaces land as GTK widgets in the cockpit's pane tree, treated
 //! identically to terminal panes for focus, workspace, and anchor-switch
 //! semantics.

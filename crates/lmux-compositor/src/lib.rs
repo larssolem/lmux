@@ -13,6 +13,7 @@ pub mod kwin;
 pub mod macos;
 pub mod noop;
 pub mod spawn;
+pub mod x11;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -22,8 +23,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub use kwin::KwinCompositor;
+pub use lmux_bus::kinds::{WindowAppIdentity, WindowCandidate, WindowCandidateBackend};
 pub use macos::MacWindowCompositor;
 pub use noop::NoopCompositor;
+pub use x11::X11Compositor;
 
 /// Rect in compositor screen coordinates. Mirrors [`lmux_bus::kinds::Rect`]
 /// intentionally — the trait level does not depend on the bus types so that
@@ -45,10 +48,26 @@ pub struct WindowId(pub String);
 #[serde(rename_all = "snake_case")]
 pub enum WindowBackend {
     Kwin,
+    X11,
     Hyprland,
+    Sway,
     Macos,
     Noop,
     Unknown(String),
+}
+
+impl From<&WindowCandidateBackend> for WindowBackend {
+    fn from(value: &WindowCandidateBackend) -> Self {
+        match value {
+            WindowCandidateBackend::Macos => Self::Macos,
+            WindowCandidateBackend::Kwin => Self::Kwin,
+            WindowCandidateBackend::X11 => Self::X11,
+            WindowCandidateBackend::Hyprland => Self::Hyprland,
+            WindowCandidateBackend::Sway => Self::Sway,
+            WindowCandidateBackend::Noop => Self::Noop,
+            WindowCandidateBackend::Unsupported => Self::Unknown("unsupported".into()),
+        }
+    }
 }
 
 /// Stable cross-backend identity for one GUI satellite window.
@@ -69,6 +88,20 @@ pub struct SatelliteWindowId {
 }
 
 impl SatelliteWindowId {
+    pub fn for_attached(candidate: &WindowCandidate) -> Self {
+        Self {
+            backend: WindowBackend::from(&candidate.backend),
+            request_id: None,
+            pid: candidate.pid,
+            backend_window_id: candidate.backend_window_id.clone(),
+            bundle_id: match &candidate.app_identity {
+                Some(WindowAppIdentity::BundleId(value)) => Some(value.clone()),
+                _ => None,
+            },
+            title: candidate.title.clone(),
+        }
+    }
+
     pub fn for_pid(backend: WindowBackend, pid: u32) -> Self {
         Self {
             backend,
@@ -130,6 +163,30 @@ pub struct WindowOpResult {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WindowControlCapabilities {
+    pub list_windows: bool,
+    pub attach_window: bool,
+    pub set_visible: bool,
+    pub raise_window: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowPreviewData {
+    EncodedImage(Vec<u8>),
+    Bgra {
+        width: u32,
+        height: u32,
+        bytes_per_row: usize,
+        data: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowPreview {
+    pub data: WindowPreviewData,
+}
+
 /// Health status reported by [`CompositorControl::health`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Health {
@@ -145,6 +202,8 @@ pub enum Health {
 /// onto a user-visible "re-inject" toast (FR14).
 #[derive(Debug, Error)]
 pub enum CompositorError {
+    #[error("unsupported compositor operation: {0}")]
+    Unsupported(String),
     #[error("compositor script not loaded")]
     ScriptMissing,
     #[error("compositor offline: {0}")]
@@ -168,6 +227,13 @@ pub trait CompositorControl: Send + Sync {
     /// Probe compositor health. MUST NOT have side effects.
     async fn health(&self) -> Health;
 
+    /// Capability report for native-window operations. Unsupported window
+    /// managers should return false for unsupported actions while keeping
+    /// terminal/session behavior alive.
+    fn window_control_capabilities(&self) -> WindowControlCapabilities {
+        WindowControlCapabilities::default()
+    }
+
     /// Spawn `argv` with an lmux tag, and return the request id the
     /// compositor will echo back via `satellite.map` when the new window
     /// appears. Returning `Ok` does NOT mean the window is visible yet —
@@ -187,6 +253,46 @@ pub trait CompositorControl: Send + Sync {
 
     /// Re-attach a previously detached satellite.
     async fn attach(&self, window: &WindowId) -> Result<(), CompositorError>;
+
+    /// List native windows that can be explicitly attached.
+    async fn list_windows(&self) -> Result<Vec<WindowCandidate>, CompositorError> {
+        Err(CompositorError::Unsupported(
+            "native window listing is not supported by this compositor".into(),
+        ))
+    }
+
+    /// Best-effort preview image for a native attach candidate. Backends
+    /// should return `Ok(None)` when the platform does not support previews
+    /// or when user/session policy denies screenshots.
+    async fn window_preview(
+        &self,
+        _candidate: &WindowCandidate,
+        _max_width: u32,
+        _max_height: u32,
+    ) -> Result<Option<WindowPreview>, CompositorError> {
+        Ok(None)
+    }
+
+    /// Validate and convert an attach candidate into the managed satellite
+    /// identity stored by AppState.
+    async fn attach_window(
+        &self,
+        candidate: &WindowCandidate,
+    ) -> Result<SatelliteWindowId, CompositorError> {
+        if candidate.backend_window_id.trim().is_empty() {
+            return Err(CompositorError::Domain(
+                "native window candidate has no backend window id".into(),
+            ));
+        }
+        Ok(SatelliteWindowId::for_attached(candidate))
+    }
+
+    /// Raise or focus a native window when the backend supports it.
+    async fn raise_window(&self, _window: &SatelliteWindowId) -> Result<(), CompositorError> {
+        Err(CompositorError::Unsupported(
+            "native window raise/focus is not supported by this compositor".into(),
+        ))
+    }
 
     /// Show or hide the compositor window whose PID matches `pid`. Used by
     /// the cockpit to tie satellite lifetimes to the active anchor: on
@@ -341,9 +447,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn noop_compositor_health_reports_online() {
+    async fn noop_compositor_health_reports_offline() {
         let c = NoopCompositor::default();
-        assert_eq!(c.health().await, Health::Online);
+        assert!(matches!(c.health().await, Health::Offline { .. }));
     }
 
     #[tokio::test]

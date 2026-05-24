@@ -1,86 +1,181 @@
 # lmux
 
-**GUI multiplexer for Linux** — bundle terminal panes and docked GUI apps into work contexts, switch context with one keystroke. Spiritual successor to macOS `cmux`, built on libghostty + GTK4 with a KWin-scripted docking layer.
+lmux collects terminal panes and ordinary app windows into work contexts. Start a
+terminal, add the browser/editor/IDE windows that belong with it, then switch
+contexts and bring the right windows back together.
+
+It is a GUI multiplexer for developer workstations: tmux-style terminal control,
+plus explicit window attach for native apps. Linux/KDE is the primary supported
+desktop today; the macOS port is active and uses the same attach-first model.
 
 ## Status
 
-v0.2 shipped; v0.3 in planning. [Capability specs](openspec/specs/) describe what the system does today, nine capabilities in total: `terminal-core`, `sessions`, `anchors`, `sidebar`, `satellites`, `compositor-control`, `bus-ipc`, `config`, `observability`. [Active change proposals](openspec/changes/) cover what's next; [numbered ADRs](docs/adr/) carry the *why* behind each decision.
+v0.2 shipped on Linux/KDE; v0.3 is in planning. The macOS port is usable enough
+for native terminal panes and explicit window attach work, but it is still
+tracked as port work. [Capability specs](openspec/specs/) describe what the
+system does today. [Active change proposals](openspec/changes/) cover what is
+next, and [numbered ADRs](docs/adr/) carry the design decisions.
 
-## The mental model
+## Mental Model
 
+```text
+lmux window
+├─ workspace: checkout-api
+│  ├─ terminal: shell / agent / build
+│  └─ app windows: browser, editor, IDE
+└─ workspace: billing-fix
+   ├─ terminal: shell / agent / logs
+   └─ app windows: browser, editor, IDE
 ```
-┌─────────────────────────────── lmux cockpit ───────────────────────────────┐
-│                                                                            │
-│  ╭── pane ──╮ ╭── pane ──╮   ╭── satellite ─────────────────────────╮       │
-│  │ shell    │ │ cargo    │   │ Kate / browser / JetBrains           │       │
-│  │          │ │ watch  ⚓ │   │   (GUI app docked into the cockpit)   │       │
-│  ╰──────────╯ ╰──────────╯   ╰───────────────────────────────────────╯     │
-│                                                                            │
-│   sidebar: session list · anchors · satellites                             │
-└────────────────────────────────────────────────────────────────────────────┘
-```
 
-- **Panes** host shells inside a single cockpit window (the tmux part)
-- **Anchors** (⚓) are tagged panes whose lifecycle you care about — they survive close, pause via `SIGSTOP`, capture crash output in a scrollback ring
-- **Satellites** are full GUI apps docked into the cockpit through compositor scripting (KWin today; wlroots/Hyprland in v0.3)
-- **Sessions** persist the full tree + anchors + satellite metadata so you can quit and come back
+The implementation still uses precise internal names:
 
-The v0.3 direction layers a **workflow switcher** on top: bind a key per workflow; switching swaps the whole window set.
+- **Pane**: a terminal pane inside the lmux window.
+- **Anchor**: the terminal root for a work context. The first terminal is an
+  anchor automatically.
+- **Satellite**: a native GUI window explicitly attached to an anchor.
+- **Session**: saved lmux state, including panes, anchors, and attached windows.
+
+In the UI, think "workspaces" and "add window" first. The anchor/satellite terms
+matter mostly when reading specs or using the CLI.
 
 ## Build
 
-Prereqs and build steps live in [BUILD.md](BUILD.md). Short form:
+Prerequisites and platform notes live in [BUILD.md](BUILD.md). Short form for
+contributors:
 
 ```sh
 cargo build --release
 ```
 
-## Run
+For daily local use, prefer the installed launcher path because it also installs
+the desktop integration lmux needs:
 
 ```sh
-./target/release/lmux
+mise trust
+mise install
+mise run install:local
 ```
 
-A single pane launches with your `$SHELL`.
+On Linux this registers a desktop entry and installs the KWin script. On macOS it
+registers `~/Applications/lmux.app`.
 
-## Keybinds (v0.2)
+## First Two Minutes: Linux/KDE
 
-lmux uses a tmux-style **prefix**: press `Ctrl+B`, then the command key. Rationale — Super-based shortcuts clash with KDE's global window-management bindings (Super+Q, Super+W, Super+[]). The window title flashes `lmux [◆]` while the prefix is armed; it auto-disarms after 1 s.
+1. Install and register lmux:
+
+   ```sh
+   mise run install:local
+   ```
+
+2. Start lmux from the app launcher, or run:
+
+   ```sh
+   lmux
+   ```
+
+3. A single terminal opens. It is already the active workspace anchor.
+4. Open a normal KDE window, such as Kate, your browser, or JetBrains.
+5. In the lmux sidebar, click the link/add-window button. Choose the open window
+   from the picker.
+6. The selected window is attached to the active workspace. Switch workspaces
+   with `Ctrl+B`, then `a`; the attached windows follow the active context.
+
+Linux attach support is best on KDE Plasma Wayland through KWin. X11 is
+best-effort when `xprop` and `xdotool` are installed. Other Wayland compositors
+can run the terminal cockpit, but native app attach may be disabled until that
+backend is implemented.
+
+lmux does not currently provide a Linux program launcher. Open apps from your
+desktop, shell, or app menu, then attach the exact window you want lmux to
+manage.
+
+## First Two Minutes: macOS
+
+1. Install dependencies and check the port prerequisites:
+
+   ```sh
+   mise trust
+   mise install
+   mise run doctor:macos
+   ```
+
+2. Build and register the local app:
+
+   ```sh
+   mise run install:local
+   ```
+
+3. Grant Accessibility permission when prompted, or request it explicitly:
+
+   ```sh
+   lmux --request-permissions
+   ```
+
+4. Start `lmux` from `~/Applications/lmux.app`, or run `lmux`.
+5. Open a normal macOS app window.
+6. In the lmux sidebar, click the link/add-window button and choose that window.
+
+macOS uses explicit window ownership through CoreGraphics window ids. lmux does
+not control every window from an app bundle; it only manages the exact windows
+you attach. The old launcher flow is disabled on macOS. See
+[docs/macos-port.md](docs/macos-port.md) for current port notes.
+
+## Keybinds
+
+lmux uses a tmux-style prefix: press `Ctrl+B`, then the command key. The window
+title flashes `lmux [*]` while the prefix is armed, and it auto-disarms after
+one second.
 
 | Keybind | Action |
 |---------|--------|
-| `Ctrl+B` `-` | Split focused pane horizontally (new pane below) |
-| `Ctrl+B` `\|` / `Ctrl+B` `\` / `Ctrl+B` `+` | Split focused pane vertically (new pane right) |
+| `Ctrl+B` `-` | Split focused pane horizontally, new pane below |
+| `Ctrl+B` `+` / `\|` / `\` | Split focused pane vertically, new pane right |
 | `Ctrl+B` `x` | Close focused pane |
-| `Ctrl+B` `]` / `Ctrl+B` `o` / `Ctrl+B` `n` | Cycle focus forward |
-| `Ctrl+B` `[` / `Ctrl+B` `p` | Cycle focus backward |
-| `Ctrl+B` `a` | Mark focused pane as anchor |
-| `Ctrl+B` `q` | Quit lmux (clean shutdown, saves session) |
-| `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy / paste (no prefix — standard terminal) |
+| `Ctrl+B` `]` / `o` / `n` | Cycle focus forward |
+| `Ctrl+B` `[` / `p` | Cycle focus backward |
+| `Ctrl+B` `a` | Cycle active workspace anchor |
+| `Ctrl+B` `s` | Open the session switcher |
+| `Ctrl+B` `m` | Rearrange panes |
+| `Ctrl+B` `q` | Quit lmux, saving session state |
+| `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy / paste in terminal panes |
+| macOS: `Command+C` / `Command+V` | Copy / paste in terminal panes |
 | `PageUp` / `PageDown` / mouse wheel | Scrollback in focused pane |
 
-## Companion CLI — `lmux-cli`
+When an attached GUI window has focus, lmux lets key events pass through so the
+native app keeps its own shortcuts.
 
-Shells and scripts talk to a running cockpit over the bus socket.
+## Companion CLI
+
+Most first-run actions are available from the GUI. Shells and scripts can also
+talk to a running lmux process over the bus socket:
 
 ```sh
-lmux-cli status                     # cockpit snapshot: pid, version, counts
-lmux-cli mark-anchor                # promote the current pane to anchor
-lmux-cli pane list                  # inventory of pane UUIDs
-lmux-cli anchor tag <uuid>          # tag a pane as anchor
-lmux-cli anchor pause <uuid>        # SIGSTOP the backing process
-lmux-cli session list / new / attach / kill
-lmux-cli satellite open <app> ...   # dock a GUI app to the focused pane
+lmux-cli status
+lmux-cli pane list
+lmux-cli anchor tag <uuid>
+lmux-cli anchor pause <uuid>
+lmux-cli session list
+lmux-cli session new <name>
+lmux-cli session rename <from> <to>
+lmux-cli session delete <name>
+lmux-cli session open <name>
+lmux-cli satellite list-windows
+lmux-cli satellite attach-window --backend kwin --backend-window-id <id>
 ```
 
-Run `lmux-cli help` / `lmux-cli <sub> --help` for the full surface.
+Use `./target/release/lmux-cli ...` from a build tree, or `lmux-cli ...` after
+`mise run install:local`. Run `lmux-cli help` or `lmux-cli <sub> --help` for the
+full surface.
 
 ## Documentation
 
-- [`openspec/specs/`](openspec/specs/) — living capability specs
-- [`openspec/changes/`](openspec/changes/) — active change proposals
-- [`docs/adr/`](docs/adr/) — numbered architecture decisions
-- [`docs/history/`](docs/history/) — product brief, original brainstorm, v0.2 PRD, e2e test strategy
+- [`BUILD.md`](BUILD.md): prerequisites, build, install, and troubleshooting
+- [`docs/macos-port.md`](docs/macos-port.md): current macOS port notes
+- [`openspec/specs/`](openspec/specs/): living capability specs
+- [`openspec/changes/`](openspec/changes/): active change proposals
+- [`docs/adr/`](docs/adr/): numbered architecture decisions
+- [`docs/history/`](docs/history/): product brief, original brainstorm, v0.2 PRD
 
 ## License
 

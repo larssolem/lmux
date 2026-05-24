@@ -66,6 +66,7 @@ fn is_chromium_family(cmd: &str) -> bool {
     )
 }
 
+#[cfg(target_os = "macos")]
 fn is_vscode_family(cmd: &str) -> bool {
     let base = std::path::Path::new(cmd)
         .file_name()
@@ -456,10 +457,8 @@ pub fn spawn_tagged_with_env(
         if !has_flag(&owned_args, "--new-window") {
             owned_args.insert(0, "--new-window".into());
         }
-        if wayland_display.is_some() {
-            if !has_flag(&owned_args, "--ozone-platform") {
-                owned_args.insert(0, "--ozone-platform=wayland".into());
-            }
+        if wayland_display.is_some() && !has_flag(&owned_args, "--ozone-platform") {
+            owned_args.insert(0, "--ozone-platform=wayland".into());
         }
         // --enable-logging=stderr surfaces Chrome's startup chatter to our
         // per-satellite stderr file instead of /var/log; without this Chrome

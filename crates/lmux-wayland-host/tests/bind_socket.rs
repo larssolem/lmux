@@ -22,21 +22,18 @@ fn bind_socket_and_emit_ready() {
     // Wait up to 2s for the Ready event — the compositor thread only
     // sends it after the socket is listening.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    let mut got_ready = false;
+    let mut display_name = None;
     while std::time::Instant::now() < deadline {
-        if let Ok(evt) = evt_rx.try_recv() {
-            if matches!(evt, HostEvent::Ready { .. }) {
-                got_ready = true;
-                break;
-            }
+        if let Ok(HostEvent::Ready { display_name: name }) = evt_rx.try_recv() {
+            display_name = Some(name);
+            break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(got_ready, "host never emitted HostEvent::Ready");
+    let display_name = display_name.expect("host never emitted HostEvent::Ready");
 
     // Socket file should exist on disk under the tmp runtime dir.
-    let pid = std::process::id();
-    let expected = tmp.path().join(format!("lmux-{pid}"));
+    let expected = tmp.path().join(&display_name);
     assert!(
         expected.exists(),
         "socket file not found at {}",

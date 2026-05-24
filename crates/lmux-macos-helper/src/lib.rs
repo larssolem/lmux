@@ -1,11 +1,12 @@
 #[cfg(target_os = "macos")]
+use std::collections::HashMap;
+#[cfg(target_os = "macos")]
 use std::ffi::CStr;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(test)]
+#[cfg(all(target_os = "macos", test))]
 use std::sync::Mutex;
 use std::{
-    collections::HashMap,
     io::{BufRead, Write},
     process::Command,
     time::Instant,
@@ -111,7 +112,7 @@ pub enum HelperError {
     Osascript(String),
 }
 
-#[cfg(test)]
+#[cfg(all(target_os = "macos", test))]
 static TEST_WINDOW_ID_VISIBILITY_RESULT: Mutex<Option<bool>> = Mutex::new(None);
 #[cfg(test)]
 static TEST_OSASCRIPT_CALLS: AtomicUsize = AtomicUsize::new(0);

@@ -5,7 +5,7 @@
 - **Rust stable ≥ 1.93** — `rustup toolchain install stable`
 - **Zig 0.15.2** — required to build vendored `libghostty-vt` (fetched from source as a pinned Zig package during the first build). On macOS 26+, keep a compatible Command Line Tools SDK such as `MacOSX15.4.sdk` installed; the build script will select it automatically when Xcode's default `MacOSX.sdk` points at a newer SDK that Zig 0.15.2 cannot link against.
 - **GTK 4 ≥ 4.12** with development headers — on Arch/Manjaro: `pacman -S gtk4 pango cairo`; on Debian/Ubuntu: `apt install libgtk-4-dev libpango1.0-dev libcairo2-dev`
-- **Wayland session** (X11 is not exercised; GTK4 still starts but some features are Wayland-first)
+- **KDE Plasma Wayland session** for native KWin attach/preview support. Other Wayland compositors run the terminal cockpit but native attach is disabled until backend support lands. X11 has a best-effort attach backend when `xprop` and `xdotool` are installed.
 - **pkg-config** — for locating GTK/Pango/Cairo
 - **C compiler** (`gcc` or `clang`) — for `bindgen`
 
@@ -21,7 +21,7 @@ This:
 
 1. Runs `zig build` under `crates/lmux-libghostty/vendor-ghostty/` to produce `libghostty-vt.a` (statically linked into the final binary)
 2. Runs `bindgen` to generate FFI bindings from the vendored headers
-3. Compiles the Rust workspace (8 crates)
+3. Compiles the Rust workspace
 
 The resulting binary is `target/release/lmux`. Confirm static linkage:
 
@@ -36,20 +36,25 @@ ldd target/release/lmux | grep -i ghostty   # should print nothing
 The repo includes `mise.toml` for pinned development tool versions and common
 test targets:
 
+For Linux development:
+
 ```sh
 mise trust
 mise install
-mise run deps:macos
-mise run doctor:macos
 mise run verify
 mise run build:app
 mise run install:local
 mise run terminal
 ```
 
-`mise run install:local` installs the `lmux` binary into Cargo's local bin
-directory and registers an OS launcher entry: `~/Applications/lmux.app` on
-macOS, or `~/.local/share/applications/lmux.desktop` on Linux.
+macOS-specific helper tasks are available as `mise run deps:macos` and
+`mise run doctor:macos`.
+
+`mise run install:local` installs the `lmux` and `lmux-cli` binaries into
+Cargo's local bin directory and registers an OS launcher entry:
+`~/Applications/lmux.app` on macOS, or
+`~/.local/share/applications/no.jpro.lmux.desktop` on Linux. On Linux it also
+installs the KWin script to `~/.local/share/lmux/kwin/lmux-dock.js`.
 
 ### macOS port branch
 
@@ -58,16 +63,12 @@ The first supported path is a native build on Apple hardware; Docker is not
 used for macOS GUI E2E because the tests need the macOS window server and
 Accessibility permissions.
 
-Chrome-family and JetBrains-family apps launched from lmux use persistent
-lmux-managed profiles under `~/.local/state/lmux/app-profiles/` unless
-`XDG_STATE_HOME` overrides the state base. Remove the relevant app directory
-there to reset an lmux-managed app profile; this does not delete the user's
-normal browser or IDE profile.
+GUI ownership is per window, not per bundle. Open GUI apps normally, then use
+the sidebar link button or `lmux-cli satellite attach-window` to attach the
+specific window lmux should manage.
 
-macOS GUI ownership is per window, not per bundle. `lmux-macos-helper` lists
-windows with CoreGraphics ids and lmux only controls windows correlated to a
-tracked lmux launch. If a safe launched window is missed, use the sidebar link
-button or the bus kind `satellite.attach_focused` while that window is focused.
+On macOS, `lmux-macos-helper` lists windows with CoreGraphics ids. If a window
+is missed, focus it and use the bus kind `satellite.attach_focused`.
 
 ### Pre-commit hook
 

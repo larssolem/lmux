@@ -87,6 +87,12 @@ frame.pane--anchor.pane--focused {
 .lmux--rearrange frame.pane--focused {
     border: 2px solid #f59e0b;
 }
+.lmux-prefix-hint {
+    background-color: alpha(#111827, 0.94);
+    color: #f8fafc;
+    padding: 6px 10px;
+    font-size: 10pt;
+}
 ";
 
 use std::sync::Arc;
@@ -157,7 +163,7 @@ pub fn activate(app: &Application) {
             root.append(first.widget());
             let mut st = AppState::new(root.clone(), first);
             // Auto-anchor the first terminal on fresh startup so anchor-gated
-            // features (sidebar, launcher, bus routing) have a target from
+            // features (sidebar, attach flow, bus routing) have a target from
             // the start — otherwise the cockpit boots into an "orphan pane"
             // state where nothing knows where satellites should attach.
             st.add_anchor(first_id);
@@ -172,7 +178,7 @@ pub fn activate(app: &Application) {
         // Self-healing anchor invariant: any cockpit session must have at
         // least one anchor. If a legacy / corrupt snapshot restored with
         // none, tag the first terminal leaf so anchor-gated features
-        // (sidebar, launcher, bus routing) have a valid target.
+        // (sidebar, attach flow, bus routing) have a valid target.
         let mut st = app_state;
         if st.anchor_count() == 0 {
             if let Some(seed) = st.first_terminal_leaf() {
@@ -197,10 +203,23 @@ pub fn activate(app: &Application) {
         s.attach_rearrange_for_all(reparent_cb);
     }
 
+    let compositor = build_compositor();
+
     // Wrap the pane tree in the anchor sidebar + install its refresh hook.
     let sidebar_cfg = sidebar::load_config();
-    let root_with_sidebar = sidebar::install(sidebar_cfg, root, state.clone());
+    let root_with_sidebar = sidebar::install(sidebar_cfg, root, state.clone(), compositor.clone());
     root_with_sidebar.set_vexpand(true);
+    let shell = gtk4::Box::new(Orientation::Vertical, 0);
+    shell.set_hexpand(true);
+    shell.set_vexpand(true);
+    shell.append(&root_with_sidebar);
+    let prefix_hint = gtk4::Label::new(Some(
+        "Command: + split right   - split down   a workspace   s sessions   m rearrange   q quit",
+    ));
+    prefix_hint.add_css_class("lmux-prefix-hint");
+    prefix_hint.set_xalign(0.0);
+    prefix_hint.set_visible(false);
+    shell.append(&prefix_hint);
     install_application_menubar(app);
 
     let window = ApplicationWindow::builder()
@@ -208,20 +227,19 @@ pub fn activate(app: &Application) {
         .title("lmux")
         .default_width(default_w)
         .default_height(default_h)
-        .child(&root_with_sidebar)
+        .child(&shell)
         .build();
     window.set_size_request(400, 300);
 
     install_window_menu_actions(app, &window, &state, shortcut_prefix.clone());
-    install_window_shortcuts(app, &window, &state, shortcut_prefix.clone());
+    install_window_shortcuts(app, &window, &state, shortcut_prefix.clone(), &prefix_hint);
     install_close_request(app, &window, &state);
     install_control_socket(&window, &state);
     install_notifier(&window, &state);
-    install_bus_server(&state);
+    install_bus_server(&state, compositor);
     install_config_watch(&window, &state, shortcut_prefix);
     #[cfg(target_os = "linux")]
     install_wayland_host(&state);
-    crate::launcher::warm_cache();
 
     // Grab focus once the window is mapped so keystrokes reach the initial
     // pane immediately without the user having to click.
@@ -370,7 +388,6 @@ fn request_platform_permissions() {
 ///   `o` / `]`    — cycle focus forward
 ///   `p` / `[`    — cycle focus backward
 ///   `s`          — session switcher
-///   `l`          — GUI-program launcher
 ///
 /// Any other non-modifier key disarms silently (tmux behavior). Modifier-only
 /// presses (Shift/Ctrl/Alt/Super) keep the prefix armed so that e.g.
@@ -380,6 +397,7 @@ fn install_window_shortcuts(
     window: &ApplicationWindow,
     state: &SharedAppState,
     shortcut_prefix: ShortcutPrefixCell,
+    prefix_hint: &gtk4::Label,
 ) {
     let armed: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     let key = EventControllerKey::new();
@@ -388,6 +406,7 @@ fn install_window_shortcuts(
     let app_cb = app.clone();
     let armed_cb = armed.clone();
     let window_cb = window.clone();
+    let hint_cb = prefix_hint.clone();
     key.connect_key_pressed(move |_ctrl, keyval, _code, modifier| {
         // When a Wayland satellite (browser/IDE) has focus, let every
         // keystroke pass through untouched — including Ctrl+B, which the
@@ -399,13 +418,13 @@ fn install_window_shortcuts(
         // focuses a terminal pane first (click or sidebar).
         if state_cb.borrow().focused_is_satellite() {
             if armed_cb.get() {
-                disarm_prefix(&armed_cb, &window_cb);
+                disarm_prefix(&armed_cb, &window_cb, &hint_cb);
             }
             return glib::Propagation::Proceed;
         }
         if !armed_cb.get() {
             if is_configured_prefix(&shortcut_prefix.borrow(), keyval, modifier) {
-                arm_prefix(&armed_cb, &window_cb);
+                arm_prefix(&armed_cb, &window_cb, &hint_cb);
                 return glib::Propagation::Stop;
             }
             return glib::Propagation::Proceed;
@@ -431,7 +450,7 @@ fn install_window_shortcuts(
         if is_modifier_only {
             return glib::Propagation::Stop;
         }
-        disarm_prefix(&armed_cb, &window_cb);
+        disarm_prefix(&armed_cb, &window_cb, &hint_cb);
 
         let as_char = keyval.to_unicode();
         match keyval {
@@ -459,16 +478,6 @@ fn install_window_shortcuts(
                 Some('s') => {
                     crate::switcher::open(&window_cb, &state_cb);
                 }
-                Some('l') => {
-                    #[cfg(target_os = "macos")]
-                    {
-                        tracing::debug!(
-                            "launcher is disabled on macOS; attach an already-open window instead"
-                        );
-                    }
-                    #[cfg(not(target_os = "macos"))]
-                    crate::launcher::open(&window_cb, &state_cb);
-                }
                 Some('m') => {
                     state_cb.borrow().toggle_rearrange_mode();
                 }
@@ -491,22 +500,26 @@ fn install_window_shortcuts(
     window.add_controller(key);
 }
 
-fn arm_prefix(armed: &Rc<Cell<bool>>, window: &ApplicationWindow) {
+fn arm_prefix(armed: &Rc<Cell<bool>>, window: &ApplicationWindow, hint: &gtk4::Label) {
     armed.set(true);
-    window.set_title(Some("lmux [◆]"));
+    window.set_title(Some("lmux [*]"));
+    hint.set_visible(true);
     let armed_to = armed.clone();
     let window_to = window.clone();
+    let hint_to = hint.clone();
     glib::timeout_add_local_once(PREFIX_TIMEOUT, move || {
         if armed_to.get() {
             armed_to.set(false);
             window_to.set_title(Some("lmux"));
+            hint_to.set_visible(false);
         }
     });
 }
 
-fn disarm_prefix(armed: &Rc<Cell<bool>>, window: &ApplicationWindow) {
+fn disarm_prefix(armed: &Rc<Cell<bool>>, window: &ApplicationWindow, hint: &gtk4::Label) {
     armed.set(false);
     window.set_title(Some("lmux"));
+    hint.set_visible(false);
 }
 
 fn load_keymap_prefix() -> String {
@@ -664,7 +677,10 @@ fn install_config_watch(
     });
 }
 
-fn install_bus_server(state: &SharedAppState) {
+fn install_bus_server(
+    state: &SharedAppState,
+    compositor: std::sync::Arc<dyn lmux_compositor::CompositorControl>,
+) {
     let Some(state_home) = lmux_session::state_home() else {
         tracing::warn!("lmux-bus: disabled (XDG_STATE_HOME / HOME not set)");
         return;
@@ -676,7 +692,6 @@ fn install_bus_server(state: &SharedAppState) {
     let anchor_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
         state.borrow().anchor_count(),
     ));
-    let compositor = build_compositor();
     let satellite_spawn_ok = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let satellite_spawn_fail = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let satellite_counters = crate::bus::SatelliteCounters {
@@ -691,7 +706,7 @@ fn install_bus_server(state: &SharedAppState) {
         cockpit_version: env!("CARGO_PKG_VERSION").to_string(),
         write_tx: Some(write_tx),
         anchor_count: anchor_count.clone(),
-        compositor,
+        compositor: compositor.clone(),
         satellite_spawn_ok,
         satellite_spawn_fail,
     };
@@ -701,6 +716,7 @@ fn install_bus_server(state: &SharedAppState) {
         write_rx,
         state_home,
         state_for_dispatch,
+        compositor.clone(),
         satellite_counters,
     ));
 
@@ -728,8 +744,12 @@ fn build_compositor() -> std::sync::Arc<dyn lmux_compositor::CompositorControl> 
     }
     #[cfg(target_os = "linux")]
     {
+        if is_x11_session() {
+            tracing::info!("compositor: X11 session detected, using X11Compositor");
+            return std::sync::Arc::new(lmux_compositor::X11Compositor::new());
+        }
         if !is_kde_session() {
-            tracing::info!("compositor: no KDE session detected, using Noop");
+            tracing::info!("compositor: no attach-capable Linux compositor detected, using Noop");
             return std::sync::Arc::new(lmux_compositor::NoopCompositor::default());
         }
         match locate_kwin_script() {
@@ -760,6 +780,17 @@ fn is_kde_session() -> bool {
     std::env::var_os("XDG_CURRENT_DESKTOP")
         .map(|v| v.to_string_lossy().to_ascii_lowercase().contains("kde"))
         .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn is_x11_session() -> bool {
+    if std::env::var_os("DISPLAY").is_none() {
+        return false;
+    }
+    match std::env::var_os("XDG_SESSION_TYPE") {
+        Some(value) => value.to_string_lossy().eq_ignore_ascii_case("x11"),
+        None => std::env::var_os("WAYLAND_DISPLAY").is_none(),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -946,6 +977,7 @@ fn onboarding_payload() -> Option<OnboardingToast> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

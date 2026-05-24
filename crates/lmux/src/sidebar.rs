@@ -21,6 +21,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gtk4::pango::prelude::{FontFamilyExt, FontMapExt};
 use gtk4::prelude::*;
@@ -30,6 +31,10 @@ use gtk4::{
     ScrolledWindow, StringObject,
 };
 
+use lmux_compositor::{
+    CompositorControl, SatelliteWindowId, WindowAppIdentity, WindowCandidate,
+    WindowCandidateBackend, WindowPreview, WindowPreviewData,
+};
 use lmux_config::{Sidebar as SidebarCfg, SidebarPosition};
 #[cfg(target_os = "macos")]
 use lmux_macos_helper::WindowInfo as MacosWindowInfo;
@@ -56,9 +61,136 @@ struct MacosWindowPickerItem {
     attached_here: bool,
 }
 
+#[derive(Clone)]
+struct WindowPickerItem {
+    window: WindowCandidate,
+    attached: Option<(PaneId, String)>,
+    attached_here: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AttachActionView {
+    sensitive: bool,
+    tooltip: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowPickerListState {
+    Windows,
+    Empty,
+    Error,
+}
+
+fn attach_action_view(caps: lmux_compositor::WindowControlCapabilities) -> AttachActionView {
+    if caps.list_windows && caps.attach_window {
+        AttachActionView {
+            sensitive: true,
+            tooltip: "Add window",
+        }
+    } else {
+        AttachActionView {
+            sensitive: false,
+            tooltip: "Adding windows is unavailable for this compositor",
+        }
+    }
+}
+
+fn window_picker_list_state(window_count: Option<usize>) -> WindowPickerListState {
+    match window_count {
+        Some(0) => WindowPickerListState::Empty,
+        Some(_) => WindowPickerListState::Windows,
+        None => WindowPickerListState::Error,
+    }
+}
+
+fn should_close_picker_after_attach(result: &Result<(), String>) -> bool {
+    result.is_ok()
+}
+
+async fn list_windows_for_picker(
+    compositor: Arc<dyn CompositorControl>,
+) -> Result<Vec<WindowCandidate>, String> {
+    let (tx, rx) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| err.to_string())
+            .and_then(|rt| {
+                rt.block_on(async move {
+                    compositor
+                        .list_windows()
+                        .await
+                        .map_err(|err| err.to_string())
+                })
+            });
+        let _ = tx.send_blocking(result);
+    });
+    rx.recv()
+        .await
+        .unwrap_or_else(|err| Err(format!("window list worker failed: {err}")))
+}
+
+async fn attach_window_for_picker(
+    compositor: Arc<dyn CompositorControl>,
+    candidate: WindowCandidate,
+) -> Result<SatelliteWindowId, String> {
+    let (tx, rx) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| err.to_string())
+            .and_then(|rt| {
+                rt.block_on(async move {
+                    compositor
+                        .attach_window(&candidate)
+                        .await
+                        .map_err(|err| err.to_string())
+                })
+            });
+        let _ = tx.send_blocking(result);
+    });
+    rx.recv()
+        .await
+        .unwrap_or_else(|err| Err(format!("window attach worker failed: {err}")))
+}
+
+async fn window_preview_for_picker(
+    compositor: Arc<dyn CompositorControl>,
+    candidate: WindowCandidate,
+    max_width: u32,
+    max_height: u32,
+) -> Result<Option<WindowPreview>, String> {
+    let (tx, rx) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| err.to_string())
+            .and_then(|rt| {
+                rt.block_on(async move {
+                    compositor
+                        .window_preview(&candidate, max_width, max_height)
+                        .await
+                        .map_err(|err| err.to_string())
+                })
+            });
+        let _ = tx.send_blocking(result);
+    });
+    rx.recv()
+        .await
+        .unwrap_or_else(|err| Err(format!("window preview worker failed: {err}")))
+}
+
 /// Install the sidebar around `pane_tree_root`. Returns the outer `Paned`
 /// widget the caller should set as the window's child.
-pub fn install(cfg: SidebarCfg, pane_tree_root: GtkBox, state: SharedAppState) -> gtk4::Widget {
+pub fn install(
+    cfg: SidebarCfg,
+    pane_tree_root: GtkBox,
+    state: SharedAppState,
+    compositor: Arc<dyn CompositorControl>,
+) -> gtk4::Widget {
     let sidebar_box = GtkBox::new(Orientation::Vertical, 4);
     sidebar_box.add_css_class("lmux-sidebar");
     sidebar_box.set_width_request(cfg.width as i32);
@@ -69,7 +201,7 @@ pub fn install(cfg: SidebarCfg, pane_tree_root: GtkBox, state: SharedAppState) -
     let collapse_btn = Button::from_icon_name("pan-start-symbolic");
     collapse_btn.add_css_class("flat");
     header.append(&collapse_btn);
-    let title = Label::new(Some("Anchors"));
+    let title = Label::new(Some("Workspaces"));
     title.set_xalign(0.0);
     title.set_hexpand(true);
     header.append(&title);
@@ -81,7 +213,7 @@ pub fn install(cfg: SidebarCfg, pane_tree_root: GtkBox, state: SharedAppState) -
     // pane is already owned.
     let new_anchor_btn = Button::from_icon_name("list-add-symbolic");
     new_anchor_btn.add_css_class("flat");
-    new_anchor_btn.set_tooltip_text(Some("New anchor"));
+    new_anchor_btn.set_tooltip_text(Some("New workspace"));
     header.append(&new_anchor_btn);
     expanded_only.push(new_anchor_btn.clone().upcast());
     let state_for_new = state.clone();
@@ -89,39 +221,26 @@ pub fn install(cfg: SidebarCfg, pane_tree_root: GtkBox, state: SharedAppState) -
         state_for_new.borrow_mut().create_new_anchor();
     });
 
-    #[cfg(not(target_os = "macos"))]
     {
-        // Launcher button: spotlight-style popover that scans installed GUI apps
-        // for the current platform and spawns the chosen one as a satellite.
-        let launcher_btn = Button::from_icon_name("system-search-symbolic");
-        launcher_btn.add_css_class("flat");
-        launcher_btn.set_tooltip_text(Some("Launch program (Ctrl+B l)"));
-        header.append(&launcher_btn);
-        expanded_only.push(launcher_btn.clone().upcast());
-        let state_for_launcher = state.clone();
-        launcher_btn.connect_clicked(move |btn| {
-            if let Some(root) = btn.root() {
-                if let Ok(win) = root.downcast::<gtk4::ApplicationWindow>() {
-                    crate::launcher::open(&win, &state_for_launcher);
-                }
-            }
-        });
-    }
-    #[cfg(target_os = "macos")]
-    {
+        let attach_caps = compositor.window_control_capabilities();
+        let attach_view = attach_action_view(attach_caps);
         let attach_btn = Button::from_icon_name("insert-link-symbolic");
         attach_btn.add_css_class("flat");
-        attach_btn.set_tooltip_text(Some("Attach macOS window"));
+        attach_btn.set_tooltip_text(Some(attach_view.tooltip));
+        attach_btn.set_sensitive(attach_view.sensitive);
         header.append(&attach_btn);
         expanded_only.push(attach_btn.clone().upcast());
-        let state_for_attach = state.clone();
-        attach_btn.connect_clicked(move |btn| {
-            if let Some(root) = btn.root() {
-                if let Ok(win) = root.downcast::<gtk4::ApplicationWindow>() {
-                    open_macos_attach_picker(&win, &state_for_attach);
+        if attach_view.sensitive {
+            let state_for_attach = state.clone();
+            let compositor_for_attach = compositor.clone();
+            attach_btn.connect_clicked(move |btn| {
+                if let Some(root) = btn.root() {
+                    if let Ok(win) = root.downcast::<gtk4::ApplicationWindow>() {
+                        open_attach_picker(&win, &state_for_attach, compositor_for_attach.clone());
+                    }
                 }
-            }
-        });
+            });
+        }
     }
     sidebar_box.append(&header);
 
@@ -320,7 +439,7 @@ fn refresh_list(
                 a.sort_key.unwrap_or(0),
                 a.display_label().to_string(),
             ),
-            None => (None, 0, format!("pane {pane_id}")),
+            None => (None, 0, format!("terminal {pane_id}")),
         };
         rows.push((group, sort_key, pane_id, label));
     }
@@ -328,9 +447,12 @@ fn refresh_list(
     drop(s);
 
     if rows.is_empty() {
-        let empty = Label::new(Some("(no anchors)\nCtrl+B a to tag"));
+        let empty = Label::new(Some(
+            "(no workspaces)\nUse + to create a workspace, or Ctrl+B a to use the focused terminal.",
+        ));
         empty.set_justify(gtk4::Justification::Center);
         empty.set_xalign(0.5);
+        empty.set_wrap(true);
         empty.add_css_class("dim-label");
         list.append(&empty);
         return;
@@ -348,7 +470,7 @@ fn refresh_list(
     let mut last_group: Option<Option<String>> = None;
     for (group, _sort_key, pane_id, label) in rows {
         if last_group.as_ref() != Some(&group) {
-            let header_label = group.clone().unwrap_or_else(|| "Ungrouped".to_string());
+            let header_label = group.clone().unwrap_or_else(|| "No group".to_string());
             let header = Label::new(Some(&header_label));
             header.set_xalign(0.0);
             header.add_css_class("heading");
@@ -475,10 +597,12 @@ fn build_row(
     });
     row.add_controller(drop_target);
 
-    let id_badge = Label::new(Some(&format!("{pane_id}")));
-    id_badge.add_css_class("dim-label");
-    id_badge.set_width_chars(2);
-    header_row.append(&id_badge);
+    row.set_tooltip_text(Some(&format!("Terminal pane {pane_id}")));
+
+    let kind_badge = Label::new(Some("Terminal"));
+    kind_badge.add_css_class("dim-label");
+    kind_badge.set_width_chars(8);
+    header_row.append(&kind_badge);
 
     let title = Label::new(Some(label));
     title.set_xalign(0.0);
@@ -490,6 +614,27 @@ fn build_row(
     dot.add_css_class("lmux-sidebar__active-dot");
     dot.set_visible(is_active);
     header_row.append(&dot);
+
+    let menu_btn = Button::from_icon_name("view-more-symbolic");
+    menu_btn.add_css_class("flat");
+    menu_btn.set_tooltip_text(Some("Workspace actions"));
+    header_row.append(&menu_btn);
+    let row_for_btn = row.downgrade();
+    let state_for_btn = state.clone();
+    let name_for_btn = current_name.clone();
+    let group_for_btn = current_group.clone();
+    menu_btn.connect_clicked(move |_| {
+        if let Some(row) = row_for_btn.upgrade() {
+            show_row_popover(
+                &row,
+                pane_id,
+                &name_for_btn,
+                &group_for_btn,
+                state_for_btn.clone(),
+            );
+        }
+    });
+
     active_rows.borrow_mut().insert(
         pane_id,
         ActiveRow {
@@ -622,12 +767,15 @@ fn rgb_texture(cols: u32, rows: u32, bytes: Vec<u8>) -> gdk::MemoryTexture {
     )
 }
 
-#[cfg(target_os = "macos")]
-fn open_macos_attach_picker(parent: &gtk4::ApplicationWindow, state: &SharedAppState) {
+fn open_attach_picker(
+    parent: &gtk4::ApplicationWindow,
+    state: &SharedAppState,
+    compositor: Arc<dyn CompositorControl>,
+) {
     let dialog = gtk4::Window::builder()
         .transient_for(parent)
         .modal(true)
-        .title("Attach window")
+        .title("Add window")
         .default_width(640)
         .default_height(460)
         .build();
@@ -638,10 +786,458 @@ fn open_macos_attach_picker(parent: &gtk4::ApplicationWindow, state: &SharedAppS
     body.set_margin_start(10);
     body.set_margin_end(10);
 
-    let heading = Label::new(Some("Attach window"));
+    let heading = Label::new(Some("Add window"));
     heading.set_xalign(0.0);
     heading.add_css_class("heading");
     body.append(&heading);
+
+    let help = Label::new(Some(
+        "Choose an open window to add to the active workspace. Open apps from KDE first, then add the exact window here.",
+    ));
+    help.set_xalign(0.0);
+    help.set_wrap(true);
+    help.add_css_class("dim-label");
+    body.append(&help);
+
+    let status = Label::new(None);
+    status.set_xalign(0.0);
+    status.set_wrap(true);
+    status.add_css_class("dim-label");
+    status.set_visible(false);
+    body.append(&status);
+
+    let list = ListBox::new();
+    list.set_selection_mode(gtk4::SelectionMode::None);
+    list.set_activate_on_single_click(true);
+    list.add_css_class("lmux-window-picker");
+    let loading = Label::new(Some("Loading windows..."));
+    loading.set_xalign(0.0);
+    loading.add_css_class("dim-label");
+    list.append(&loading);
+
+    let scroll = ScrolledWindow::new();
+    scroll.set_vexpand(true);
+    scroll.set_hscrollbar_policy(gtk4::PolicyType::Never);
+    scroll.set_child(Some(&list));
+    body.append(&scroll);
+
+    let footer = GtkBox::new(Orientation::Horizontal, 6);
+    footer.set_halign(Align::End);
+    let cancel = Button::with_label("Cancel");
+    footer.append(&cancel);
+    body.append(&footer);
+
+    let dialog_for_cancel = dialog.clone();
+    cancel.connect_clicked(move |_| dialog_for_cancel.close());
+
+    dialog.set_child(Some(&body));
+    dialog.present();
+
+    let state_for_list = state.clone();
+    let list_for_load = list.clone();
+    let dialog_for_load = dialog.clone();
+    let status_for_load = status.clone();
+    glib::MainContext::default().spawn_local(async move {
+        clear_list_box(&list_for_load);
+        status_for_load.set_visible(false);
+        match list_windows_for_picker(compositor.clone()).await {
+            Ok(windows)
+                if window_picker_list_state(Some(windows.len()))
+                    == WindowPickerListState::Empty =>
+            {
+                let empty = Label::new(Some(
+                    "No windows found. Open an app, then try Add window again.",
+                ));
+                empty.set_xalign(0.0);
+                empty.set_wrap(true);
+                empty.add_css_class("dim-label");
+                list_for_load.append(&empty);
+            }
+            Ok(windows) => {
+                let items = Rc::new(window_picker_items(windows, &state_for_list));
+                for item in items.iter() {
+                    let row = gtk4::ListBoxRow::new();
+                    row.set_activatable(true);
+                    row.set_selectable(false);
+                    row.set_child(Some(&window_picker_row(item, compositor.clone())));
+                    list_for_load.append(&row);
+                }
+
+                let state_for_activate = state_for_list.clone();
+                let compositor_for_activate = compositor.clone();
+                let items_for_activate = items.clone();
+                let dialog_for_activate = dialog_for_load.clone();
+                let status_for_activate = status_for_load.clone();
+                list_for_load.connect_row_activated(move |_, row| {
+                    let Ok(index) = usize::try_from(row.index()) else {
+                        return;
+                    };
+                    let Some(item) = items_for_activate.get(index).cloned() else {
+                        return;
+                    };
+                    let state_for_attach = state_for_activate.clone();
+                    let compositor_for_attach = compositor_for_activate.clone();
+                    let dialog_for_attach = dialog_for_activate.clone();
+                    let status_for_attach = status_for_activate.clone();
+                    status_for_attach.set_visible(false);
+                    glib::MainContext::default().spawn_local(async move {
+                        let attach_result = async {
+                            let window = attach_window_for_picker(
+                                compositor_for_attach,
+                                item.window.clone(),
+                            )
+                            .await?;
+                            state_for_attach
+                                .borrow_mut()
+                                .attach_native_window_to_active_anchor(&item.window, window)
+                        }
+                        .await;
+                        if should_close_picker_after_attach(&attach_result) {
+                            dialog_for_attach.close();
+                        } else if let Err(err) = attach_result {
+                            tracing::warn!(error = %err, "attach selected window failed");
+                            status_for_attach.set_text(&format!("Could not add window: {err}"));
+                            status_for_attach.set_visible(true);
+                        }
+                    });
+                });
+            }
+            Err(err) => {
+                debug_assert_eq!(window_picker_list_state(None), WindowPickerListState::Error);
+                tracing::warn!(error = %err, "window picker failed to list windows");
+                status_for_load.set_text(&format!("Could not list windows: {err}"));
+                status_for_load.set_visible(true);
+                let error = Label::new(Some("Could not list windows"));
+                error.set_xalign(0.0);
+                error.add_css_class("dim-label");
+                list_for_load.append(&error);
+            }
+        }
+    });
+}
+
+fn clear_list_box(list: &ListBox) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+}
+
+fn window_picker_items(
+    windows: Vec<WindowCandidate>,
+    state: &SharedAppState,
+) -> Vec<WindowPickerItem> {
+    let state = state.borrow();
+    let active_anchor = state.active_anchor();
+    window_picker_items_for(windows, active_anchor, |backend_window_id| {
+        state.attached_anchor_for_backend_window(backend_window_id)
+    })
+}
+
+fn window_picker_items_for<F>(
+    windows: Vec<WindowCandidate>,
+    active_anchor: Option<PaneId>,
+    attached_for: F,
+) -> Vec<WindowPickerItem>
+where
+    F: Fn(&str) -> Option<(PaneId, String)>,
+{
+    let mut items: Vec<_> = windows
+        .into_iter()
+        .map(|window| {
+            let attached = attached_for(&window.backend_window_id);
+            let attached_here = attached
+                .as_ref()
+                .map(|(anchor, _)| Some(*anchor) == active_anchor)
+                .unwrap_or(false);
+            WindowPickerItem {
+                window,
+                attached,
+                attached_here,
+            }
+        })
+        .collect();
+    items.sort_by(|a, b| {
+        window_picker_item_rank(a)
+            .cmp(&window_picker_item_rank(b))
+            .then_with(|| window_backend_label(&a.window).cmp(&window_backend_label(&b.window)))
+            .then_with(|| window_app_label(&a.window).cmp(&window_app_label(&b.window)))
+            .then_with(|| window_title(&a.window).cmp(&window_title(&b.window)))
+    });
+    items
+}
+
+fn window_picker_item_rank(item: &WindowPickerItem) -> u8 {
+    if item.attached_here {
+        0
+    } else if item.attached.is_some() {
+        1
+    } else {
+        2
+    }
+}
+
+fn window_picker_row(
+    item: &WindowPickerItem,
+    compositor: Arc<dyn CompositorControl>,
+) -> gtk4::Widget {
+    let row = GtkBox::new(Orientation::Horizontal, 10);
+    row.add_css_class("lmux-window-picker__row");
+    if item.attached_here {
+        row.add_css_class("lmux-window-picker__row--attached-active");
+    } else if item.attached.is_some() {
+        row.add_css_class("lmux-window-picker__row--attached-other");
+    }
+    row.set_margin_top(6);
+    row.set_margin_bottom(6);
+    row.set_margin_start(6);
+    row.set_margin_end(6);
+
+    row.append(&window_preview_tile(&item.window, compositor));
+
+    let text = GtkBox::new(Orientation::Vertical, 3);
+    text.set_hexpand(true);
+    text.set_valign(Align::Center);
+
+    let title = Label::new(Some(&window_title(&item.window)));
+    title.set_xalign(0.0);
+    title.set_hexpand(true);
+    title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    text.append(&title);
+
+    let meta = Label::new(Some(&window_meta(&item.window)));
+    meta.set_xalign(0.0);
+    meta.add_css_class("lmux-window-picker__meta");
+    meta.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    text.append(&meta);
+
+    if let Some((_, label)) = &item.attached {
+        let attached_text = if item.attached_here {
+            "Active workspace".to_string()
+        } else {
+            format!("Other workspace: {label}")
+        };
+        let attached = Label::new(Some(&attached_text));
+        attached.set_xalign(0.0);
+        if item.attached_here {
+            attached.add_css_class("lmux-window-picker__attached-active");
+        } else {
+            attached.add_css_class("lmux-window-picker__attached-other");
+        }
+        text.append(&attached);
+    }
+
+    row.append(&text);
+
+    let attach_text = if item.attached_here {
+        "Active"
+    } else if item.attached.is_some() {
+        "Move here"
+    } else {
+        "Add"
+    };
+    let attach = Label::new(Some(attach_text));
+    if item.attached_here {
+        attach.add_css_class("lmux-window-picker__attached-active");
+    } else if item.attached.is_some() {
+        attach.add_css_class("lmux-window-picker__attached-other");
+    } else {
+        attach.add_css_class("dim-label");
+    }
+    attach.set_valign(Align::Center);
+    row.append(&attach);
+
+    row.upcast()
+}
+
+fn window_preview_tile(
+    window: &WindowCandidate,
+    compositor: Arc<dyn CompositorControl>,
+) -> gtk4::Widget {
+    let tile = GtkBox::new(Orientation::Vertical, 0);
+    tile.add_css_class("lmux-window-picker__preview");
+    tile.add_css_class("lmux-window-picker__preview--missing");
+    tile.set_size_request(118, 66);
+    tile.set_valign(Align::Center);
+
+    append_window_preview_fallback(&tile, window);
+
+    let tile_for_preview = tile.clone();
+    let window_for_preview = window.clone();
+    glib::MainContext::default().spawn_local(async move {
+        match window_preview_for_picker(compositor, window_for_preview.clone(), 118, 66).await {
+            Ok(Some(preview)) => {
+                if apply_window_preview(&tile_for_preview, preview).is_err() {
+                    replace_window_preview_fallback(&tile_for_preview, &window_for_preview);
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::debug!(error = %err, "window preview capture failed");
+            }
+        }
+    });
+
+    tile.upcast()
+}
+
+fn append_window_preview_fallback(tile: &GtkBox, window: &WindowCandidate) {
+    tile.add_css_class("lmux-window-picker__preview--missing");
+    let fallback = Label::new(Some(&window_initials(window)));
+    fallback.add_css_class("lmux-window-picker__preview-text");
+    fallback.set_halign(Align::Center);
+    fallback.set_valign(Align::Center);
+    fallback.set_justify(gtk4::Justification::Center);
+    fallback.set_hexpand(true);
+    fallback.set_vexpand(true);
+    tile.append(&fallback);
+}
+
+fn replace_window_preview_fallback(tile: &GtkBox, window: &WindowCandidate) {
+    clear_box(tile);
+    append_window_preview_fallback(tile, window);
+}
+
+fn apply_window_preview(tile: &GtkBox, preview: WindowPreview) -> Result<(), glib::Error> {
+    let picture = Picture::new();
+    picture.set_content_fit(gtk4::ContentFit::Contain);
+    match preview.data {
+        WindowPreviewData::EncodedImage(bytes) => {
+            let texture = gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes))?;
+            picture.set_paintable(Some(&texture));
+        }
+        WindowPreviewData::Bgra {
+            width,
+            height,
+            bytes_per_row,
+            data,
+        } => {
+            let texture = gdk::MemoryTexture::new(
+                width as i32,
+                height as i32,
+                gdk::MemoryFormat::B8g8r8a8Premultiplied,
+                &glib::Bytes::from_owned(data),
+                bytes_per_row,
+            );
+            picture.set_paintable(Some(&texture));
+        }
+    }
+    tile.remove_css_class("lmux-window-picker__preview--missing");
+    clear_box(tile);
+    tile.append(&picture);
+    Ok(())
+}
+
+fn clear_box(container: &GtkBox) {
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
+    }
+}
+
+fn window_title(window: &WindowCandidate) -> String {
+    window
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or("(untitled window)")
+        .to_string()
+}
+
+fn window_meta(window: &WindowCandidate) -> String {
+    let mut parts = vec![
+        window_backend_label(window),
+        window.backend_window_id.clone(),
+    ];
+    if let Some(pid) = window.pid {
+        parts.push(format!("pid {pid}"));
+    }
+    if let Some(app) = app_identity_label(window.app_identity.as_ref()) {
+        parts.push(app);
+    }
+    if let Some(workspace) = &window.workspace {
+        parts.push(format!("workspace {workspace}"));
+    }
+    if let Some(output) = &window.output {
+        parts.push(output.clone());
+    }
+    parts.join(" · ")
+}
+
+fn window_backend_label(window: &WindowCandidate) -> String {
+    match &window.backend {
+        WindowCandidateBackend::Macos => "macOS",
+        WindowCandidateBackend::Kwin => "KWin",
+        WindowCandidateBackend::X11 => "X11",
+        WindowCandidateBackend::Hyprland => "Hyprland",
+        WindowCandidateBackend::Sway => "Sway",
+        WindowCandidateBackend::Noop => "Noop",
+        WindowCandidateBackend::Unsupported => "Unsupported",
+    }
+    .to_string()
+}
+
+fn window_app_label(window: &WindowCandidate) -> String {
+    app_identity_label(window.app_identity.as_ref()).unwrap_or_default()
+}
+
+fn app_identity_label(identity: Option<&WindowAppIdentity>) -> Option<String> {
+    match identity {
+        Some(WindowAppIdentity::BundleId(value)) => Some(value.clone()),
+        Some(WindowAppIdentity::DesktopEntry(value)) => Some(value.clone()),
+        Some(WindowAppIdentity::WmClass(value)) => Some(value.clone()),
+        Some(WindowAppIdentity::AppId(value)) => Some(value.clone()),
+        Some(WindowAppIdentity::Other(value)) => Some(value.clone()),
+        None => None,
+    }
+}
+
+fn window_initials(window: &WindowCandidate) -> String {
+    let source =
+        app_identity_label(window.app_identity.as_ref()).unwrap_or_else(|| window_title(window));
+    let mut initials = String::new();
+    for word in source.split(|c: char| !c.is_alphanumeric()) {
+        if let Some(ch) = word.chars().next() {
+            initials.extend(ch.to_uppercase());
+        }
+        if initials.chars().count() >= 2 {
+            break;
+        }
+    }
+    if initials.is_empty() {
+        "W".to_string()
+    } else {
+        initials
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_macos_attach_picker(parent: &gtk4::ApplicationWindow, state: &SharedAppState) {
+    let dialog = gtk4::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .title("Add window")
+        .default_width(640)
+        .default_height(460)
+        .build();
+
+    let body = GtkBox::new(Orientation::Vertical, 8);
+    body.set_margin_top(10);
+    body.set_margin_bottom(10);
+    body.set_margin_start(10);
+    body.set_margin_end(10);
+
+    let heading = Label::new(Some("Add window"));
+    heading.set_xalign(0.0);
+    heading.add_css_class("heading");
+    body.append(&heading);
+
+    let help = Label::new(Some(
+        "Choose an open window to add to the active workspace. Open apps first, then add the exact window here.",
+    ));
+    help.set_xalign(0.0);
+    help.set_wrap(true);
+    help.add_css_class("dim-label");
+    body.append(&help);
 
     let list = ListBox::new();
     list.set_selection_mode(gtk4::SelectionMode::None);
@@ -650,8 +1246,11 @@ fn open_macos_attach_picker(parent: &gtk4::ApplicationWindow, state: &SharedAppS
 
     match lmux_macos_helper::list_windows(None, None) {
         Ok(windows) if windows.is_empty() => {
-            let empty = Label::new(Some("No windows found"));
+            let empty = Label::new(Some(
+                "No windows found. Open an app, then try Add window again.",
+            ));
             empty.set_xalign(0.0);
+            empty.set_wrap(true);
             empty.add_css_class("dim-label");
             list.append(&empty);
         }
@@ -790,9 +1389,9 @@ fn macos_window_picker_row(item: &MacosWindowPickerItem) -> gtk4::Widget {
 
     if let Some((_, label)) = &item.attached {
         let attached_text = if item.attached_here {
-            "Active anchor".to_string()
+            "Active workspace".to_string()
         } else {
-            format!("Other anchor: {label}")
+            format!("Other workspace: {label}")
         };
         let attached = Label::new(Some(&attached_text));
         attached.set_xalign(0.0);
@@ -811,7 +1410,7 @@ fn macos_window_picker_row(item: &MacosWindowPickerItem) -> gtk4::Widget {
     } else if item.attached.is_some() {
         "Move here"
     } else {
-        "Attach"
+        "Add"
     };
     let attach = Label::new(Some(attach_text));
     if item.attached_here {
@@ -951,7 +1550,7 @@ fn show_row_popover(
     body.set_margin_start(8);
     body.set_margin_end(8);
 
-    let heading = Label::new(Some(&format!("Anchor · pane {pane_id}")));
+    let heading = Label::new(Some(&format!("Workspace · terminal {pane_id}")));
     heading.set_xalign(0.0);
     heading.add_css_class("heading");
     body.append(&heading);
@@ -993,7 +1592,7 @@ fn show_row_popover(
 
     let btn_row = GtkBox::new(Orientation::Horizontal, 6);
     btn_row.set_halign(Align::End);
-    let untag_btn = Button::with_label("Untag");
+    let untag_btn = Button::with_label("Remove");
     untag_btn.add_css_class("destructive-action");
     let pause_btn = Button::with_label(if is_paused { "Resume" } else { "Pause" });
     let apply_btn = Button::with_label("Apply");
@@ -1199,15 +1798,18 @@ fn append_settings_controls(
     let prefix_error_apply = prefix_error.clone();
     let shortcut_prefix_apply = shortcut_prefix;
     apply.connect_clicked(move |_| {
+        let controls = SettingsApplyControls {
+            font_combo: &font_combo_apply,
+            size_spin: &size_spin_apply,
+            prefix_entry: &prefix_entry_apply,
+            prefix_error: &prefix_error_apply,
+            shortcut_prefix: &shortcut_prefix_apply,
+        };
         let applied = apply_settings_config(
             cfg_for_apply.clone(),
             path_for_apply.clone(),
             &state_for_apply,
-            &font_combo_apply,
-            &size_spin_apply,
-            &prefix_entry_apply,
-            &prefix_error_apply,
-            &shortcut_prefix_apply,
+            controls,
         );
         if applied {
             dialog_for_apply.close();
@@ -1215,31 +1817,37 @@ fn append_settings_controls(
     });
 }
 
+struct SettingsApplyControls<'a> {
+    font_combo: &'a DropDown,
+    size_spin: &'a gtk4::SpinButton,
+    prefix_entry: &'a Entry,
+    prefix_error: &'a Label,
+    shortcut_prefix: &'a ShortcutPrefixCell,
+}
+
 fn apply_settings_config(
     mut cfg: lmux_config::Config,
     path: PathBuf,
     state: &SharedAppState,
-    font_combo: &DropDown,
-    size_spin: &gtk4::SpinButton,
-    prefix_entry: &Entry,
-    prefix_error: &Label,
-    shortcut_prefix: &ShortcutPrefixCell,
+    controls: SettingsApplyControls<'_>,
 ) -> bool {
-    if let Some(family) = selected_font_family(font_combo) {
+    if let Some(family) = selected_font_family(controls.font_combo) {
         cfg.general.font_family = family;
     }
-    cfg.general.font_size = size_spin.value_as_int().clamp(6, 48) as u32;
-    let prefix = prefix_entry.text().trim().to_string();
+    cfg.general.font_size = controls.size_spin.value_as_int().clamp(6, 48) as u32;
+    let prefix = controls.prefix_entry.text().trim().to_string();
     if !prefix.is_empty() {
         if !crate::app::is_valid_prefix_binding(&prefix) {
-            prefix_error.set_text("Use a prefix like ctrl+b, ctrl+shift+k, alt+x, or cmd+k.");
-            prefix_error.set_visible(true);
-            prefix_entry.grab_focus();
+            controls
+                .prefix_error
+                .set_text("Use a prefix like ctrl+b, ctrl+shift+k, alt+x, or cmd+k.");
+            controls.prefix_error.set_visible(true);
+            controls.prefix_entry.grab_focus();
             return false;
         }
-        prefix_error.set_visible(false);
+        controls.prefix_error.set_visible(false);
         cfg.keymap.prefix = prefix.clone();
-        *shortcut_prefix.borrow_mut() = prefix;
+        *controls.shortcut_prefix.borrow_mut() = prefix;
     }
     state.borrow().apply_config(&cfg);
     if let Err(err) = lmux_config::save(&path, &cfg) {
@@ -1351,6 +1959,18 @@ fn _keep_glib_linked() {
 mod tests {
     use super::*;
 
+    fn test_window(id: &str, title: &str) -> WindowCandidate {
+        WindowCandidate {
+            backend: WindowCandidateBackend::Kwin,
+            backend_window_id: id.to_string(),
+            pid: Some(1234),
+            app_identity: Some(WindowAppIdentity::WmClass("example".into())),
+            title: Some(title.to_string()),
+            workspace: None,
+            output: None,
+        }
+    }
+
     #[test]
     fn sidebar_sort_tie_breaker_ignores_label() {
         let mut rows = vec![
@@ -1376,5 +1996,84 @@ mod tests {
 
         let pane_ids: Vec<PaneId> = rows.into_iter().map(|(_, _, pane_id, _)| pane_id).collect();
         assert_eq!(pane_ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn attach_action_is_enabled_only_when_listing_and_attach_are_supported() {
+        let supported = attach_action_view(lmux_compositor::WindowControlCapabilities {
+            list_windows: true,
+            attach_window: true,
+            set_visible: true,
+            raise_window: true,
+        });
+        assert_eq!(
+            supported,
+            AttachActionView {
+                sensitive: true,
+                tooltip: "Add window"
+            }
+        );
+
+        let unsupported = attach_action_view(lmux_compositor::WindowControlCapabilities {
+            list_windows: true,
+            attach_window: false,
+            set_visible: false,
+            raise_window: false,
+        });
+        assert_eq!(
+            unsupported,
+            AttachActionView {
+                sensitive: false,
+                tooltip: "Adding windows is unavailable for this compositor"
+            }
+        );
+    }
+
+    #[test]
+    fn window_picker_list_state_covers_windows_empty_and_error() {
+        assert_eq!(
+            window_picker_list_state(Some(2)),
+            WindowPickerListState::Windows
+        );
+        assert_eq!(
+            window_picker_list_state(Some(0)),
+            WindowPickerListState::Empty
+        );
+        assert_eq!(window_picker_list_state(None), WindowPickerListState::Error);
+    }
+
+    #[test]
+    fn window_picker_orders_attached_active_other_then_unattached() {
+        let items = window_picker_items_for(
+            vec![
+                test_window("kwin:unattached", "C"),
+                test_window("kwin:other", "B"),
+                test_window("kwin:active", "A"),
+            ],
+            Some(10),
+            |id| match id {
+                "kwin:active" => Some((10, "Active".into())),
+                "kwin:other" => Some((20, "Other".into())),
+                _ => None,
+            },
+        );
+
+        let ids: Vec<_> = items
+            .iter()
+            .map(|item| item.window.backend_window_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["kwin:active", "kwin:other", "kwin:unattached"]);
+        assert!(items[0].attached_here);
+        assert!(items[1].attached.is_some());
+        assert!(!items[2].attached_here);
+        assert!(items[2].attached.is_none());
+    }
+
+    #[test]
+    fn attach_failure_keeps_picker_open() {
+        assert!(should_close_picker_after_attach(&Ok(())));
+        assert!(!should_close_picker_after_attach(&Err(
+            "attach selected window failed".into()
+        )));
     }
 }

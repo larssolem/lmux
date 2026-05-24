@@ -8,12 +8,17 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[cfg(target_os = "macos")]
 use std::path::Path;
 use std::process::Command;
+#[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
 use assert_cmd::assert::OutputAssertExt;
+#[cfg(target_os = "macos")]
 use lmux_e2e::{Env, RunningLmux};
+#[cfg(target_os = "macos")]
 use predicates::prelude::*;
 
 #[test]
@@ -127,13 +132,18 @@ fn run_macos_window_flow() {
 
 fn build_live_binaries() {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let mut args = vec!["build", "-p", "lmux", "-p", "lmux-cli"];
+    let args = vec!["build", "-p", "lmux", "-p", "lmux-cli"];
     #[cfg(target_os = "macos")]
-    args.extend(["-p", "lmux-macos-helper"]);
+    let args = {
+        let mut args = args;
+        args.extend(["-p", "lmux-macos-helper"]);
+        args
+    };
     let status = Command::new(cargo).args(args).status().unwrap();
     assert!(status.success(), "live e2e binary build failed: {status}");
 }
 
+#[cfg(target_os = "macos")]
 fn anchors(env: &Env) -> Vec<String> {
     let output = env.cli("lmux-cli").args(["pane", "list"]).output().unwrap();
     assert!(output.status.success(), "pane list failed: {output:?}");
@@ -146,6 +156,7 @@ fn anchors(env: &Env) -> Vec<String> {
         .collect()
 }
 
+#[cfg(target_os = "macos")]
 fn added_anchor(before: &[String], after: &[String]) -> String {
     after
         .iter()
@@ -302,6 +313,7 @@ fn wait_for_window_state(pid: u32, title: &str, expected: WindowState, lmux: &Ru
     );
 }
 
+#[cfg(target_os = "macos")]
 fn macos_window_state(pid: u32, title: &str) -> WindowState {
     let script = format!(
         r#"tell application "System Events"

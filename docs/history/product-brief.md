@@ -4,8 +4,6 @@ status: "complete"
 created: "2026-04-21"
 updated: "2026-04-21"
 inputs:
-  - _bmad-output/brainstorming/brainstorming-session-2026-04-20-23-28.md
-  - _bmad-output/implementation-artifacts/spec-compositor-ipc-spike.md
   - spikes/compositor-ipc/FINDINGS.md
   - spikes/libghostty-ffi/ (working FFI + GTK4 + PTY spike)
 effort_assumption: "Nights + weekends, ~10–15 h/week; all timeline estimates carry an implicit 1.5–2× contingency multiplier."

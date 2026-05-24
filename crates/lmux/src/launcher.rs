@@ -1,6 +1,7 @@
 //! GUI-program launcher (Epic 9 UX): a spotlight-style popover that scans
-//! installed GUI apps and spawns the chosen entry as a satellite via
-//! [`lmux_compositor::spawn::spawn_tagged`].
+//! installed GUI apps and launches the chosen entry externally. Launching
+//! does not establish anchor ownership; native windows must be attached
+//! explicitly through the attach flow.
 //!
 //! Platform scanners stay in `launcher/linux.rs` and `launcher/macos.rs` so
 //! Linux `.desktop` handling and macOS `.app` handling do not bleed together.
@@ -37,6 +38,7 @@ pub struct LaunchEntry {
     pub name: String,
     pub exec: String,
     pub comment: Option<String>,
+    #[allow(dead_code)]
     pub bundle_id: Option<String>,
 }
 
@@ -193,7 +195,7 @@ pub fn open(anchor: &ApplicationWindow, state: &SharedAppState) {
 /// KWin/Wayland setups lands the popup offscreen. A modal window renders
 /// reliably regardless of surface.
 #[cfg(not(target_os = "macos"))]
-pub fn open(anchor: &ApplicationWindow, state: &SharedAppState) {
+pub fn open(anchor: &ApplicationWindow, _state: &SharedAppState) {
     let opened_at = Instant::now();
     let snapshot = launcher_open_snapshot();
     let entries = std::rc::Rc::new(RefCell::new(snapshot.entries));
@@ -260,12 +262,11 @@ pub fn open(anchor: &ApplicationWindow, state: &SharedAppState) {
     let dialog_activate = dialog.clone();
     let list_activate = list.clone();
     let entries_for_commit = entries.clone();
-    let state_for_commit = state.clone();
     let commit = move || {
         if let Some(row) = list_activate.selected_row() {
             if let Some(origin) = row_origin_index(&row) {
                 if let Some(de) = entries_for_commit.borrow().get(origin) {
-                    spawn_entry(de, &state_for_commit);
+                    spawn_entry(de);
                 }
             }
         }
@@ -474,7 +475,7 @@ fn move_selection(list: &ListBox, delta: i32) {
     }
 }
 
-fn spawn_entry(de: &LaunchEntry, state: &SharedAppState) {
+fn spawn_entry(de: &LaunchEntry) {
     let argv = match parse_exec(&de.exec) {
         Some(v) if !v.is_empty() => v,
         _ => {
@@ -482,35 +483,15 @@ fn spawn_entry(de: &LaunchEntry, state: &SharedAppState) {
             return;
         }
     };
-    let anchor_at_launch = state.borrow().active_anchor();
-
-    // Pin the child onto the nested-compositor socket (ADR-0018). When
-    // the cockpit's wayland host hasn't started (e.g. CI, or bind
-    // failure) we fall back to inheriting WAYLAND_DISPLAY, which means
-    // the satellite docks to the *outer* compositor like in v0.1.
-    let nested_display = state.borrow().wayland_display_name().map(|s| s.to_string());
-
-    let spawn_res =
-        lmux_compositor::spawn::spawn_tagged_with_env(&argv, None, nested_display.as_deref());
+    let spawn_res = lmux_compositor::spawn::spawn_tagged_with_env(&argv, None, None);
     match spawn_res {
         Ok((id, pid)) => {
             tracing::info!(
                 name = %de.name,
                 request_id = %id,
                 pid,
-                nested = nested_display.is_some(),
-                "launcher: satellite spawned"
+                "launcher: external app spawned without ownership"
             );
-            // Tie the satellite's lifecycle to the currently-active anchor
-            // so it hides on anchor switch-away and returns on switch-back,
-            // mirroring terminal pane workspace membership.
-            let mut s = state.borrow_mut();
-            if let Some(anchor) = anchor_at_launch {
-                s.register_satellite_spawn(anchor, id, pid, de.bundle_id.clone());
-            } else {
-                tracing::warn!(pid, "launcher: no active anchor — satellite is unmanaged");
-            }
-            drop(s);
         }
         Err(err) => tracing::warn!(name = %de.name, error = %err, "launcher: spawn failed"),
     }

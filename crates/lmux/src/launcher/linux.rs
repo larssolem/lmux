@@ -49,7 +49,7 @@ fn scan_desktop_entries_in(dirs: &[PathBuf]) -> Vec<LaunchEntry> {
             if seen.contains_key(&id) {
                 continue;
             }
-            if let Some(de) = parse_desktop_file(&path) {
+            if let Some(de) = parse_desktop_file(&path, &id) {
                 seen.insert(id, de);
             }
         }
@@ -59,12 +59,13 @@ fn scan_desktop_entries_in(dirs: &[PathBuf]) -> Vec<LaunchEntry> {
 
 /// Minimal parser for the `[Desktop Entry]` section. Skips entries where
 /// `NoDisplay=true`, `Hidden=true`, `Type != Application`, or `Terminal=true`.
-fn parse_desktop_file(path: &Path) -> Option<LaunchEntry> {
+fn parse_desktop_file(path: &Path, desktop_id: &str) -> Option<LaunchEntry> {
     let content = fs::read_to_string(path).ok()?;
     let mut in_section = false;
     let mut name: Option<String> = None;
     let mut exec: Option<String> = None;
     let mut comment: Option<String> = None;
+    let mut startup_wm_class: Option<String> = None;
     let mut kind: Option<String> = None;
     let mut no_display = false;
     let mut hidden = false;
@@ -90,6 +91,9 @@ fn parse_desktop_file(path: &Path) -> Option<LaunchEntry> {
             "Name" if name.is_none() => name = Some(value.trim().to_string()),
             "Exec" if exec.is_none() => exec = Some(value.trim().to_string()),
             "Comment" if comment.is_none() => comment = Some(value.trim().to_string()),
+            "StartupWMClass" if startup_wm_class.is_none() => {
+                startup_wm_class = Some(value.trim().to_string())
+            }
             "Type" => kind = Some(value.trim().to_string()),
             "NoDisplay" => no_display = value.trim().eq_ignore_ascii_case("true"),
             "Hidden" => hidden = value.trim().eq_ignore_ascii_case("true"),
@@ -108,8 +112,21 @@ fn parse_desktop_file(path: &Path) -> Option<LaunchEntry> {
         name: name?,
         exec: exec?,
         comment,
-        bundle_id: None,
+        bundle_id: linux_app_identity(desktop_id, startup_wm_class.as_deref()),
     })
+}
+
+fn linux_app_identity(desktop_id: &str, startup_wm_class: Option<&str>) -> Option<String> {
+    if let Some(startup_wm_class) = startup_wm_class {
+        let trimmed = startup_wm_class.trim();
+        if !trimmed.is_empty() {
+            return Some(format!("startup-wm-class:{trimmed}"));
+        }
+    }
+    desktop_id
+        .strip_suffix(".desktop")
+        .or(Some(desktop_id))
+        .map(|id| format!("desktop-entry:{id}"))
 }
 
 #[cfg(test)]
@@ -130,7 +147,7 @@ mod tests {
         write_desktop(
             &apps,
             "chrome",
-            "[Desktop Entry]\nType=Application\nName=Chrome\nExec=google-chrome %U\n",
+            "[Desktop Entry]\nType=Application\nName=Chrome\nExec=google-chrome %U\nStartupWMClass=google-chrome\n",
         );
         write_desktop(
             &apps,
@@ -142,6 +159,16 @@ mod tests {
         let mut names: Vec<_> = entries.iter().map(|e| e.name.clone()).collect();
         names.sort();
         assert_eq!(names, vec!["Chrome".to_string(), "Firefox".to_string()]);
+        let chrome = entries.iter().find(|entry| entry.name == "Chrome").unwrap();
+        assert_eq!(
+            chrome.bundle_id.as_deref(),
+            Some("startup-wm-class:google-chrome")
+        );
+        let firefox = entries
+            .iter()
+            .find(|entry| entry.name == "Firefox")
+            .unwrap();
+        assert_eq!(firefox.bundle_id.as_deref(), Some("desktop-entry:firefox"));
     }
 
     #[test]

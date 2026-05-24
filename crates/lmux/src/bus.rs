@@ -17,7 +17,7 @@ use std::thread;
 
 use async_trait::async_trait;
 use lmux_bus::{
-    kinds::CompositorState,
+    kinds::{CompositorState, WindowCandidate},
     paths::{bus_pid_path, bus_socket_path},
     BusError, Kind, PaneSummary, Server, SessionSummary, StatusSnapshot,
 };
@@ -74,6 +74,7 @@ impl lmux_bus::Handler for LmuxBusHandler {
         match req {
             Kind::SessionList {} => self.handle_session_list().await,
             Kind::StatusGet {} => self.handle_status_get().await,
+            Kind::SatelliteListWindows {} => self.handle_satellite_list_windows().await,
             other => self.dispatch_to_gtk(other).await,
         }
     }
@@ -156,6 +157,23 @@ impl LmuxBusHandler {
             satellite_spawn_fail: self.ctx.satellite_spawn_fail.load(Ordering::Relaxed),
         }))
     }
+
+    async fn handle_satellite_list_windows(&self) -> Result<Kind, BusError> {
+        let caps = self.ctx.compositor.window_control_capabilities();
+        if !caps.list_windows {
+            return Err(BusError::Domain(
+                "satellite.list_windows: native window listing is not supported by this compositor"
+                    .into(),
+            ));
+        }
+        let windows = self
+            .ctx
+            .compositor
+            .list_windows()
+            .await
+            .map_err(|err| BusError::Domain(format!("satellite.list_windows: {err}")))?;
+        Ok(Kind::SatelliteListWindowsResult { windows })
+    }
 }
 
 /// GTK-side dispatcher: consumes [`DeferredRequest`]s off the channel
@@ -170,18 +188,21 @@ pub async fn run_dispatcher(
     rx: DeferredRequestReceiver,
     store_root: std::path::PathBuf,
     state: SharedAppState,
+    compositor: Arc<dyn CompositorControl>,
     satellite_counters: SatelliteCounters,
 ) {
     while let Ok((req, resp_tx)) = rx.recv().await {
-        let result = handle_deferred(req, &store_root, &state, &satellite_counters);
+        let result =
+            handle_deferred(req, &store_root, &state, &compositor, &satellite_counters).await;
         let _ = resp_tx.send(result);
     }
 }
 
-fn handle_deferred(
+async fn handle_deferred(
     req: Kind,
     store_root: &std::path::Path,
     state: &SharedAppState,
+    compositor: &Arc<dyn CompositorControl>,
     satellite_counters: &SatelliteCounters,
 ) -> Result<Kind, BusError> {
     match req {
@@ -343,21 +364,14 @@ fn handle_deferred(
                         .fetch_add(1, Ordering::Relaxed);
                     return Err(BusError::Domain("satellite.open: argv is empty".into()));
                 }
-                let anchor_at_launch = state.borrow().active_anchor();
-                let nested_display = state.borrow().wayland_display_name().map(str::to_string);
-                match lmux_compositor::spawn::spawn_tagged_with_env(
-                    &argv,
-                    None,
-                    nested_display.as_deref(),
-                ) {
+                match lmux_compositor::spawn::spawn_tagged_with_env(&argv, None, None) {
                     Ok((request_id, pid)) => {
                         satellite_counters.spawn_ok.fetch_add(1, Ordering::Relaxed);
-                        if let Some(anchor) = anchor_at_launch {
-                            let mut st = state.borrow_mut();
-                            st.register_satellite_spawn(anchor, request_id, pid, None);
-                        } else {
-                            tracing::warn!(pid, "satellite.open: no active anchor; unmanaged");
-                        }
+                        tracing::info!(
+                            pid,
+                            %request_id,
+                            "satellite.open: launched external app without ownership; use satellite.attach_window to manage it"
+                        );
                         Ok(Kind::Ok {
                             of: Some("satellite.open".into()),
                         })
@@ -388,58 +402,41 @@ fn handle_deferred(
                 ))
             }
         }
-        Kind::SatelliteListWindows {} => {
-            #[cfg(target_os = "macos")]
-            {
-                let windows = lmux_macos_helper::list_windows(None, None)
-                    .map_err(|err| BusError::Domain(format!("satellite.list_windows: {err}")))?
-                    .into_iter()
-                    .map(|window| lmux_bus::kinds::MacosWindowCandidate {
-                        pid: window.pid,
-                        window_id: window.window_id,
-                        window_index: window.window_index,
-                        bundle_id: window.bundle_id,
-                        title: window.title,
-                    })
-                    .collect();
-                Ok(Kind::SatelliteListWindowsResult { windows })
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                Err(BusError::Domain(
-                    "satellite.list_windows: macOS only".into(),
-                ))
-            }
-        }
         Kind::SatelliteAttachWindow {
+            backend,
+            backend_window_id,
             pid,
-            window_id,
-            window_index,
-            bundle_id,
+            app_identity,
             title,
+            workspace,
+            output,
         } => {
-            #[cfg(target_os = "macos")]
-            {
-                let mut st = state.borrow_mut();
-                st.attach_macos_window_to_active_anchor(lmux_macos_helper::WindowInfo {
-                    window_id,
-                    pid,
-                    bundle_id,
-                    window_index: window_index.unwrap_or(1),
-                    title,
-                })
+            let caps = compositor.window_control_capabilities();
+            if !caps.attach_window {
+                return Err(BusError::Domain(
+                    "satellite.attach_window: native window attachment is not supported by this compositor"
+                        .into(),
+                ));
+            }
+            let candidate = WindowCandidate {
+                backend,
+                backend_window_id,
+                pid,
+                app_identity,
+                title,
+                workspace,
+                output,
+            };
+            let window = compositor
+                .attach_window(&candidate)
+                .await
                 .map_err(|err| BusError::Domain(format!("satellite.attach_window: {err}")))?;
-                Ok(Kind::Ok {
-                    of: Some("satellite.attach_window".into()),
-                })
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = (pid, window_id, window_index, bundle_id, title);
-                Err(BusError::Domain(
-                    "satellite.attach_window: macOS only".into(),
-                ))
-            }
+            let mut st = state.borrow_mut();
+            st.attach_native_window_to_active_anchor(&candidate, window)
+                .map_err(|err| BusError::Domain(format!("satellite.attach_window: {err}")))?;
+            Ok(Kind::Ok {
+                of: Some("satellite.attach_window".into()),
+            })
         }
         other => Err(BusError::Domain(format!(
             "not_implemented: {other:?} (dispatcher)"
