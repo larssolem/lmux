@@ -2,109 +2,124 @@
 
 ## Purpose
 
-User configuration lives in `~/.config/lmux/config.toml` with a shipped default, documented schema, and hot-reload semantics. The user overrides the prefix key, chord bindings, anchor auto-detect patterns, sandbox toggle, and UI defaults without a restart; pane state, PTYs, and docked satellites survive a reload.
+User configuration lives at `$XDG_CONFIG_HOME/lmux/config.toml` with fallback
+to `$HOME/.config/lmux/config.toml`. The current implemented schema is small:
+`[general]`, `[keymap]`, `[sidebar]`, and repeated `[[autodetect]]` rules. The
+cockpit provisions a default file, watches it when present, and applies safe
+runtime settings without restarting panes.
 
 ## Requirements
 
-### Requirement: TOML schema with documented sections
+### Requirement: Implemented TOML schema
 
-The cockpit SHALL read `$XDG_CONFIG_HOME/lmux/config.toml` at startup and accept at minimum the sections `[keybindings]`, `[anchors]`, `[satellites]`, `[sandbox]`, and `[ui]`; a missing file is equivalent to the shipped default.
+The config loader SHALL accept the implemented sections `[general]`, `[keymap]`,
+`[sidebar]`, and `[[autodetect]]`.
 
-#### Scenario: Missing config is equivalent to defaults
+#### Scenario: Missing config loads defaults
 
-- **WHEN** the cockpit starts and no `config.toml` exists in `$XDG_CONFIG_HOME/lmux/`
-- **THEN** the cockpit operates with the shipped default values for every schema key and does not error out
+- **WHEN** `lmux_config::load(path)` is called and `path` does not exist
+- **THEN** it returns `Config::default()` and does not write a file
 
-#### Scenario: Unknown keys are surfaced, not fatal
+#### Scenario: First-run provisioning writes defaults
 
-- **WHEN** the config contains a key outside the documented schema
-- **THEN** the cockpit logs a warning naming the unrecognised key and proceeds using defaults for the rest of the schema
+- **WHEN** `lmux_config::load_or_provision(path)` is called and `path` does not
+  exist
+- **THEN** it creates parent directories as needed, writes a complete default
+  TOML file, and returns `ProvisionOutcome::Provisioned`
 
-### Requirement: First-run provisioning
+#### Scenario: Invalid TOML is an error
 
-On a first launch with no existing config the cockpit SHALL write a commented default `config.toml`, mark the user as onboarded via `$XDG_STATE_HOME/lmux/onboarded.v0.2`, and surface a one-time onboarding toast pointing at the path.
+- **WHEN** the config file is syntactically invalid TOML
+- **THEN** loading returns `LoadError::InvalidToml` with the path and parser
+  error
 
-#### Scenario: First launch writes a default config
+### Requirement: General settings
 
-- **WHEN** the cockpit starts with no `config.toml` and no `onboarded.v0.2` marker
-- **THEN** a commented default config is written to `~/.config/lmux/config.toml`, the marker file is created, and a sidebar toast points at the config path with an "open in editor" action
+The `[general]` section SHALL configure font family, font size, optional
+compositor script path, and pointer focus mode.
 
-#### Scenario: Subsequent launches do not re-provision
+#### Scenario: Font settings apply live
 
-- **WHEN** the cockpit starts with the `onboarded.v0.2` marker present
-- **THEN** the default config is not rewritten and no onboarding toast appears, even if the user has since deleted the config file
+- **WHEN** config is applied at startup or after a watch reload
+- **THEN** every live pane receives the configured font family and font size
 
-### Requirement: Keybinding overrides
+#### Scenario: Focus mode applies live
 
-The user SHALL be able to override the prefix key and individual chord mappings via `[keybindings]`; invalid binding strings MUST be rejected at load time with a descriptive error surfaced as a toast.
+- **WHEN** `[general].focus_mode` changes to `click` or `hover`
+- **THEN** the shared focus-mode cell used by pane controllers is updated
+  without recreating panes
 
-#### Scenario: Prefix override takes effect on load
+### Requirement: Prefix-only keymap configuration
 
-- **WHEN** `[keybindings] prefix = "ctrl+space"` is set and the cockpit (re)loads config
-- **THEN** `ctrl+space` arms the prefix dispatcher; the previous prefix binding is released
+The `[keymap]` section SHALL currently expose only the prefix key. Individual
+follower chords are not user-configurable.
 
-#### Scenario: Chord overrides are independent
+#### Scenario: Prefix override takes effect
 
-- **WHEN** individual chord overrides (for example `switcher = "prefix+s"`) are present
-- **THEN** each override takes effect on load without requiring other chords to be present in the file
+- **WHEN** `[keymap] prefix = "ctrl+shift+k"` is loaded
+- **THEN** that chord arms the prefix dispatcher and the old prefix no longer
+  does
 
-#### Scenario: Invalid binding surfaces a toast
+#### Scenario: Invalid prefix in settings dialog is rejected
 
-- **WHEN** the config contains a keybinding string that fails to parse
-- **THEN** the load aborts for that specific key, the prior value (or default) is retained, and a sidebar toast names the failing key and reason
+- **WHEN** the user tries to save an invalid prefix through the settings dialog
+- **THEN** the dialog keeps focus on the prefix entry and shows a validation
+  error
 
-### Requirement: Hot-reload preserves live state
+### Requirement: Sidebar configuration
 
-The user SHALL be able to trigger a config hot-reload from within the cockpit (default `prefix + C`, or `lmux config reload`); applying a reload MUST NOT kill pane PTYs, docked satellites, or mutate session state.
+The `[sidebar]` section SHALL configure sidebar side, expanded width, collapsed
+width, collapsed initial state, preview enablement, preview refresh interval,
+and default sort mode.
 
-#### Scenario: Reload applies without killing panes
+#### Scenario: Sidebar config affects installed sidebar
 
-- **WHEN** the user triggers a reload and the new config is valid
-- **THEN** keybindings, anchor patterns, sidebar toggle, sandbox policy, and font are re-applied live; all open PTYs and docked satellites continue running
+- **WHEN** the cockpit installs the sidebar
+- **THEN** it uses the configured side, width, collapsed rail width, collapsed
+  state, preview enablement, and preview refresh interval
 
-#### Scenario: Reload failure surfaces a toast
+#### Scenario: Sidebar may collapse and hover-expand
 
-- **WHEN** a reload attempt parses invalid TOML or fails schema validation
-- **THEN** the previous config remains in force, and a toast shows the parse error or the failing key
+- **WHEN** the user clicks the collapse button
+- **THEN** the sidebar switches between configured expanded width and collapsed
+  rail width
+- **AND** hovering the collapsed rail temporarily expands it
 
-#### Scenario: Font propagates to every pane
+### Requirement: File-watch reload
 
-- **WHEN** `[ui] font` changes across a reload
-- **THEN** every pane calls `Pane::set_font(family, size)`, re-measures cell metrics, and redraws at the new size without losing scrollback
+When a config file exists at startup, the cockpit SHALL watch its parent
+directory and apply debounced changes on the GTK main loop.
 
-### Requirement: File-watch driven reload
+#### Scenario: Directory watch survives atomic writes
 
-The cockpit SHALL watch the parent directory of `config.toml` with a `notify` recursive watcher, debounced at 150 ms, and apply any on-disk change through the same reload path as the explicit trigger.
+- **WHEN** an editor saves `config.toml` via stage-and-rename
+- **THEN** the parent-directory watcher sees the change and reloads the config
+  after the 150 ms debounce window
 
-#### Scenario: Editing the file applies a reload
+#### Scenario: Reload keeps live panes
 
-- **WHEN** the user saves an edit to `config.toml` from any editor
-- **THEN** within 150 ms of the write settling, the cockpit re-reads and re-applies the config, with the same success/failure toasts as the explicit trigger
+- **WHEN** a valid watched config change is applied
+- **THEN** live panes, PTYs, anchors, sessions, and attached windows remain
+  alive
+- **AND** runtime-applicable settings are updated in place
 
-#### Scenario: Watcher survives atomic-write editors
+#### Scenario: Reload failure logs and preserves prior state
 
-- **WHEN** an editor writes `config.toml` via stage + rename (vim, Neovim default)
-- **THEN** the watcher still fires and the reload applies; watching the parent directory (not the file directly) is what makes this work
+- **WHEN** watched reload fails due to IO or TOML parse error
+- **THEN** the cockpit logs a warning and keeps the prior in-memory config
 
-### Requirement: User-extensible anchor patterns
+### Requirement: Autodetect rule data model
 
-The `[anchors].auto_detect_patterns` array SHALL be a user-extensible list; the effective pattern set is the union of built-in and user patterns and reloads when the config reloads.
+The config SHALL parse repeated `[[autodetect]]` rules with a `name`, a
+`match` table, and `hide_on_session_close`.
 
-#### Scenario: New user pattern triggers auto-tag
+#### Scenario: Command substring match
 
-- **WHEN** the user adds `"pnpm dev"` to `auto_detect_patterns` and the config reloads
-- **THEN** subsequent panes spawning `pnpm dev` auto-tag as anchors
+- **WHEN** an autodetect rule contains
+  `match = { command_contains = ["cargo test"] }`
+- **THEN** the rule matches a command line containing `cargo test`
 
-#### Scenario: Removing a pattern does not untag existing anchors
+#### Scenario: Environment variable match
 
-- **WHEN** the user removes a pattern from `auto_detect_patterns`
-- **THEN** future panes matching that pattern are not auto-tagged; panes already tagged under the pattern remain tagged
-
-### Requirement: Keyboard-layout-respecting defaults
-
-Default keybindings SHALL respect a non-US keyboard layout (specifically Norwegian): primary bindings MUST use unshifted alphanumeric keys, not US-centric shifted symbols like `|` or `\`.
-
-#### Scenario: Defaults use unshifted keys
-
-- **WHEN** the cockpit boots with the shipped defaults
-- **THEN** the primary chord bindings use keys reachable without `Shift` on a Norwegian keyboard (letters and `+`/`-`, not US-shifted symbols)
+- **WHEN** an autodetect rule contains `match = { env_set = ["LMUX_ANCHOR"] }`
+- **THEN** the rule matches a pane environment containing `LMUX_ANCHOR`

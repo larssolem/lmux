@@ -1,45 +1,70 @@
-# ADR-0012: Session state persistence — earn it or drop
+# ADR-0012: Session persistence - earned snapshot layers
 
 - Status: Accepted
 - Date: 2026-04-21
+- Updated: 2026-05-24
 - Deciders: Lars
-- Blocks: v0.1 (layout save/restore), v0.3 (session-level persistence)
+- Blocks: startup restore, named sessions, session switcher
 
 ## Context
 
-The brainstorm included a "session state as append-only log" idea (syncable, replayable, fallback-readable) and explicitly marked it **lukewarm** with a "Phase-3 earn-it-or-drop" disposition. Persistence designs are a classic scope sink: once an append-only log exists, it attracts features (sync, replay, audit) that balloon faster than the core product.
+The original brainstorm included richer persistence ideas: append-only logs,
+sync, replay, and crash-proof incremental state. Those remain out of scope until
+real usage earns them.
 
-Meanwhile, lmux's v0.1 commitment includes "save/restore layout on quit." That is a real, small requirement — not a persistence system. The question: how much persistence does each milestone actually earn?
+The implementation now has two pragmatic snapshot layers:
+
+- a legacy startup/shutdown snapshot at `$XDG_DATA_HOME/lmux/last-session.json`;
+- named TOML sessions under `$XDG_STATE_HOME/lmux/sessions/`.
+
+The legacy JSON file keeps first-run and clean shutdown restore simple. The
+named TOML store powers `lmux-cli session ...` and the `Ctrl+B s` fuzzy
+switcher. A migration path copies a v0.1 `last-session.json` into
+`sessions/default.toml` when needed.
 
 ## Decision
 
-Persistence is shipped **only as each milestone earns it**, starting minimal and growing only when a concrete need appears.
+lmux persists only state it can restore honestly:
 
-- **v0.1:** on clean quit, write a single JSON snapshot (`serde_json`) to `$XDG_DATA_HOME/lmux/last-session.json` containing (a) pane layout, (b) each pane's working directory, (c) anchor tags. On next start, restore if the file exists. That's it.
-- **v0.2:** extend the same snapshot with multi-session (each session a separate file under `$XDG_DATA_HOME/lmux/sessions/<id>.json`). Snapshot is atomic-replace on clean quit only.
-- **v0.3:** **no change** unless a v0.2 dogfood pain point explicitly surfaces a need (e.g. "I lost 3 sessions to an OOM crash last week" → warrants incremental write; "I want to replay what Claude did yesterday" → warrants transcript, not an event log).
+- terminal pane layout;
+- pane working directories;
+- anchor pane ids and named-session anchor references;
+- session recency index.
 
-**Explicitly rejected for v0.3:**
+Live GUI satellite panes are stripped from saved terminal layout snapshots.
+Native app windows are compositor state, not process state lmux can reliably
+respawn. lmux may remember attached-window identity while the process is live,
+but a saved session is not a promise to relaunch arbitrary GUI windows later.
 
-- Append-only event log.
-- Sync / remote session mirroring.
-- Replay / time-travel UI.
-- Crash-robust incremental persistence (unless observed pain demands it).
+Named sessions use TOML under `$XDG_STATE_HOME/lmux/sessions/` with
+`sessions/index.toml` for recency. The legacy JSON snapshot remains under
+`$XDG_DATA_HOME/lmux/last-session.json` for startup/shutdown compatibility.
+
+Persistence remains snapshot-based. There is no append-only event log, no sync,
+no replay UI, and no background session daemon.
 
 ## Alternatives considered
 
-- **Append-only log from v0.1.** Rejected: speculative scope; violates Display-Don't-Duplicate's spirit (don't build infrastructure before the need). "Earn it or drop" is the explicit brainstorm verdict.
-- **No persistence at all; restore-from-shell-history.** Rejected: even MVP needs layout restore to avoid feeling hostile on day one.
-- **SQLite-backed store.** Rejected for v0.3: overkill; JSON snapshot + atomic replace handles all the v0.2 load we see.
+- **Append-only event log.** Rejected as speculative infrastructure.
+- **Only the legacy JSON file.** Rejected once named session switching shipped.
+- **SQLite store.** Still unnecessary for the current snapshot model.
+- **Full native app restore.** Rejected for current behavior because app
+  relaunch, per-window identity, unsaved documents, and OS permission prompts
+  are outside lmux's reliable control.
 
 ## Consequences
 
-- **+** Zero scope creep; every persistence feature has to earn its weight against a real pain.
-- **+** JSON snapshot is trivially debuggable and editable by the user.
-- **+** Crash-robustness can be added per-feature when observed (not theorised).
-- **−** Crash during a long session loses that session's layout. Acceptable for v0.1/v0.2 — documented behaviour.
-- **−** Users who *want* session replay will not get it. Acceptable: Display-Don't-Duplicate — transcripts live in the shell / the agent, not in lmux.
+- Users get stable terminal/session restore without a daemon.
+- Session files are easy to inspect and repair.
+- Switching named sessions tears down live terminal panes and recreates them
+  from the target snapshot.
+- GUI windows attached to an anchor are part of the live workspace experience,
+  but not guaranteed durable session contents.
+- Crash-robust incremental persistence can still be added later if dogfooding
+  shows real data loss pain.
 
 ## Follow-up
 
-- During v0.2 dogfood, log every time the author wishes persistence had been better (OOM, crash, context drop). Each occurrence is one data point toward "earning" a richer design.
+- Keep `openspec/specs/sessions/` as the current behavior contract.
+- User docs must explain the difference between terminal/session restore and
+  live native-window attachment.

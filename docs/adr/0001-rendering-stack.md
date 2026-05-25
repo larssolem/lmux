@@ -7,7 +7,7 @@
 
 ## Context
 
-lmux needs a terminal rendering stack that: (a) reproduces Ghostty's VT fidelity without writing a VT engine from scratch, (b) links statically into a single Rust binary, (c) supports GUI chrome around panes (sidebar, tabs, docked satellites), (d) drives PTYs with resize + keyboard correctly across shells.
+lmux needs a terminal rendering stack that: (a) reproduces Ghostty's VT fidelity without writing a VT engine from scratch, (b) links statically into a single Rust binary, (c) supports GUI chrome around panes, sidebar, and satellite-related controls, (d) drives PTYs with resize + keyboard correctly across shells.
 
 Ghostty's `libghostty-vt` is stable and zero-deps; the embed API is pre-1.0 but functional. cmux proves the embedding works on macOS via Apple-only parts of the API; Linux builds only expose `libghostty-vt`.
 

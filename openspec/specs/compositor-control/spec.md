@@ -2,114 +2,145 @@
 
 ## Purpose
 
-Abstraction that lets the cockpit talk to the display compositor without leaking compositor-specific types into the rest of the codebase. A `CompositorControl` trait with a `NoopCompositor` (X11 / non-KWin / CI) and a `KwinCompositor` (KWin 6.x D-Bus scripting) implementor keeps the v0.3 wlroots work honest and gives the user an honest, recoverable view of compositor integration state.
+`CompositorControl` is the boundary between the GTK cockpit and platform window
+control. It lists attachable native windows, validates explicit window attach,
+shows/hides or raises managed windows, reports health, and keeps backend-specific
+details out of `AppState`.
 
 ## Requirements
 
-### Requirement: Compositor abstraction trait
+### Requirement: Backend-neutral trait
 
-The cockpit SHALL expose a `CompositorControl` trait whose method surface is compositor-agnostic (no raw D-Bus types, no KWin enums in the trait signatures) and SHALL provide at minimum two implementors: `NoopCompositor` and `KwinCompositor`.
+The cockpit SHALL depend on a backend-neutral `CompositorControl` trait.
 
-#### Scenario: Trait compiles against both implementors
+#### Scenario: Implemented backends compile behind one trait
 
-- **WHEN** both `NoopCompositor` and `KwinCompositor` are built
-- **THEN** each implements `CompositorControl` without leaking compositor-specific types into the trait surface; callers depend only on `CompositorControl` and the supporting types `CompositorError`, `CompositorHealth`, `SpawnRequest`, `SpawnHandle`, `CompositorWindowId`, and `Rect`
+- **WHEN** Linux, macOS, X11, and test builds compile
+- **THEN** callers use `CompositorControl` plus shared types such as
+  `Health`, `CompositorError`, `WindowCandidate`, `SatelliteWindowId`,
+  `WindowGroupSwitch`, `WindowOpResult`, and `WindowControlCapabilities`
 
-#### Scenario: Cockpit chooses the implementor at runtime
+#### Scenario: Runtime backend selection
 
-- **WHEN** the cockpit starts on a Plasma 6 Wayland session with a discoverable `lmux-dock.js`
-- **THEN** it instantiates `KwinCompositor`; on any other environment it falls back to `NoopCompositor`, with the decision logged at INFO
+- **WHEN** the cockpit starts on Linux X11
+- **THEN** it uses `X11Compositor`
+- **WHEN** it starts on Linux KDE/Wayland with a discoverable KWin script
+- **THEN** it uses `KwinCompositor`
+- **WHEN** no supported native window backend is available
+- **THEN** it uses `NoopCompositor`
 
-### Requirement: NoopCompositor degrades gracefully
+### Requirement: Window control capability flags
 
-`NoopCompositor` SHALL satisfy `ensure_script_loaded` trivially, report `Offline` with an explanatory reason from `health`, accept `spawn_satellite` as a floating-only spawn, and return `Unsupported` for geometry and docking operations — without ever crashing or erroring the caller.
+Each backend SHALL report whether it can list windows, attach windows, set
+visibility, and raise windows.
 
-#### Scenario: Health reports offline with reason
+#### Scenario: Sidebar attach button follows capabilities
 
-- **WHEN** `NoopCompositor::health()` is called
-- **THEN** it returns `Offline { reason: <non-empty string describing why> }`
+- **WHEN** `window_control_capabilities().attach_window` is false
+- **THEN** the sidebar attach button is disabled with explanatory tooltip text
 
-#### Scenario: Floating-only satellite spawn still works
+#### Scenario: Native listing follows capabilities
 
-- **WHEN** `NoopCompositor::spawn_satellite(argv, cwd)` is called
-- **THEN** it returns `Ok(SpawnHandle)` for a floating satellite; the child runs without docking; `set_geometry`, `detach`, and `attach` subsequently return `Unsupported`
+- **WHEN** `satellite.list_windows` is requested and the backend cannot list
+  windows
+- **THEN** the bus returns a clear domain error
 
-#### Scenario: Script-loaded and reinject are no-ops
+### Requirement: Explicit native window attach
 
-- **WHEN** `ensure_script_loaded` or any re-inject operation is invoked on `NoopCompositor`
-- **THEN** the call returns `Ok(())` without side effects; no error is raised
+Backends that support native attach SHALL validate a `WindowCandidate` and
+return a stable `SatelliteWindowId` for the exact window.
 
-### Requirement: KWin script install and idempotent reconfigure
+#### Scenario: KWin attach validates current inventory
 
-`KwinCompositor` SHALL ensure `lmux-dock.js` is installed into a known KWin scripts path and registered via KWin's scripting D-Bus surface; repeated calls MUST be idempotent.
+- **WHEN** a KWin window candidate is attached
+- **THEN** the backend verifies that the backend window id is still present in
+  the current inventory before returning a managed identity
 
-#### Scenario: First-time install and register
+#### Scenario: macOS attach uses per-window identity
 
-- **WHEN** `KwinCompositor::ensure_script_loaded` is called and no prior registration exists
-- **THEN** the script is installed into a discoverable location (env `LMUX_KWIN_SCRIPT`, `$XDG_DATA_HOME/lmux/kwin/`, `/usr/share/lmux/kwin/`, or dev-layout fallback), loaded via `org.kde.kwin.Scripting.loadScript`, and run
+- **WHEN** a macOS window is attached
+- **THEN** the managed identity preserves stable CoreGraphics window id when
+  available, otherwise the helper-provided window index fallback is retained
 
-#### Scenario: Repeat call is a no-op
+#### Scenario: X11 attach validates window id
 
-- **WHEN** `ensure_script_loaded` is called and the script is already registered and running
-- **THEN** no duplicate load occurs; the call returns `Ok(())`
+- **WHEN** an X11 candidate is attached
+- **THEN** the backend verifies the X11 window id before returning a managed
+  identity
 
-### Requirement: Live health probe over D-Bus
+### Requirement: Anchor switch window group operation
 
-`KwinCompositor::health()` SHALL query KWin's scripting service over D-Bus in real time and map the result to `Online`, `ScriptMissing`, or `Offline { reason }`.
+The compositor bridge SHALL apply anchor-driven native window switching off the
+GTK main thread.
 
-#### Scenario: Online when script is loaded and running
+#### Scenario: AppState emits group switch
 
-- **WHEN** KWin reports that `lmux-dock` is loaded
-- **THEN** `health()` returns `Online`
+- **WHEN** the active anchor changes or a native window is attached
+- **THEN** `AppState` computes the windows to hide and show from
+  `satellite_windows_by_anchor`
+- **AND** queues one `ApplyWindowGroupSwitch` command with a monotonically
+  increasing sequence number
 
-#### Scenario: ScriptMissing when KWin is reachable but script is absent
+#### Scenario: Bridge coalesces stale switches
 
-- **WHEN** KWin's scripting service is reachable but reports `lmux-dock` is not loaded
-- **THEN** `health()` returns `ScriptMissing`
+- **WHEN** multiple anchor switches are queued quickly
+- **THEN** the bridge drops older queued group-switch commands and applies the
+  latest sequence
 
-#### Scenario: Offline when D-Bus is unreachable
+#### Scenario: Backend reports per-window results
 
-- **WHEN** `DBUS_SESSION_BUS_ADDRESS` is unset or the scripting service cannot be reached
-- **THEN** `health()` returns `Offline { reason: <specific cause> }`
+- **WHEN** a group switch is applied
+- **THEN** the backend returns one `WindowOpResult` per attempted window
+- **AND** failures are logged without blocking the cockpit UI
 
-### Requirement: Compositor status published on the bus
+### Requirement: User placement is preserved
 
-The cockpit SHALL publish a `compositor.status` event on the bus whenever the compositor health transitions between `Online`, `ScriptMissing`, and `Offline`.
+lmux SHALL NOT manage monitor topology or move windows between displays as part
+of anchor switching. The user and compositor own physical placement.
 
-#### Scenario: Offline transition surfaces within 500 ms
+#### Scenario: Anchor switch does not set display geometry
 
-- **WHEN** the compositor transitions to `Offline` (e.g., KWin reload, script eviction)
-- **THEN** a `compositor.status { state: "offline", reason: "..." }` event is published on the bus and the sidebar banner appears within 500 ms
+- **WHEN** the user switches anchors
+- **THEN** lmux shows/raises the incoming anchor's tracked windows and hides or
+  minimizes outgoing tracked windows according to backend ability
+- **AND** lmux does not choose a monitor, rewrite window coordinates, or
+  re-home windows on hotplug
 
-#### Scenario: Online transition clears the banner
+### Requirement: KWin backend
 
-- **WHEN** the compositor transitions back to `Online`
-- **THEN** a `compositor.status { state: "online" }` event is published and the offline banner is cleared
+The KWin backend SHALL use KWin scripting for window inventory, previews,
+visibility, and raising.
 
-### Requirement: Re-inject from sidebar and CLI
+#### Scenario: KWin visibility targets exact backend id
 
-The user SHALL be able to trigger a KWin script re-inject from the sidebar banner action and from the `lmux compositor reinject` CLI; the operation MUST be a single call to `ensure_script_loaded` over D-Bus.
+- **WHEN** `set_window_visible` is called with a KWin `SatelliteWindowId`
+- **THEN** the backend validates the backend window id and runs a one-shot KWin
+  script matching that exact id
 
-#### Scenario: Sidebar re-inject path
+#### Scenario: KWin raise activates exact backend id
 
-- **WHEN** the user clicks the sidebar's "Re-inject" action while the compositor is offline
-- **THEN** the cockpit calls `ensure_script_loaded`; on success, `health()` returns `Online` within 500 ms
+- **WHEN** `raise_window` is called for a KWin window
+- **THEN** the backend unminimizes and activates the matching KWin window
 
-#### Scenario: CLI re-inject path
+### Requirement: macOS backend
 
-- **WHEN** the user runs `lmux compositor reinject` against a running cockpit
-- **THEN** the cockpit performs the same operation and returns the resulting health state; a failure surfaces as a toast naming the underlying `CompositorError` variant
+The macOS backend SHALL use `lmux-macos-helper` for listing and per-window
+visibility group operations when helper support is available.
 
-### Requirement: Wayland-only; X11 degrades without error
+#### Scenario: Group switch is batched
 
-The cockpit SHALL run its terminal and PTY surfaces on X11 sessions but MUST disable satellite docking with a single clear banner; `lmux open` on X11 still spawns the requested app as a floating window.
+- **WHEN** `apply_window_group_switch_latest` is called on macOS
+- **THEN** the backend sends one helper request containing hide and show lists
+- **AND** skips the helper call if the operation is already stale
 
-#### Scenario: X11 session shows one-time banner
+### Requirement: Noop backend degrades gracefully
 
-- **WHEN** the cockpit starts inside an X11 session
-- **THEN** a one-time sidebar banner explains that satellite docking is disabled; terminal and PTY features continue to work
+`NoopCompositor` SHALL keep the terminal cockpit usable when native window
+control is unavailable.
 
-#### Scenario: `lmux open` on X11 returns a floating satellite
+#### Scenario: Unsupported operations do not crash cockpit
 
-- **WHEN** the user runs `lmux open <app>` inside an X11 session
-- **THEN** the cockpit spawns the app as a floating window without attempting KWin correlation and without returning an error
+- **WHEN** a native-window operation is unsupported
+- **THEN** callers receive an `Unsupported`/domain error or a harmless no-op
+  depending on the trait default
+- **AND** terminal panes continue running

@@ -100,12 +100,23 @@ cargo test --workspace
 
 ## Manual smoke tests
 
-Until the full E2E harness lands (see `docs/history/e2e-test-strategy.md`), these manual checks verify the v0.1 story acceptance criteria:
+Until the full E2E harness lands (see `docs/history/e2e-test-strategy.md`),
+these checks cover the current local build at a high level:
 
-- **Story 1.4** — launch lmux; shell prompt renders; typing produces output; resize window; cols/rows track the window
-- **Story 7.3 (PDEATHSIG)** — `kill -9 $(pgrep -x lmux)` from another terminal; `pgrep -P 1 -a | grep $SHELL` should be empty within 1 s
+- **Terminal cockpit** — launch lmux; the first terminal renders a shell prompt;
+  typing produces output; resizing the window updates the terminal grid.
+- **Pane lifecycle** — split right and down; close a non-last pane; verify the
+  last pane is not closed by the close-pane command.
+- **Workspace anchor** — start with one auto-created anchor; create/cycle anchors
+  with `Ctrl+B a`; verify the sidebar follows the active workspace.
+- **Native attach on supported desktops** — open a normal app window; attach it
+  from the sidebar picker; switch anchors and verify the attached window follows
+  the active anchor by visibility/fronting, without lmux moving it between
+  monitors.
+- **Process cleanup** — `kill -9 $(pgrep -x lmux)` from another terminal;
+  `pgrep -P 1 -a | grep $SHELL` should be empty within 1 s.
 
-### Bell → toast latency (Story 6.3, NFR3)
+### Bell to toast latency
 
 Verifies p50 ≤ 250 ms and p95 ≤ 500 ms from BEL byte arrival to freedesktop notification delivery.
 

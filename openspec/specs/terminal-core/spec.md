@@ -2,102 +2,162 @@
 
 ## Purpose
 
-Foundational terminal multiplexer capability inherited from lmux v0.1: pane tree, PTY lifecycle, libghostty rendering, tmux-style prefix dispatcher, clean shutdown contract. Every other capability builds on this.
+The terminal cockpit is the stable core of lmux: one GTK window, a recursive
+split tree of PTY-backed terminal panes, libghostty-vt rendering, a tmux-style
+prefix dispatcher, scrollback, copy/paste shortcuts, and coordinated shutdown.
+The first terminal in a fresh cockpit is auto-tagged as the initial workspace
+anchor so anchor-gated UI and attach flows always have a target.
 
 ## Requirements
 
 ### Requirement: Pane tree with recursive splits
 
-The cockpit SHALL render a recursive horizontal/vertical split layout of terminal panes inside a single top-level window, with exactly one pane holding keyboard focus at any time.
+The cockpit SHALL render a recursive horizontal/vertical split layout of
+terminal panes inside one top-level GTK window.
 
-#### Scenario: Split a pane horizontally
+#### Scenario: Split a pane right
 
-- **WHEN** the focused pane receives a `split-horizontal` action
-- **THEN** the pane is replaced with a horizontal split whose left child is the previous pane and right child is a fresh pane running the user's login shell in `$HOME`
-- **AND** focus moves to the new (right) pane
+- **WHEN** the focused pane receives the split-right action (`prefix + +`,
+  `prefix + |`, `prefix + \`, or the terminal context action)
+- **THEN** the focused leaf is replaced by a vertical split whose left child is
+  the previous pane and whose right child is a fresh pane
+- **AND** the fresh pane starts in the source pane's current working directory
+- **AND** focus remains on the source pane
 
-#### Scenario: Split a pane vertically
+#### Scenario: Split a pane down
 
-- **WHEN** the focused pane receives a `split-vertical` action
-- **THEN** the pane is replaced with a vertical split (top = previous, bottom = new) and focus moves to the new pane
+- **WHEN** the focused pane receives the split-down action (`prefix + -` or the
+  terminal context action)
+- **THEN** the focused leaf is replaced by a horizontal split whose top child is
+  the previous pane and whose bottom child is a fresh pane
+- **AND** the fresh pane starts in the source pane's current working directory
+- **AND** focus remains on the source pane
 
-#### Scenario: Close the focused pane
+#### Scenario: Close a non-last pane
 
-- **WHEN** the user closes the focused pane with an already-exited shell
-- **THEN** the pane is removed from the tree, its sibling collapses into the parent slot, and focus moves to the geometrically nearest remaining pane
-- **AND** if the last pane is closed, the cockpit begins its shutdown sequence
+- **WHEN** the user closes a focused pane and at least one other leaf remains
+- **THEN** the pane is removed from the layout, its sibling collapses into the
+  parent slot, the pane process is terminated, and focus moves to a surviving
+  leaf
 
-### Requirement: PTY lifecycle and signal contract
+#### Scenario: Close the last pane is ignored
 
-The cockpit SHALL own each pane's pseudoterminal and process-group lifecycle, and MUST reap every spawned child during shutdown within a bounded time budget.
+- **WHEN** the focused pane is the only leaf and receives close-pane
+- **THEN** the cockpit leaves the pane alive and logs that the last pane close
+  was ignored
+- **AND** the user must quit through the quit action or window close path
 
-#### Scenario: Shutdown reaps every child within 700 ms
+### Requirement: PTY lifecycle and shutdown
 
-- **WHEN** the user closes the top-level window or the last pane exits
-- **THEN** the cockpit sends `SIGTERM` to every pane's process group, waits up to 500 ms for graceful exit, then sends `SIGKILL`, and reaps all children within 700 ms of the shutdown trigger
+The cockpit SHALL own each pane's PTY and child process lifecycle.
 
-#### Scenario: PTY resize propagates to the child
+#### Scenario: Pane process is terminated on close
 
-- **WHEN** a pane's widget is resized so its cell grid changes from (cols, rows) to (cols', rows')
-- **THEN** the cockpit issues `TIOCSWINSZ` on the PTY master with the new dimensions before the next input is written to the child
+- **WHEN** a non-last pane is closed
+- **THEN** the cockpit sends cooperative termination to the pane child and
+  schedules a force-kill fallback
 
-#### Scenario: Child exit becomes a pane state transition
+#### Scenario: Cockpit shutdown drains every pane
 
-- **WHEN** a pane's child process exits (by any signal or normal exit)
-- **THEN** the cockpit detects the exit via `waitpid` and marks the pane as exited without blocking the GTK main loop
+- **WHEN** the user quits lmux or the top-level window closes
+- **THEN** the cockpit marks itself shutting down, saves the current snapshot,
+  terminates every live pane, clears anchor/workspace state, and exits the GTK
+  application
 
-### Requirement: libghostty terminal rendering
+#### Scenario: PTY resize propagates to child
 
-The cockpit SHALL render terminal cells through libghostty (dynamically linked) and MUST preserve per-keystroke input latency equivalent to the v0.1 baseline.
+- **WHEN** a pane widget changes size so its terminal grid changes
+- **THEN** the PTY window size is updated before subsequent input is written to
+  the child process
 
-#### Scenario: Keystroke reaches the PTY within one frame
+### Requirement: libghostty-vt static rendering stack
 
-- **WHEN** the user presses a printable key in a focused pane under normal load
-- **THEN** the keycode is written to the PTY master within one frame (≤16 ms) of the GTK key event
+The cockpit SHALL render terminal cells through the vendored libghostty-vt
+library, built by Zig and statically linked as `ghostty-vt-static`.
 
-#### Scenario: libghostty is dynamically linked
+#### Scenario: Build links the static Ghostty VT library
 
-- **WHEN** `ldd` is run against the built `lmux` binary
-- **THEN** `libghostty` appears as a dynamic dependency (not statically embedded)
+- **WHEN** `crates/lmux-libghostty/build.rs` runs
+- **THEN** it runs `zig build --release=fast` under `vendor-ghostty`
+- **AND** it emits `cargo:rustc-link-lib=static=ghostty-vt-static`
+- **AND** bindgen generates bindings from `ghostty/vt.h` with
+  `-DGHOSTTY_STATIC`
 
-### Requirement: Tmux-style prefix key dispatcher
+### Requirement: Prefix dispatcher
 
-The cockpit SHALL provide a two-stroke prefix dispatcher (default `Ctrl+B` + key) that intercepts keybindings on a GTK Capture-phase controller before the focused pane receives the keys.
+The cockpit SHALL provide a configurable two-stroke prefix dispatcher. Only the
+prefix key itself is user-configurable today; the follower command table is
+compiled in.
 
-#### Scenario: Prefix arms, follower is consumed by the cockpit
+#### Scenario: Prefix arms and consumes follower
 
-- **WHEN** the user presses the configured prefix key
-- **THEN** the dispatcher enters an armed state; the next non-modifier keystroke is captured by the cockpit instead of being forwarded to the PTY
-- **AND** the armed state clears after the follower key or after a 1 s timeout
+- **WHEN** the configured prefix key is pressed while a terminal pane has focus
+- **THEN** the dispatcher enters an armed state, the window title and command
+  hint reflect that state, and the next non-modifier key is consumed by the
+  cockpit
+- **AND** the armed state clears after the follower key or after one second
 
-#### Scenario: A bare prefix key still reaches the terminal when escaped
+#### Scenario: Satellite focus bypasses cockpit shortcuts
 
-- **WHEN** the user presses the prefix key twice in quick succession
-- **THEN** the second keystroke is forwarded to the focused pane as a literal prefix character
+- **WHEN** the focused pane is a Wayland/native satellite
+- **THEN** the cockpit lets key events pass through and disarms any pending
+  prefix state
 
-### Requirement: Non-blocking UI event loop
+#### Scenario: Built-in prefix commands
 
-The cockpit SHALL keep the GTK main loop responsive under PTY I/O and disk I/O load; long-running work MUST run on Tokio tasks and hand results back to the UI via `glib::MainContext::spawn_local`.
+- **WHEN** the dispatcher is armed
+- **THEN** `+`, `|`, and `\` split right, `-` splits down, `x` closes the
+  focused pane, `a` cycles/creates the active workspace anchor, `s` opens the
+  session switcher, `m` toggles rearrange mode, `q` quits, `o`/`n`/`]` cycle
+  focus forward, and `p`/`[` cycle focus backward
 
-#### Scenario: A blocking write does not stall input
+### Requirement: Terminal input and scrollback shortcuts
 
-- **WHEN** a PTY child writes a large burst faster than the rendering pipeline consumes it
-- **THEN** the UI continues accepting keyboard and mouse events and redraws within its normal frame budget; backpressure is applied at the read side of the PTY, not the UI
+Terminal panes SHALL translate keyboard input to PTY bytes and reserve
+application-level scroll/copy/paste shortcuts.
 
-### Requirement: Bell-to-toast regression guard
+#### Scenario: Page keys scroll the focused pane
 
-The cockpit SHALL convert a terminal bell (`BEL`, 0x07) in any pane to a non-focus-stealing sidebar toast within one frame of arrival.
+- **WHEN** the user presses `PageUp` or `PageDown`
+- **THEN** the focused pane scrolls by one page
+- **AND** `Shift+PageUp` / `Shift+PageDown` scroll by one row
 
-#### Scenario: Bell in a non-focused pane surfaces as a toast
+#### Scenario: Clipboard shortcuts are platform-aware
 
-- **WHEN** a non-focused pane's PTY emits `\a`
-- **THEN** a toast appears in the sidebar toast strip tagged with the pane id, and no focus change occurs
+- **WHEN** the user presses `Ctrl+Shift+C` or `Ctrl+Shift+V`
+- **THEN** the focused terminal pane copies or pastes
+- **AND** on macOS, `Command+C` and `Command+V` do the same
 
-### Requirement: Cargo workspace shape preserved
+#### Scenario: Clipboard image paste injects a file path
 
-The project SHALL retain the v0.1 Cargo workspace structure; new capabilities are added as new crates under `crates/` without restructuring the existing ones.
+- **WHEN** terminal paste is invoked and the clipboard advertises an `image/*`
+  MIME type
+- **THEN** lmux reads the clipboard image as a texture, writes it as a PNG under
+  `$XDG_RUNTIME_DIR/lmux/pastes/` or `/tmp/lmux-pastes-<uid>/`
+- **AND** it injects the absolute file path into the PTY via bracketed paste
+- **AND** it does not inject raw image bytes or inline terminal graphics
 
-#### Scenario: Workspace membership enumerable
+#### Scenario: Clipboard text paste remains the fallback
 
-- **WHEN** `cargo metadata --format-version=1 | jq '.workspace_members | length'` runs
-- **THEN** it reports the current workspace member count; removal of any pre-existing v0.1 crate constitutes a breaking change
+- **WHEN** terminal paste is invoked and no clipboard image can be read
+- **THEN** lmux reads clipboard text and injects it through the normal
+  bracketed-paste path
+
+### Requirement: Bell notification
+
+The cockpit SHALL convert terminal bell bytes into local desktop
+notifications without blocking the GTK main loop.
+
+#### Scenario: Bell replaces prior notification for same pane
+
+- **WHEN** a pane emits BEL
+- **THEN** the notifier sends a freedesktop notification labelled with the pane
+  or anchor label
+- **AND** later bells from the same pane reuse the previous notification id
+  instead of stacking unlimited notifications
+
+#### Scenario: Notification click raises lmux
+
+- **WHEN** the notification daemon reports the default action for a notification
+  created by lmux
+- **THEN** the cockpit presents the lmux window

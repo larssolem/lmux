@@ -16,7 +16,8 @@ So the cockpit has to bridge: detect that the clipboard holds an image, material
 
 ## Decision
 
-When the user invokes paste (`Ctrl+B ]` or platform paste shortcut), `request_paste_from_clipboard` runs the following decision:
+When the user invokes terminal paste (`Ctrl+Shift+V` on Linux or `Command+V` on
+macOS), `request_paste_from_clipboard` runs the following decision:
 
 1. Probe `gdk::Clipboard::formats().mime_types()`.
 2. **If any MIME starts with `image/`**, read the clipboard as a `gdk::Texture`, save it as PNG to an ephemeral file, and inject the **absolute path** into the PTY via bracketed paste (`\x1b[200~<path>\x1b[201~`).
@@ -63,4 +64,4 @@ Fallback when `XDG_RUNTIME_DIR` is unset: `/tmp/lmux-pastes-<uid>/paste-...png` 
 - Configurable max image size; reject pastes above the limit with a status-bar message instead of writing a 50 MB PNG.
 - Configurable paste dir (some users will want pastes outside tmpfs so they survive a logout).
 - Consider whether to inject `file://<path>` instead of bare path for environments that prefer URIs.
-- If the v0.2 status bar lands first, surface "📎 image pasted (<filename>)" briefly so the user knows what got injected.
+- If the v0.2 status bar lands first, surface "image pasted (<filename>)" briefly so the user knows what got injected.

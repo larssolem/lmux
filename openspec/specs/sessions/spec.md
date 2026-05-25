@@ -2,131 +2,149 @@
 
 ## Purpose
 
-Named, persistent sessions as first-class domain objects: each session owns a pane tree, per-pane cwds, anchor metadata, and a last-opened timestamp. Sessions are created, renamed, deleted, listed, and restored atomically from disk. The fuzzy switcher gives keyboard-only navigation between sessions and recently-closed panes.
+lmux has two session persistence layers today:
+
+- a legacy JSON snapshot at `$XDG_DATA_HOME/lmux/last-session.json` used for
+  startup restore and shutdown save;
+- named TOML sessions under `$XDG_STATE_HOME/lmux/sessions/`, used by
+  `lmux-cli session ...` and the fuzzy switcher.
+
+Snapshots persist terminal pane layout, cwd map, and anchor pane ids. Live GUI
+satellite panes are stripped from snapshots because they cannot be respawned
+cleanly.
 
 ## Requirements
 
-### Requirement: Session domain model
+### Requirement: Legacy startup/shutdown snapshot
 
-The cockpit SHALL represent each session as a serializable value containing at minimum a name, creation and last-opened timestamps, a pane tree (with splits, focus, per-pane cwd), and anchor references.
+The cockpit SHALL restore and save the legacy JSON snapshot around process
+startup/shutdown.
 
-#### Scenario: Session value round-trips through serde
+#### Scenario: Missing legacy snapshot starts fresh
 
-- **WHEN** a `Session` value is serialized to TOML and deserialized back
-- **THEN** the resulting value is structurally equal to the original, including pane tree shape, focus index, cwds, and anchor references
+- **WHEN** `last-session.json` is absent
+- **THEN** lmux starts a fresh terminal session
 
-#### Scenario: Session index tracks recency
+#### Scenario: Corrupt legacy snapshot is moved aside
 
-- **WHEN** `SessionIndex` is queried
-- **THEN** it returns session entries sorted by `last_opened_at` descending, making the most-recently-used session the first candidate for the fuzzy switcher
+- **WHEN** `last-session.json` is malformed or has an unsupported schema version
+- **THEN** it is renamed to `.bad.<unix-seconds>` when possible
+- **AND** lmux starts fresh
 
-### Requirement: Session CRUD from UI and CLI
-
-The cockpit SHALL let the user create, rename, and delete sessions both from the in-process UI and from the `lmux session` CLI subcommand routed over the bus.
-
-#### Scenario: Create a new named session
-
-- **WHEN** the user runs `lmux session new client-acme` against a running cockpit
-- **THEN** a new session named `client-acme` is created in the store, added to `SessionIndex`, and becomes available to the fuzzy switcher on next open
-
-#### Scenario: Rename an existing session
-
-- **WHEN** the user runs `lmux session rename client-acme acme` (or renames via the sidebar)
-- **THEN** both the session's TOML file and its `SessionIndex` entry are renamed atomically; existing references to the old name fail with a clear "not found" error
-
-#### Scenario: Delete a session
-
-- **WHEN** the user runs `lmux session delete acme` (or triggers delete from the sidebar)
-- **THEN** the TOML file and the `SessionIndex` entry are removed atomically; if the deleted session was currently active, the cockpit falls back to an empty unnamed session
-
-#### Scenario: List all sessions
-
-- **WHEN** the user runs `lmux session list` (with or without `--json`)
-- **THEN** the CLI prints every known session in recency order, with name, last-opened timestamp, and active-session marker; `--json` emits machine-readable fields suitable for shell scripting
-
-### Requirement: Atomic TOML persistence
-
-The cockpit SHALL persist every session state change atomically under `$XDG_STATE_HOME/lmux/sessions/` using stage → `fsync` → rename, with file mode `0600`.
-
-#### Scenario: Atomic write survives power loss mid-operation
-
-- **WHEN** the cockpit saves a session and a simulated crash occurs between stage and rename
-- **THEN** the previously committed file remains intact and readable; on next launch the cockpit opens the last good version
-
-#### Scenario: Session files are user-private
-
-- **WHEN** a session file is created under `$XDG_STATE_HOME/lmux/sessions/<name>.toml`
-- **THEN** its mode is `0600` and its index entry in `sessions/index.toml` is updated in the same atomic manner
-
-#### Scenario: Corruption never blocks cockpit startup
-
-- **WHEN** the cockpit starts and finds a malformed session TOML file
-- **THEN** it logs a warning and opens that session as empty (same name, empty pane tree); cockpit startup proceeds normally
-
-### Requirement: Restore active session on launch
-
-The cockpit SHALL restore the active session on launch by default, honoring the v0.1 `last-session.json` contract, with explicit `--session <name>` and "no session" overrides.
-
-#### Scenario: Default launch restores last-active session
-
-- **WHEN** the user runs `lmux` without arguments
-- **THEN** the cockpit reads `last-session.json`; if it names a session, that session's pane tree and cwds are restored within 2 s of launch for sessions of up to 20 panes
-
-#### Scenario: Explicit session selection
-
-- **WHEN** the user runs `lmux --session client-acme`
-- **THEN** the cockpit opens `client-acme` regardless of what `last-session.json` points at
-
-#### Scenario: Missing last-session yields empty session
-
-- **WHEN** the cockpit launches and no `last-session.json` exists
-- **THEN** it opens an empty, unnamed session without erroring
-
-#### Scenario: Graceful shutdown persists active session
+#### Scenario: Shutdown writes current snapshot
 
 - **WHEN** the cockpit shuts down cleanly
-- **THEN** the active session's pane tree is written to its session TOML and `last-session.json` is rewritten to point at it
+- **THEN** it writes the current terminal layout, cwd map, and anchor pane ids
+  to the legacy JSON path through the atomic write helper
 
-### Requirement: Migration from v0.1 last-session.json
+### Requirement: Snapshot shape
 
-The cockpit SHALL migrate an existing v0.1 `last-session.json` (pane tree without session name) to a named session on first v0.2 launch, idempotently.
+The JSON snapshot SHALL use schema version `1`, a recursive layout tree, a cwd
+map, and legacy plus multi-anchor fields.
 
-#### Scenario: v0.1 state becomes `default` session
+#### Scenario: Multi-anchor preferred over legacy singleton
 
-- **WHEN** a v0.1 user first runs v0.2 with a `last-session.json` containing an unnamed pane tree
-- **THEN** the cockpit writes `sessions/default.toml`, rewrites `last-session.json` to reference `"default"`, and logs the migration at INFO level
+- **WHEN** `anchor_pane_ids` is non-empty
+- **THEN** readers use that list as the canonical anchor list
+- **AND** otherwise fall back to `anchor_pane_id`
 
-#### Scenario: Re-running migration is a no-op
+#### Scenario: Satellite panes are stripped before save
 
-- **WHEN** the cockpit starts and `sessions/default.toml` already exists
-- **THEN** no migration is performed and existing state is preserved
+- **WHEN** `AppState::snapshot()` serializes the layout
+- **THEN** live satellite pane leaves are removed from the layout before writing
+  the snapshot
 
-### Requirement: Fuzzy switcher opens within 50 ms
+### Requirement: Named TOML session store
 
-The cockpit SHALL provide a keyboard-only fuzzy switcher overlay, bound by default to `prefix + s`, that lists every session plus recently-closed panes and opens within 50 ms of the keybinding.
+Named sessions SHALL be persisted under `$XDG_STATE_HOME/lmux/sessions/` or the
+HOME fallback.
 
-#### Scenario: Switcher opens on prefix chord
+#### Scenario: Create named session
+
+- **WHEN** `SessionStore::create(name, now)` succeeds
+- **THEN** it writes `sessions/<name>.toml` and updates `sessions/index.toml`
+
+#### Scenario: Rename named session
+
+- **WHEN** `SessionStore::rename(from, to)` succeeds
+- **THEN** it writes the renamed session file, removes the old file, and updates
+  the index entry
+
+#### Scenario: Delete named session
+
+- **WHEN** `SessionStore::delete(name)` is called
+- **THEN** the session file is removed if present and the index entry is removed
+
+#### Scenario: List sessions by recency
+
+- **WHEN** `SessionStore::list()` is called
+- **THEN** it returns index entries sorted by last-opened time descending
+
+### Requirement: Session name validation
+
+Named sessions SHALL reject unsafe names.
+
+#### Scenario: Valid names
+
+- **WHEN** a name is non-empty, at most 64 chars, does not start with `.`, and
+  contains only ASCII alphanumeric characters plus `.`, `_`, and `-`
+- **THEN** it is accepted
+
+#### Scenario: Invalid names fail before IO
+
+- **WHEN** a name violates the validation rules
+- **THEN** create, rename, delete, or load returns `InvalidName`
+
+### Requirement: Named session switching
+
+The fuzzy switcher and `lmux-cli session open` SHALL swap live terminal panes to
+the target named session.
+
+#### Scenario: Switching saves known outgoing session
+
+- **WHEN** `AppState::switch_session(target)` runs and `current_session` is set
+- **THEN** lmux snapshots the outgoing tree and saves it to the named TOML
+  session before loading the target
+
+#### Scenario: Switching tears down live panes
+
+- **WHEN** a session switch proceeds
+- **THEN** live panes are drained and terminated, in-memory pane/anchor/workspace
+  maps are reset, and new panes are spawned from the target session or a fresh
+  fallback
+
+#### Scenario: Target without snapshot falls back fresh
+
+- **WHEN** the target named session does not load into panes
+- **THEN** lmux creates a fresh single-pane session at HOME
+
+### Requirement: Fuzzy switcher
+
+The cockpit SHALL provide a modal fuzzy switcher for named sessions.
+
+#### Scenario: Prefix opens switcher
 
 - **WHEN** the user presses `prefix + s`
-- **THEN** a modal overlay appears centered in the cockpit window within 50 ms
-- **AND** focus is captured by the overlay input; keystrokes do not reach the underlying pane until the overlay closes
+- **THEN** a modal "Switch session" window opens, lists known sessions from the
+  named store, and focuses the filter entry
 
-#### Scenario: Filter latency stays under 16 ms
+#### Scenario: Enter switches selected session
 
-- **WHEN** the user types a character in the switcher with up to 50 sessions and 200 recent-pane entries loaded
-- **THEN** the filtered list updates within 16 ms of the keystroke, ranked by substring match combined with recency
+- **WHEN** the user activates a selected session row
+- **THEN** lmux calls `AppState::switch_session` with that session name
 
-#### Scenario: Keyboard navigation and dismissal
+#### Scenario: Empty state points to CLI
 
-- **WHEN** the switcher is open
-- **THEN** `Enter` opens the top-ranked entry, arrow keys and `Tab` navigate between entries, and `Esc` closes the switcher without any session change
+- **WHEN** no named sessions exist
+- **THEN** the switcher shows an empty-state message mentioning
+  `lmux-cli session new <name>`
 
-### Requirement: Switcher swap saves outgoing state
+### Requirement: Session CLI
 
-The cockpit SHALL save the outgoing session's state before swapping to the target session selected in the switcher; no pane state is lost in the transition.
+The implemented CLI SHALL expose named session CRUD through `lmux-cli session`.
 
-#### Scenario: Session swap preserves outgoing state
+#### Scenario: CLI commands route over bus
 
-- **WHEN** the user selects session `B` while session `A` is active with modified state
-- **THEN** the cockpit saves `A`'s snapshot via the atomic store, tears down `A`'s live panes, and rehydrates `B` from its on-disk snapshot (or a fresh `$HOME` shell if `B` has no snapshot yet)
-- **AND** the sidebar highlight, active-session marker, and tab-edge glow update to reflect `B`
+- **WHEN** the user runs `lmux-cli session list|new|rename|delete|open`
+- **THEN** the CLI connects to the bus and sends the corresponding `session.*`
+  kind
