@@ -9,6 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use lmux_bus::{BusError, Client, ClientRole, Handler, Kind, Server};
 use tempfile::tempdir;
+use uuid::Uuid;
 
 struct EchoHandler;
 
@@ -74,6 +75,7 @@ async fn unknown_kind_yields_structured_error() {
     let mut stream = UnixStream::connect(&sock)
         .await
         .unwrap_or_else(|e| panic!("connect: {e}"));
+    write_hello(&mut stream).await;
 
     let body = br#"{"v":2,"id":"00000000-0000-0000-0000-000000000001","kind":"session.teleport"}"#;
     lmux_bus::write_frame(&mut stream, body)
@@ -87,6 +89,38 @@ async fn unknown_kind_yields_structured_error() {
     assert_eq!(resp["kind"], "error");
     assert_eq!(resp["code"], "unknown_kind");
     assert_eq!(resp["kind_received"], "session.teleport");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn request_before_hello_is_rejected() {
+    let dir = tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+    let sock = dir.path().join("bus.sock");
+    let pid = dir.path().join("bus.sock.pid");
+
+    let mut server = Server::bind(sock.clone(), pid, Arc::new(EchoHandler))
+        .await
+        .unwrap_or_else(|e| panic!("bind: {e}"));
+
+    use tokio::net::UnixStream;
+    let mut stream = UnixStream::connect(&sock)
+        .await
+        .unwrap_or_else(|e| panic!("connect: {e}"));
+
+    let body = br#"{"v":2,"id":"00000000-0000-0000-0000-000000000002","kind":"status.get"}"#;
+    lmux_bus::write_frame(&mut stream, body)
+        .await
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    let frame = lmux_bus::read_frame(&mut stream)
+        .await
+        .unwrap_or_else(|e| panic!("read: {e}"));
+    let resp: serde_json::Value =
+        serde_json::from_slice(&frame).unwrap_or_else(|e| panic!("parse: {e}"));
+
+    assert_eq!(resp["kind"], "error");
+    assert_eq!(resp["code"], "bad_request");
+    assert_eq!(resp["kind_received"], "status.get");
 
     server.shutdown().await;
 }
@@ -115,4 +149,26 @@ async fn stale_socket_is_reclaimed() {
         .await
         .unwrap_or_else(|e| panic!("status: {e}"));
     server.shutdown().await;
+}
+
+async fn write_hello(stream: &mut tokio::net::UnixStream) {
+    let id = Uuid::new_v4();
+    let body = serde_json::json!({
+        "v": 2,
+        "id": id,
+        "kind": "hello",
+        "client": "lmux-cli",
+        "pid": std::process::id() as i32,
+    });
+    let body = serde_json::to_vec(&body).unwrap_or_else(|e| panic!("hello encode: {e}"));
+    lmux_bus::write_frame(stream, &body)
+        .await
+        .unwrap_or_else(|e| panic!("hello write: {e}"));
+    let frame = lmux_bus::read_frame(stream)
+        .await
+        .unwrap_or_else(|e| panic!("hello read: {e}"));
+    let resp: serde_json::Value =
+        serde_json::from_slice(&frame).unwrap_or_else(|e| panic!("hello parse: {e}"));
+    assert_eq!(resp["id"], id.to_string());
+    assert_eq!(resp["kind"], "hello_ack");
 }

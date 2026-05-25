@@ -21,7 +21,7 @@ const MAX_FRAME_BYTES: u32 = 64 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("XDG_RUNTIME_DIR not set")]
+    #[error("runtime dir not set")]
     NoRuntimeDir,
     #[error("io: {0}")]
     Io(#[from] io::Error),
@@ -58,13 +58,30 @@ pub enum AppEvent {
     },
 }
 
-/// Resolve the control socket path — `$XDG_RUNTIME_DIR/lmux/control.sock`.
+/// Resolve the control socket path.
+///
+/// Linux uses `$XDG_RUNTIME_DIR/lmux/control.sock`. macOS usually lacks
+/// `XDG_RUNTIME_DIR`, so use a user-private directory under `$TMPDIR`.
 pub fn socket_path() -> Result<PathBuf, Error> {
-    let dir = std::env::var_os("XDG_RUNTIME_DIR").ok_or(Error::NoRuntimeDir)?;
-    let mut p = PathBuf::from(dir);
+    let mut p = runtime_dir()?;
     p.push("lmux");
     p.push("control.sock");
     Ok(p)
+}
+
+fn runtime_dir() -> Result<PathBuf, Error> {
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let base = std::env::var_os("TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        return Ok(base.join(format!("lmux-{}", unsafe { libc::getuid() })));
+    }
+    #[cfg(not(target_os = "macos"))]
+    Err(Error::NoRuntimeDir)
 }
 
 /// Ensure `$XDG_RUNTIME_DIR/lmux/` exists with mode 0700 and unlink a stale
@@ -178,27 +195,45 @@ where
 }
 
 fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
-    #[repr(C)]
-    struct Ucred {
-        pid: libc::pid_t,
-        uid: libc::uid_t,
-        gid: libc::gid_t,
+    #[cfg(target_os = "macos")]
+    {
+        let mut euid: libc::uid_t = 0;
+        let mut egid: libc::gid_t = 0;
+        let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut euid, &mut egid) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        return Ok(euid as u32);
     }
-    let mut cred: Ucred = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<Ucred>() as libc::socklen_t;
-    let rc = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            &mut cred as *mut _ as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
+    #[cfg(target_os = "linux")]
+    {
+        #[repr(C)]
+        struct Ucred {
+            pid: libc::pid_t,
+            uid: libc::uid_t,
+            gid: libc::gid_t,
+        }
+        let mut cred: Ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<Ucred>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                &mut cred as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(cred.uid as u32)
     }
-    Ok(cred.uid as u32)
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = stream;
+        Ok(unsafe { libc::getuid() } as u32)
+    }
 }
 
 fn read_frame<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> Result<T, Error> {

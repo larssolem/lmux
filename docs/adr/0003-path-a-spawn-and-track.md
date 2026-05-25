@@ -1,44 +1,68 @@
-# ADR-0003: Path A — spawn-and-track GUI satellites (no Wayland reparenting)
+# ADR-0003: Historical Path A - spawn-and-track GUI satellites
 
-- Status: Accepted
+- Status: Superseded
 - Date: 2026-04-21
 - Deciders: Lars
-- Blocks: v0.2
+- Superseded by: current explicit native-window attach model in `openspec/specs/satellites/` and `openspec/specs/compositor-control/`
+- Blocks: none
 
 ## Context
 
-Users expect a JetBrains IDE to sit *inside* the lmux window alongside a terminal, the way a tmux pane does. On X11 this would be XEmbed-style reparenting. On Wayland, reparenting is **impossible by design** — the protocol isolates clients from each other's surfaces, and no extension makes inter-client reparenting legitimate.
+The original v0.2 satellite plan tried to make external GUI windows feel owned
+by lmux. Wayland does not allow true inter-client reparenting, so the first
+shippable approximation was to spawn a GUI app, identify its compositor window,
+and then use compositor-specific APIs to move, resize, focus, and observe it.
 
-The design choice is therefore not "reparent or embed" but "accept the constraint and find the shippable approximation."
+That direction was useful as a spike: it proved that KWin scripting could see
+and control windows. It is no longer the current user workflow.
+
+The current product model is explicit attach:
+
+1. The user opens a normal app window from the desktop, shell, or app launcher.
+2. lmux lists attachable native windows through the active compositor backend.
+3. The user picks the exact window to attach to the active anchor/workspace.
+4. lmux stores that window identity and controls visibility/fronting on anchor
+   switches.
+5. The user remains responsible for placement, monitor choice, and ordinary
+   window-manager layout.
 
 ## Decision
 
-**Path A — spawn-and-track.** lmux does not embed GUI satellites; it *docks* them by controlling the compositor:
+The old spawn-and-track geometry-control plan is superseded for native windows.
 
-1. lmux spawns the GUI app as a normal compositor client with a known identifier (PID on KDE, app_id + first-seen heuristic on wlroots).
-2. lmux uses compositor-specific IPC to enumerate, focus, move, resize, and observe lifecycle of the spawned toplevel.
-3. lmux positions the spawned window so it *appears* docked relative to its own chrome (sidebar, tabs).
-4. User-facing language is **"docked"** or **"attached"**, never "pseudo-embedded" — the latter signals "not quite working" to a cold reader.
+lmux SHALL NOT present native GUI windows as geometry-owned panes in the host
+window manager. For host-compositor windows, lmux manages membership in a work
+context: list, attach, hide/show, raise, and remove. It does not own placement
+or monitor geometry.
 
-Validated by the KWin Phase 1 spike (commit `f67c37d`, `spikes/compositor-ipc/FINDINGS.md`): all five capabilities (spawn, identify, focus, move/resize, lifecycle) work with sub-5 ms steady-state round-trips.
+The legacy `satellite.open` path may still launch a process where implemented,
+but it is not the reliable ownership model. The reliable model is
+`satellite.list_windows` plus `satellite.attach_window`, or the sidebar
+add-window picker.
 
 ## Alternatives considered
 
-- **True Wayland reparenting.** Rejected: forbidden by the protocol. No extension changes this.
-- **X11 XEmbed for GUI satellites.** Rejected for v0.1–v0.3: X11 is deprecated on modern Linux desktops, adds a second code path, and doesn't help the KWin/wlroots MVP audience. Parked for v0.4+ backlog.
-- **Screen-capture + in-process compositing** of the GUI satellite's surface. Rejected: loses input routing, breaks HiDPI, enormous implementation cost, legally and technically fragile.
-- **Launch GUI satellites as truly separate windows** with no docking. Rejected: defeats "cohesive workspace feel" — which is a named success bar.
+- **True Wayland reparenting.** Still impossible by protocol design.
+- **X11 XEmbed.** Not a useful primary model for a Wayland-first GTK4 app.
+- **Screen capture plus input forwarding.** Too fragile and does not give real
+  application ownership.
+- **Host-compositor geometry ownership.** Superseded because multi-display and
+  normal window-manager placement are better left to the user and desktop.
 
 ## Consequences
 
-- **+** Shippable on Wayland with existing protocols.
-- **+** The GUI satellite is a normal compositor client; keyboard, IME, accessibility, HiDPI all work natively.
-- **+** Clean separation: lmux chrome is one client, each satellite is another; compositor handles rendering/compositing.
-- **−** Anti-metric risk: "docked window visibly detaches, flickers, or lags on resize." Kill criterion applies.
-- **−** Each compositor needs its own backend (KWin D-Bus script; wlroots protocol + hyprctl/swaymsg). Abstracted via `CompositorControl` (see ADR-0004).
-- **−** Some interactions remain imperfect: the docked IDE's own title-bar/shadow still reads as a separate window to attentive users.
+- Native app windows keep normal desktop behavior: decorations, shortcuts,
+  accessibility, IME, and monitor placement remain owned by the OS compositor.
+- Anchor switching is simpler and more predictable: lmux only needs to bring
+  the active anchor's windows forward and hide or deprioritize inactive ones.
+- Specs and user documentation must avoid promising spawned host windows that
+  lmux owns geometrically.
+- Historical docs that mention geometry-owned host windows should be read as
+  spike history unless they explicitly refer to the nested Wayland host.
 
 ## Follow-up
 
-- Verify resize-follow latency on KWin under heavy load before v0.2 dogfood commitment.
-- Phase 2 (wlroots) spike before v0.3.
+- Keep the current behavior contract in `openspec/specs/satellites/` and
+  `openspec/specs/compositor-control/`.
+- If launch-and-own becomes reliable again, document it as a new capability
+  instead of reviving this ADR's geometry-docking model.

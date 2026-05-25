@@ -3,6 +3,7 @@
 //! `xdg_toplevel.set_title`, and assert that `HostEvent::ToplevelCreated`
 //! lands on the cockpit channel with the title we sent.
 
+#![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::collapsible_match)]
 
 use std::time::{Duration, Instant};

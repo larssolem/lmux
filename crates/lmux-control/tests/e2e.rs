@@ -22,12 +22,23 @@ fn setup_runtime_dir() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tid = std::thread::current().id();
-    let mut dir = std::env::temp_dir();
-    dir.push(format!("lmux-control-e2e-{nanos}-{tid:?}"));
+    let dir = test_runtime_dir(nanos);
     std::fs::create_dir_all(&dir).expect("create tmp runtime dir");
     // SAFETY: tests hold `env_lock()` while mutating env.
     std::env::set_var("XDG_RUNTIME_DIR", &dir);
+    dir
+}
+
+#[cfg(target_os = "macos")]
+fn test_runtime_dir(nanos: u128) -> PathBuf {
+    PathBuf::from(format!("/tmp/lmux-ctl-{}-{nanos}", std::process::id()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn test_runtime_dir(nanos: u128) -> PathBuf {
+    let tid = std::thread::current().id();
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("lmux-control-e2e-{nanos}-{tid:?}"));
     dir
 }
 

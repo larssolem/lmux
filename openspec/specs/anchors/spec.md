@@ -2,147 +2,195 @@
 
 ## Purpose
 
-An anchor is a pane the user has marked as long-running (dev server, AI agent, log tail). Anchors get an explicit lifecycle — tag/untag, pause (SIGSTOP), resume (SIGCONT), soft-hide (widget detach, PTY preserved), reattach — plus automatic tagging by command-pattern match and a compact workspace model where exactly one anchor is active at a time. Tab-edge glow colours mirror anchor and satellite state.
+An anchor is a terminal pane tagged as a workspace root. Exactly one anchor is
+active on screen at a time. Non-active anchors and panes owned by them are hidden
+from the GTK workspace view; native windows attached to those anchors are sent
+through the compositor bridge for hide/show handling. Anchors can be named,
+grouped, reordered, paused, hidden, reattached, activated, and removed.
 
 ## Requirements
 
-### Requirement: Tag and untag a pane as an anchor
+### Requirement: First terminal auto-anchor
 
-The cockpit SHALL let the user tag any live pane as an anchor and later remove the anchor tag without affecting the underlying PTY or process.
+The cockpit SHALL ensure a fresh session has an anchor target.
 
-#### Scenario: Tag the focused pane
+#### Scenario: Fresh startup creates initial anchor
 
-- **WHEN** the user runs `lmux anchor tag <uuid>` against a running cockpit (or presses `prefix + a` with a fresh pane focused)
-- **THEN** the pane's anchor metadata is set, the sidebar shows the anchor indicator, and subsequent `anchor.*` operations targeted at the pane's UUID are accepted
+- **WHEN** lmux starts with one fresh terminal and no restored anchor metadata
+- **THEN** the cockpit tags that terminal as an anchor
+- **AND** makes it the active anchor
 
-#### Scenario: Untag preserves the PTY
+#### Scenario: Restored snapshots keep restored anchors
 
-- **WHEN** the user runs `lmux anchor untag <uuid>` against a tagged pane
-- **THEN** the anchor metadata is cleared, the sidebar indicator is removed, and the PTY and process continue running unaffected
+- **WHEN** a snapshot restores one or more anchor pane ids
+- **THEN** each restored pane is tagged through the restore path
+- **AND** the first restored anchor becomes active
 
-### Requirement: Per-pane UUID identity
+### Requirement: Manual anchor tagging
 
-The cockpit SHALL assign a UUID to every pane it creates and SHALL maintain a reverse `pane_for_uuid` lookup so bus kinds can target a pane independently of its ephemeral `PaneId`.
+The cockpit SHALL let the user tag a live terminal pane as an anchor.
 
-#### Scenario: UUID survives layout changes
+#### Scenario: Prefix `a` creates the first anchor
 
-- **WHEN** a pane is split, moved, or its containing tab is reorganized
-- **THEN** the pane's UUID is preserved across every insert, remove, drain, and rehydrate operation; `pane_for_uuid` continues to resolve to the same logical pane
+- **WHEN** no anchors exist and the user presses `prefix + a`
+- **THEN** the focused pane is tagged as an anchor and becomes active
 
-### Requirement: Pause and resume via process-group signals
+#### Scenario: Tagging absorbs unowned panes
 
-The cockpit SHALL pause a tagged anchor by sending `SIGSTOP` to the PTY's process group (with a single-PID fallback) and resume it by sending `SIGCONT`; the sidebar state glyph MUST reflect the transition within 100 ms.
+- **WHEN** a pane is tagged as an anchor
+- **THEN** all currently unowned panes are assigned to that anchor's workspace
+- **AND** existing panes owned by other anchors are left alone
 
-#### Scenario: Pause halts the process group
+#### Scenario: Satellite pane cannot become anchor
 
-- **WHEN** the user pauses a tagged anchor via `lmux anchor pause <uuid>` or the sidebar
-- **THEN** the cockpit calls `kill(-pgid, SIGSTOP)` on the PTY's process group; the sidebar glyph transitions to "paused" within 100 ms
+- **WHEN** a pane is already owned by a different anchor workspace
+- **THEN** anchor tagging refuses to promote it
 
-#### Scenario: Resume unblocks the process group
+### Requirement: Anchor identity
 
-- **WHEN** the user resumes a paused anchor
-- **THEN** the cockpit sends `SIGCONT` to the process group; the glyph returns to "live" and the pane resumes rendering output
+Every live pane SHALL have a process-local UUID, and every tagged anchor SHALL
+have a separate anchor UUID.
 
-#### Scenario: Pause is idempotent
+#### Scenario: Pane UUID addresses non-anchor panes
 
-- **WHEN** the user pauses an already-paused anchor
-- **THEN** the operation is a no-op; no duplicate signal is sent and no error is returned
+- **WHEN** `pane.list` returns a pane
+- **THEN** the returned `pane_id` is the pane UUID used by `anchor.tag`
 
-### Requirement: Soft-hide and reattach
+#### Scenario: Anchor UUID addresses anchor operations
 
-The cockpit SHALL let the user hide a tagged anchor by detaching its widget from the rendering tree while keeping the PTY alive, and reattach later to the same or a different pane slot.
+- **WHEN** `anchor.pause`, `anchor.resume`, `anchor.hide`, `anchor.reattach`,
+  `anchor.untag`, or `anchor.activate` is called
+- **THEN** the UUID is resolved as an anchor UUID to its live pane
 
-#### Scenario: Hide preserves PTY and scrollback
+#### Scenario: UUIDs are process-local
 
-- **WHEN** the user hides a tagged anchor
-- **THEN** the pane's widget is hidden (visibility toggled) and its anchor state transitions to "hidden"; the PTY stays open and libghostty continues to accumulate scrollback
+- **WHEN** panes are restored from session snapshots
+- **THEN** fresh pane UUIDs and anchor UUIDs are assigned for the new cockpit
+  process
 
-#### Scenario: Reattach makes the pane visible again
+### Requirement: Active anchor workspace switching
 
-- **WHEN** the user reattaches a hidden anchor
-- **THEN** the anchor's widget becomes visible and its state transitions back to "live"; the accumulated scrollback is available via normal scrolling
+The cockpit SHALL render only one anchor workspace at a time.
 
-#### Scenario: Hide transitions use the non-destructive path
+#### Scenario: Activating anchor changes visible workspace
 
-- **WHEN** the cockpit transitions an anchor to hidden via `AnchorRegistry::set_hidden`
-- **THEN** the pane binding is preserved; the destructive `hide` flavor (kill + respawn) is not used in this path
+- **WHEN** `set_active_anchor(Some(anchor))` succeeds
+- **THEN** panes whose workspace owner is that anchor are visible
+- **AND** panes owned by other anchors and unowned panes are hidden from the
+  mounted GTK workspace view
+- **AND** focus moves to the active anchor pane
 
-### Requirement: Auto-detect anchors by command pattern
+#### Scenario: Prefix `a` cycles anchors
 
-The cockpit SHALL auto-tag new panes as anchors when their spawn argv matches any built-in or user-configured pattern prefix, within 1 second of first output.
+- **WHEN** one or more anchors exist and the user presses `prefix + a`
+- **THEN** active anchor advances through anchors in pane-id order
 
-#### Scenario: Built-in pattern triggers auto-tag
+#### Scenario: Sidebar activation sets active anchor
 
-- **WHEN** a pane spawns a command whose argv starts with one of the built-in patterns (`npm run dev`, `pnpm dev`, `cargo watch`, `claude code`)
-- **THEN** the pane auto-tags as an anchor within 1 second of first output, and the sidebar shows an "auto-detected" icon variant distinct from user-tagged anchors
+- **WHEN** the user left-clicks an anchor row in the sidebar
+- **THEN** that anchor becomes active
 
-#### Scenario: User-extensible patterns take effect after reload
+### Requirement: Native windows follow anchor ownership by visibility/fronting
 
-- **WHEN** the user adds `"my dev cmd"` to `[anchors].auto_detect_patterns` in config and triggers a reload
-- **THEN** subsequent panes spawning that command auto-tag; the pattern list is the union of built-in and user patterns, deduplicated
+Attached native windows SHALL be associated with the owning anchor and switched
+through the compositor bridge when the active anchor changes. lmux does not own
+their physical display placement.
 
-#### Scenario: Removing a pattern does not untag existing anchors
+#### Scenario: Active anchor windows are shown
 
-- **WHEN** the user removes a pattern from config and reloads
-- **THEN** future panes matching that pattern are not auto-tagged; already-tagged panes remain anchors
+- **WHEN** an anchor becomes active
+- **THEN** native windows registered under that anchor are sent in the `show`
+  side of an `ApplyWindowGroupSwitch` command
 
-### Requirement: Crash capture surfaces a dead anchor
+#### Scenario: Other anchor windows are hidden
 
-When a tagged anchor's process exits unexpectedly the cockpit SHALL capture the exit status and recent output tail, transition the anchor to the "dead" state, and make the captured tail viewable from the sidebar.
+- **WHEN** an anchor becomes inactive
+- **THEN** native windows registered under that anchor are sent in the `hide`
+  side of the group-switch command
 
-#### Scenario: Exit is detected and the anchor marked dead
+#### Scenario: Window placement is preserved
 
-- **WHEN** a tagged anchor's child process exits (any signal or non-zero status)
-- **THEN** the cockpit detects the exit via `waitpid`, records the exit status and the last 200 lines of output, and transitions the sidebar row to the "dead" state
+- **WHEN** the compositor handles an anchor switch
+- **THEN** lmux does not rewrite display placement, monitor assignment, or saved
+  geometry for the native windows
 
-#### Scenario: Captured tail is viewable
+### Requirement: Pause and resume
 
-- **WHEN** the user opens the dead anchor's row in the sidebar
-- **THEN** the captured tail (exit status + last 200 lines) is viewable and copyable; there is no modal interruption at the time of death
+The cockpit SHALL pause and resume tagged anchor processes by sending process
+group signals and updating the in-memory anchor registry.
 
-### Requirement: Per-anchor workspace ownership
+#### Scenario: Pause sends SIGSTOP
 
-The cockpit SHALL model a compact workspace where exactly one anchor is active at a time; non-active anchors' panes and their satellites are hidden, and `prefix + a` cycles between anchors.
+- **WHEN** a tagged live anchor is paused
+- **THEN** lmux sends `SIGSTOP` to the pane child's process group using the
+  negative-pid path
+- **AND** the registry state becomes `paused`
 
-#### Scenario: Switching the active anchor hides the others
+#### Scenario: Resume sends SIGCONT
 
-- **WHEN** the user switches the active anchor from `A` to `B`
-- **THEN** `B`'s panes become visible, `A`'s panes become hidden, and any satellites owned by `A`'s panes are minimized while `B`'s are shown
+- **WHEN** a paused anchor is resumed
+- **THEN** lmux sends `SIGCONT` to the process group
+- **AND** the registry state becomes `live`
 
-#### Scenario: `prefix + a` cycles anchors
+### Requirement: Hide and reattach
 
-- **WHEN** the user presses `prefix + a` with at least one anchor present
-- **THEN** the active anchor advances to the next anchor in sort order; with no anchors present the binding creates a new one
+The cockpit SHALL hide and reattach anchor panes without killing the PTY.
 
-### Requirement: Tab-edge state glow colours
+#### Scenario: Hide preserves process
 
-The tab-edge glow SHALL convey non-focus pane state using distinct colours: blue for satellite-owned, orange for anchor-paused, muted orange for anchor-hidden, red for anchor-dead; focus ring composes with state glow.
+- **WHEN** a tagged anchor is hidden
+- **THEN** its pane widget is hidden, its pane and PTY remain alive, and the
+  registry state becomes `hidden`
 
-#### Scenario: Paused anchor shows orange glow
+#### Scenario: Reattach preserves workspace filter
 
-- **WHEN** an anchor enters the paused state
-- **THEN** its pane renders an orange tab-edge glow in addition to any focus ring
+- **WHEN** a hidden anchor is reattached
+- **THEN** its registry state becomes `live`
+- **AND** the widget becomes visible only if the anchor's workspace is active
 
-#### Scenario: Dead anchor shows red glow
+### Requirement: Remove anchor
 
-- **WHEN** an anchor enters the dead state
-- **THEN** its pane renders a red tab-edge glow until the anchor is respawned or dismissed
+The cockpit SHALL let the user remove the anchor tag without killing the pane.
 
-#### Scenario: Focused satellite-owning pane composes both glows
+#### Scenario: Remove clears metadata
 
-- **WHEN** a pane that owns a docked satellite holds focus
-- **THEN** the pane renders both the focus ring and the blue satellite glow; the two are visually distinguishable
+- **WHEN** an anchor is removed through the sidebar or `anchor.untag`
+- **THEN** the anchor set, registry entry, hidden state, active CSS class, and
+  workspace ownership records for that anchor are cleared
+- **AND** the underlying terminal pane remains alive
 
-### Requirement: Anchor survival across session-window close
+#### Scenario: Removing active anchor promotes another
 
-Hidden tagged anchors SHALL survive a session-window close so long as the cockpit process continues running; closing the cockpit itself kills hidden anchors per the v0.1 shutdown contract.
+- **WHEN** the removed anchor was active and other anchors remain
+- **THEN** lmux activates the next remaining anchor
+- **AND** if no anchors remain, active anchor becomes `None`
 
-#### Scenario: Hidden anchor survives session close
+### Requirement: Sidebar metadata
 
-- **WHEN** the user closes a session window that contains a tagged, hidden anchor
-- **THEN** the PTY stays alive (the cockpit retains the master fd); reopening the session reattaches the anchor
+Anchors SHALL carry editable presentation metadata for the sidebar.
 
-#### Scenario: Cockpit shutdown reaps hidden anchors
+#### Scenario: Rename and regroup
 
-- **WHEN** the cockpit itself shuts down
-- **THEN** hidden anchors are terminated along with all other children within the 700 ms shutdown budget
+- **WHEN** the user edits name or group in the row popover
+- **THEN** the anchor registry updates `name` and `group`
+- **AND** the sidebar refreshes
+
+#### Scenario: Drag reorder within group
+
+- **WHEN** the user drags an anchor row onto another row in the same group
+- **THEN** lmux rewrites sort keys for that group's anchors in the new order
+
+#### Scenario: Cross-group drag is ignored
+
+- **WHEN** the user drops an anchor row onto a row in another group
+- **THEN** the drop is ignored; regrouping is done through the popover
+
+### Requirement: Autodetect matcher library
+
+The repo SHALL provide a pure autodetect matcher for configured rules, even
+though cockpit auto-tag wiring is not the primary runtime path today.
+
+#### Scenario: First matching rule wins
+
+- **WHEN** multiple `[[autodetect]]` rules could match a command/env pair
+- **THEN** `lmux_anchor::match_rule` returns the first matching rule

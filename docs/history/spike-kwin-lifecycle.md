@@ -6,7 +6,6 @@ status: 'proposed'
 baseline_commit: 'f67c37d'
 context:
   - '{project-root}/docs/adr/0011-kwin-script-lifecycle.md'
-  - '{project-root}/_bmad-output/implementation-artifacts/spec-compositor-ipc-spike.md'
   - '{project-root}/spikes/compositor-ipc/FINDINGS.md'
   - '{project-root}/spikes/compositor-ipc/phase1-kwin/'
 ---

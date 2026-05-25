@@ -5,7 +5,7 @@ created: '2026-04-21'
 status: 'in-progress'
 baseline_commit: 'f67c37d'
 context:
-  - '{project-root}/_bmad-output/brainstorming/brainstorming-session-2026-04-20-23-28.md'
+  - '{project-root}/docs/history/brainstorming-2026-04-20.md'
   - '{project-root}/spikes/libghostty-ffi/Cargo.toml'
 ---
 

@@ -2,90 +2,116 @@
 
 ## Purpose
 
-Structured tracing spans around every user-visible operation, a rotating on-disk log at `$XDG_STATE_HOME/lmux/logs/`, a `lmux status` CLI for live health, and in-memory counters for dogfooding signals (satellite dock success rate). No network telemetry; everything is local.
+Observability is local-only. The cockpit logs structured tracing to stderr and
+to rotating files under `$XDG_STATE_HOME/lmux/logs/`, exposes a compact
+`status.get` bus snapshot, records satellite spawn counters, and emits spans for
+latency-sensitive operations.
 
 ## Requirements
 
-### Requirement: Structured spans per user-visible operation
+### Requirement: Tracing setup
 
-The cockpit SHALL open a `tracing` span for every user-visible operation, carrying an id, duration, outcome, and operation-specific fields.
+The cockpit SHALL initialize `tracing_subscriber` with an environment filter,
+stderr logging, and an optional daily rolling file appender.
 
-#### Scenario: Core operations emit spans
+#### Scenario: RUST_LOG controls filtering
 
-- **WHEN** the user triggers session-open, session-restore, anchor-pause, anchor-resume, anchor-hide, anchor-reattach, satellite-open, or compositor-reinject
-- **THEN** a span is opened with `id`, `duration_ms`, `outcome`, and operation-specific fields; the span closes when the operation resolves
+- **WHEN** `RUST_LOG` is set
+- **THEN** the tracing filter is taken from the environment
+- **AND** otherwise defaults to `info,lmux=info`
 
-#### Scenario: v0.1 bell-to-toast span preserved
+#### Scenario: File logs rotate locally
 
-- **WHEN** a terminal bell is converted to a toast
-- **THEN** the v0.1 `bell_to_toast` span is emitted with its existing fields; no regression from the v0.1 tracing surface
+- **WHEN** `$XDG_STATE_HOME` or `$HOME` can resolve a state directory
+- **THEN** lmux writes daily rotating logs under `$XDG_STATE_HOME/lmux/logs/`
+  or `$HOME/.local/state/lmux/logs/`
+- **AND** retains at most five files through the appender configuration
 
-### Requirement: Rotating on-disk log
+#### Scenario: Panic hook logs backtrace
 
-The cockpit SHALL write a rotating log to `$XDG_STATE_HOME/lmux/logs/lmux.<date>.log` with daily rotation and at most 5 retained files; `RUST_LOG` overrides the config-file verbosity when both are set.
+- **WHEN** a panic reaches the installed hook
+- **THEN** lmux logs the panic info and a forced backtrace before delegating to
+  the default hook
 
-#### Scenario: Daily rotation caps disk usage
+### Requirement: Startup banner
 
-- **WHEN** the cockpit runs across a calendar-day boundary
-- **THEN** a new `lmux.<date>.log` is opened for the new day; at most 5 rolled files are retained; older files are pruned automatically
+The cockpit SHALL log a startup banner with useful environment fields.
 
-#### Scenario: RUST_LOG overrides config verbosity
+#### Scenario: Startup metadata is logged
 
-- **WHEN** `RUST_LOG` is set in the environment and `[logging].level` is set in config
-- **THEN** the effective verbosity is taken from `RUST_LOG`; the config value is used only when `RUST_LOG` is unset
+- **WHEN** the cockpit starts
+- **THEN** it logs lmux version, libghostty version, current desktop,
+  runtime dir, state dir, and data dir
 
-### Requirement: `lmux status` CLI
+### Requirement: Status snapshot
 
-The `lmux status` subcommand SHALL report cockpit uptime and version, compositor integration health, bus accept count, active pane count, active anchor count, active satellite count, and satellite spawn-success counters; `--json` emits machine-readable output.
+The implemented live status surface SHALL be `status.get` on the bus and
+`lmux-cli status` on the CLI.
 
-#### Scenario: Status reports the baseline fields
+#### Scenario: Status reports implemented fields
 
-- **WHEN** the user runs `lmux status` against a running cockpit
-- **THEN** the output includes: `cockpit_version`, uptime, compositor state, bus accept count, active panes, active anchors, active satellites, and `satellites: ok=N fail=M`
+- **WHEN** a client requests status
+- **THEN** the snapshot includes cockpit version, PID, session count, anchor
+  count, compositor online/offline state, `satellite_spawn_ok`, and
+  `satellite_spawn_fail`
 
-#### Scenario: JSON output is machine-readable
+#### Scenario: Compositor health is probed live
 
-- **WHEN** the user runs `lmux status --json`
-- **THEN** the output is a single JSON document whose keys correspond to the pretty-printed fields, suitable for `jq` piping
-
-#### Scenario: Missing cockpit yields non-zero exit
-
-- **WHEN** the user runs `lmux status` with no cockpit process running
-- **THEN** the CLI exits non-zero with a stderr message identifying the absent cockpit
+- **WHEN** `status.get` is handled
+- **THEN** the bus asks the current compositor backend for health before
+  building the response
 
 ### Requirement: Satellite spawn counters
 
-The cockpit SHALL maintain atomic counters `satellite_spawn_ok` and `satellite_spawn_fail` that are incremented on every resolved `satellite.open` dispatch, MUST expose them through `status.get.result`, and MUST emit a tracing event on each spawn outcome.
+The cockpit SHALL maintain process-local counters for the legacy
+`satellite.open` spawn path.
 
-#### Scenario: Counters increment per outcome
+#### Scenario: Successful non-macOS spawn increments ok
 
-- **WHEN** a `satellite.open` dispatch resolves to success
-- **THEN** `satellite_spawn_ok` increments by 1; on failure `satellite_spawn_fail` increments by 1
+- **WHEN** `satellite.open` launches a process successfully on a non-macOS
+  build
+- **THEN** `satellite_spawn_ok` increments
+- **AND** the log says the process was launched without ownership and must be
+  attached separately to be managed
 
-#### Scenario: Tracing event mirrors the outcome
+#### Scenario: Failed or disabled spawn increments fail
 
-- **WHEN** a spawn resolves
-- **THEN** a `tracing` event is emitted carrying the request id, outcome, and (on failure) the reason
+- **WHEN** `satellite.open` receives empty argv, fails to spawn, or is called on
+  macOS
+- **THEN** `satellite_spawn_fail` increments
 
-### Requirement: No network telemetry in v0.2
+### Requirement: Bell notification span
 
-The cockpit SHALL NOT open any network sockets for telemetry, analytics, or crash reporting; observability MUST remain strictly local.
+The cockpit SHALL keep the `bell_to_toast` span around notification delivery.
 
-#### Scenario: No listening or outbound sockets from the cockpit
+#### Scenario: Bell delivery is measured
 
-- **WHEN** `ss -lntp` and `ss -ntp` are run against the cockpit PID under normal operation
-- **THEN** no listening TCP sockets and no outbound network connections are attributable to the cockpit process for observability purposes
+- **WHEN** a pane bell is converted to a desktop notification
+- **THEN** the async notification call is wrapped in a `bell_to_toast` tracing
+  span tagged with the pane id
 
-### Requirement: Error messages name the recovery action
+### Requirement: Anchor switch latency logging
 
-Every error surfaced to the user SHALL either name its recovery action inline or provide an expand affordance that reveals the recovery action.
+Anchor switches SHALL log local switch duration and compositor bridge duration.
 
-#### Scenario: Compositor-offline toast offers re-inject
+#### Scenario: Local anchor switch logs duration
 
-- **WHEN** the cockpit emits the `compositor.status { state: "offline" }` toast
-- **THEN** the toast or its detail expansion names the "Re-inject" action and the CLI equivalent `lmux compositor reinject`
+- **WHEN** `set_active_anchor` changes the active anchor
+- **THEN** it logs `operation = "anchor.switch.local"`, `duration_ms`, target,
+  active anchor, pane count, anchor count, satellite-window count, and whether a
+  GTK rebuild happened
 
-#### Scenario: Satellite fallback names the fallback explicitly
+#### Scenario: Compositor group switch logs duration
 
-- **WHEN** a satellite falls back to floating because correlation timed out
-- **THEN** the toast reads `Could not dock <app> — opened as floating window` and does not hide the cause behind a generic "error" phrasing
+- **WHEN** the compositor bridge applies a group switch
+- **THEN** it logs `operation = "compositor.group_switch"`, duration, sequence,
+  hide/show counts, attempted windows, and failure count
+
+### Requirement: No network telemetry
+
+lmux SHALL NOT implement analytics, crash upload, or network telemetry.
+
+#### Scenario: Observability stays local
+
+- **WHEN** lmux records logs, counters, status, spans, or notifications
+- **THEN** the data remains on the local machine or local desktop session bus

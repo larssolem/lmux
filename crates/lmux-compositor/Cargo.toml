@@ -12,7 +12,9 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 lmux-bus = { path = "../lmux-bus" }
+lmux-macos-helper = { path = "../lmux-macos-helper" }
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time", "fs"] }
 tracing.workspace = true

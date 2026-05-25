@@ -172,6 +172,7 @@ async fn serve_connection<H: Handler>(
         return Ok(());
     }
 
+    let mut handshake_complete = false;
     loop {
         let frame = match read_frame(&mut stream).await {
             Ok(f) => f,
@@ -193,6 +194,17 @@ async fn serve_connection<H: Handler>(
             }
         };
 
+        if !handshake_complete && envelope.kind != "hello" {
+            let payload = ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "hello handshake required before other requests".into(),
+                kind_received: Some(envelope.kind.clone()),
+                in_reply_to: Some(envelope.id),
+            };
+            write_error(&mut stream, envelope.id, payload).await?;
+            continue;
+        }
+
         // Try to parse the full kind; unknown-kind surfaces as serde error,
         // which we map back to `error.unknown_kind` carrying the received
         // tag so clients can introspect.
@@ -213,6 +225,7 @@ async fn serve_connection<H: Handler>(
         let response_kind = match &kind {
             Kind::Hello { client, pid } => {
                 debug!(?client, pid, "lmux-bus: hello");
+                handshake_complete = true;
                 Kind::HelloAck {
                     cockpit_version: handler.cockpit_version(),
                 }
@@ -308,24 +321,42 @@ fn current_uid() -> u32 {
 }
 
 fn so_peercred_uid(stream: &UnixStream) -> Result<u32, BusError> {
-    let fd = stream.as_raw_fd();
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut len: libc::socklen_t = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: getsockopt on a connected Unix socket for SO_PEERCRED is
-    // well-defined; `cred` + `len` point to correctly-sized storage.
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            &mut cred as *mut _ as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if rc != 0 {
-        return Err(BusError::Io(io::Error::last_os_error()));
+    #[cfg(target_os = "macos")]
+    {
+        let mut euid: libc::uid_t = 0;
+        let mut egid: libc::gid_t = 0;
+        let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut euid, &mut egid) };
+        if rc != 0 {
+            return Err(BusError::Io(io::Error::last_os_error()));
+        }
+        return Ok(euid as u32);
     }
-    Ok(cred.uid as u32)
+    #[cfg(target_os = "linux")]
+    {
+        let fd = stream.as_raw_fd();
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len: libc::socklen_t = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: getsockopt on a connected Unix socket for SO_PEERCRED is
+        // well-defined; `cred` + `len` point to correctly-sized storage.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                &mut cred as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(BusError::Io(io::Error::last_os_error()));
+        }
+        Ok(cred.uid as u32)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = stream;
+        Ok(current_uid())
+    }
 }
 
 /// Helper type: a [`Handler`] that returns `error.unknown_kind` for every

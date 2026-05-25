@@ -1,0 +1,95 @@
+name: macOS Port
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  PREFERRED_XCODE_VERSION: "26.5"
+  FALLBACK_XCODE_VERSION: "26.3"
+  MACOSX_DEPLOYMENT_TARGET: "26.3"
+
+on:
+  push:
+    branches:
+      - macos-port-window-groups
+  pull_request:
+    branches:
+      - macos-port-window-groups
+  workflow_dispatch:
+
+jobs:
+  macos-port:
+    name: macOS build and smoke checks
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 26.5 or 26.3
+        run: |
+          set -euo pipefail
+          echo "Installed Xcode bundles:"
+          ls -1 /Applications | grep -E '^Xcode' || true
+
+          for version in "$PREFERRED_XCODE_VERSION" "$FALLBACK_XCODE_VERSION"; do
+            candidate="/Applications/Xcode_${version}.app/Contents/Developer"
+            if [[ -d "$candidate" ]]; then
+              echo "SELECTED_XCODE_VERSION=$version" >> "$GITHUB_ENV"
+              echo "Using Xcode $version at $candidate"
+              sudo xcode-select -s "$candidate"
+              xcodebuild -version
+              clang --version
+              exit 0
+            fi
+          done
+
+          echo "::error::Neither Xcode ${PREFERRED_XCODE_VERSION} nor ${FALLBACK_XCODE_VERSION} is installed on this runner."
+          exit 1
+
+      - name: Configure macOS SDK for Zig
+        run: |
+          SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          CLANG="$(xcrun --find clang)"
+          echo "SDKROOT=$SDKROOT" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=$SDKROOT/usr/lib" >> "$GITHUB_ENV"
+          echo "CPATH=$SDKROOT/usr/include" >> "$GITHUB_ENV"
+          echo "CC=$CLANG" >> "$GITHUB_ENV"
+          echo "CXX=$(xcrun --find clang++)" >> "$GITHUB_ENV"
+          echo "AR=$(xcrun --find ar)" >> "$GITHUB_ENV"
+          echo "RANLIB=$(xcrun --find ranlib)" >> "$GITHUB_ENV"
+          echo "ZIG_SYSTEM_LINKER_HACK=1" >> "$GITHUB_ENV"
+          echo "SDKROOT=$SDKROOT"
+          "$CLANG" --version
+
+      - name: Install mise toolchains
+        uses: jdx/mise-action@v3
+        with:
+          install: false
+          cache: true
+          experimental: true
+
+      - name: Trust mise config
+        run: mise trust
+
+      - name: Install pinned toolchains
+        run: mise install
+
+      - name: Install macOS dependencies
+        run: mise run deps:macos
+
+      - name: Doctor
+        run: mise run doctor:macos
+
+      - name: Portable port tests
+        run: mise run test:port
+
+      - name: App compile check
+        run: mise run check:app
+
+      - name: App binary build
+        run: mise run build:app
+
+      - name: Verify built binary
+        run: |
+          test -x target/debug/lmux
+          file target/debug/lmux

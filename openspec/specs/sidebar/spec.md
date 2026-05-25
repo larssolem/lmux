@@ -2,129 +2,168 @@
 
 ## Purpose
 
-Left-side panel that makes the cockpit's state legible and actionable: session list, per-session pane tree, anchor/satellite indicators, context actions, drag-to-reorder, mini-previews, and a toast channel for system events. Tab-edge glow on each pane mirrors focus state so the user always knows where keystrokes will land.
+The sidebar is the always-installed workspace rail. It shows anchor workspaces,
+lets the user create a new workspace, add an existing native window to the active
+workspace, activate/rename/group/pause/remove anchors, reorder anchors within a
+group, show low-res previews, and edit basic settings.
 
 ## Requirements
 
-### Requirement: Toggleable sidebar reachable by keyboard
+### Requirement: Always-installed sidebar shell
 
-The cockpit SHALL render a sidebar that can be toggled on and off via a configurable keybinding (default `prefix + b`) and SHALL be navigable using the keyboard alone.
+The cockpit SHALL wrap the pane tree in a horizontal `gtk::Paned` containing the
+sidebar and the workspace area.
 
-#### Scenario: Toggle hides and shows the sidebar
+#### Scenario: Sidebar side follows config
 
-- **WHEN** the user presses the configured toggle key while a pane has focus
-- **THEN** the sidebar hides or shows without stealing focus from the current pane
+- **WHEN** `[sidebar].position` is `left` or `right`
+- **THEN** the sidebar is installed on that side of the paned layout
 
-#### Scenario: Keyboard focus into the sidebar
+#### Scenario: Collapse button toggles rail
 
-- **WHEN** the user presses the sidebar-focus keybinding (default `prefix + s`)
-- **THEN** focus moves into the sidebar; every sidebar control (session rows, pane rows, action menu, new-anchor button) is reachable with arrow keys, `Tab`, and `Enter`
+- **WHEN** the user clicks the collapse button
+- **THEN** the sidebar switches between configured width and collapsed rail
+  width
 
-### Requirement: Session list with active-session highlight
+#### Scenario: Hover expands collapsed rail
 
-The sidebar SHALL list every known session from `SessionIndex`, visually highlight the active session, and open any session on click or keyboard activation.
+- **WHEN** the sidebar is collapsed and the pointer enters it
+- **THEN** it temporarily expands until the pointer leaves
 
-#### Scenario: Sessions render in recency order
+### Requirement: Header actions
 
-- **WHEN** the sidebar refreshes
-- **THEN** session rows are drawn in `SessionIndex` recency order and the active session row has a visually distinct highlight (coloured dot and tint)
+The sidebar header SHALL expose workspace creation and native window attach.
 
-#### Scenario: Activate a session from the sidebar
+#### Scenario: New workspace button
 
-- **WHEN** the user clicks a non-active session row (or presses `Enter` on it with keyboard focus)
-- **THEN** the cockpit swaps to that session via the same code path used by the fuzzy switcher (outgoing state saved, target restored)
+- **WHEN** the user clicks the plus button
+- **THEN** lmux creates a fresh terminal pane, tags it as a new anchor, and
+  makes it active
 
-### Requirement: Pane tree with state glyphs
+#### Scenario: Add-window button follows compositor capability
 
-The sidebar SHALL display the active session's pane tree in nested form (splits render as nested lists) with a glyph on each row for focus, satellite ownership, and anchor state.
+- **WHEN** native attach is supported
+- **THEN** the add-window button is enabled and opens the add-window picker
+- **AND** otherwise it is disabled with a capability tooltip
 
-#### Scenario: Focused pane is unambiguous
+### Requirement: Anchor row list
 
-- **WHEN** the active session has a pane with focus
-- **THEN** exactly one pane row in the sidebar bears the focus glyph, matching the pane that currently receives keystrokes
+The sidebar SHALL render one row per tagged anchor, grouped and manually sorted.
 
-#### Scenario: Anchor state glyphs are distinct
+#### Scenario: Empty state
 
-- **WHEN** a pane is tagged as an anchor
-- **THEN** the row displays a glyph that visually distinguishes the four anchor states: live, paused, hidden, dead
+- **WHEN** there are no anchors
+- **THEN** the sidebar shows text telling the user to use `+` or `Ctrl+B a`
 
-#### Scenario: Satellite ownership is visible
+#### Scenario: Grouped rows
 
-- **WHEN** a pane owns a docked satellite
-- **THEN** the row displays a satellite-ownership glyph distinct from the anchor glyphs
+- **WHEN** anchors have group metadata
+- **THEN** rows are grouped by group name, with ungrouped anchors under `No
+  group`
 
-### Requirement: Context actions on pane rows
+#### Scenario: Active row updates without full rebuild
 
-The sidebar SHALL expose context actions on each pane row, reachable by right-click and by a keyboard shortcut (`prefix + m` with the row focused), with enabled/disabled state matching the pane's current state.
+- **WHEN** only the active anchor changes
+- **THEN** the sidebar updates active row CSS and active dot through the active
+  anchor callback
 
-#### Scenario: Pane context menu exposes minimum actions
+### Requirement: Row activation and popover actions
 
-- **WHEN** the user opens the context menu on a pane row
-- **THEN** the menu offers at minimum: focus-pane, close-pane, pause-anchor, resume-anchor, detach-satellite, untag-anchor, rename-anchor, move-to-group
-- **AND** actions inapplicable to the pane's current state are shown as disabled
+Anchor rows SHALL activate workspaces and expose a small popover for metadata
+and lifecycle operations.
 
-#### Scenario: Action dispatches through AppState and bus
+#### Scenario: Left click activates anchor
 
-- **WHEN** the user triggers any context action
-- **THEN** the action is applied via the in-process state store, and any observable side effect (anchor state change, pane close, satellite detach) also emits a corresponding status event on the bus
+- **WHEN** the user left-clicks an anchor row
+- **THEN** that anchor becomes active
 
-### Requirement: Drag-to-reorder anchors within a group
+#### Scenario: Right click or more button opens popover
 
-The sidebar SHALL let the user reorder anchor rows within the same group via drag-and-drop; the new order MUST persist across redraws.
+- **WHEN** the user right-clicks a row, long-presses it, or clicks the more
+  button
+- **THEN** a popover opens for that anchor
 
-#### Scenario: Drop reassigns sort keys
+#### Scenario: Popover exposes implemented actions
 
-- **WHEN** the user drags an anchor row and drops it within the same group
-- **THEN** `sort_key` values are rewritten `0..N` reflecting the post-drop order; the sidebar re-renders in the new order and preserves it across redraws
+- **WHEN** the popover opens
+- **THEN** it shows the anchor UUID, editable name, editable group, `Pause` or
+  `Resume`, `Remove`, and `Apply`
 
-#### Scenario: Cross-group drops are ignored or moved explicitly
+### Requirement: Drag reorder within group
 
-- **WHEN** the user drops an anchor row into a different group
-- **THEN** either the drop is rejected (row snaps back) or a move-to-group action is applied with an explicit confirmation; in no case does the row silently disappear
+The sidebar SHALL let the user reorder anchors inside their current group.
 
-### Requirement: Mini-preview per pane row
+#### Scenario: Same-group drop rewrites sort keys
 
-The sidebar SHALL render a live mini-preview for each pane row, derived from the terminal's cell grid downsampled to one pixel per cell, refreshing on a configurable interval (default 750 ms).
+- **WHEN** an anchor row is dropped on another row in the same group
+- **THEN** lmux rewrites sort keys in the new order and refreshes the list
 
-#### Scenario: Preview updates at the configured interval
+#### Scenario: Cross-group drop ignored
 
-- **WHEN** a pane's terminal content changes and the preview interval elapses
-- **THEN** the pane row's `gtk::Picture` updates to reflect the new content
+- **WHEN** an anchor row is dropped on a row from another group
+- **THEN** the drop is ignored; the user must use the group field in the
+  popover to move groups
 
-#### Scenario: Preview refresh self-terminates on widget drop
+### Requirement: Mini previews
 
-- **WHEN** the sidebar row or the owning `AppState` is dropped
-- **THEN** the preview refresh timer detects the broken weak reference and unschedules itself
+The sidebar SHALL optionally show low-resolution previews for visible terminal
+anchor panes.
 
-### Requirement: Toast channel for system events
+#### Scenario: Preview renders immediately and refreshes
 
-The sidebar SHALL host a dedicated toast strip for non-modal system events with severity levels (info, warn, error), auto-dismiss, and a scrollable recent-events history.
+- **WHEN** previews are enabled
+- **THEN** each row attempts one immediate thumbnail render and then refreshes
+  on the configured interval, clamped to at least 100 ms
 
-#### Scenario: Toast shown on system event
+#### Scenario: Hidden or inactive workspace preview is blank
 
-- **WHEN** the cockpit fires an internal event (anchor crash, satellite fallback, config reload, compositor status change, first-run onboarding)
-- **THEN** a toast appears in the toast strip with timestamp, severity, message, and an optional one-click action
+- **WHEN** a pane is hidden or not in the active workspace
+- **THEN** the preview timer does not render that pane's thumbnail
 
-#### Scenario: Toast auto-dismiss and history
+#### Scenario: Timer self-terminates
 
-- **WHEN** a toast has been visible for 8 seconds without user interaction
-- **THEN** it is dismissed from the live strip but retained in a scrollable "recent events" list capped at 20 entries
+- **WHEN** the row or shared state has been dropped
+- **THEN** the preview refresh timer stops
 
-#### Scenario: Error recoverability is explicit
+### Requirement: Add-window picker
 
-- **WHEN** an error toast is surfaced
-- **THEN** the toast either names the recovery action inline or offers an expand affordance revealing the recovery action
+The sidebar SHALL expose native window attach through a modal picker.
 
-### Requirement: Tab-edge focus glow
+#### Scenario: Picker lists native candidates
 
-Every pane SHALL carry a tab-edge glow indicating focus state; the outgoing pane's glow fades out and the incoming pane's glow appears within one frame of any focus change.
+- **WHEN** the picker opens
+- **THEN** it asks the compositor backend for window candidates and renders a
+  row for each candidate
 
-#### Scenario: Focus change repaints glow within one frame
+#### Scenario: Picker previews windows best-effort
 
-- **WHEN** the user changes pane focus (keyboard or click)
-- **THEN** within one frame (~16 ms) the outgoing pane's focus glow fades and the incoming pane's glow appears
+- **WHEN** the compositor can capture a preview for a candidate
+- **THEN** the row replaces its fallback initials tile with that preview
+- **AND** preview failures only log debug output
 
-#### Scenario: Glow is subtle, not neon
+#### Scenario: Selecting candidate attaches to active workspace
 
-- **WHEN** the focus glow is rendered
-- **THEN** its width is at most 2 px and its alpha is at most 0.4; it MUST NOT dominate the pane contents
+- **WHEN** the user activates an unattached candidate row
+- **THEN** lmux sends the candidate through compositor validation and registers
+  the resulting window under the active anchor
+
+### Requirement: Settings dialog
+
+The application menu SHALL expose a settings dialog for the implemented config
+surface.
+
+#### Scenario: Settings loads config or defaults
+
+- **WHEN** the settings dialog opens
+- **THEN** it loads the config file if present or defaults if missing
+
+#### Scenario: Settings can save prefix and general config
+
+- **WHEN** the user applies valid settings
+- **THEN** lmux saves the TOML file, updates the shared prefix cell, and applies
+  config to live panes
+
+#### Scenario: Invalid prefix blocks save
+
+- **WHEN** the prefix entry is invalid
+- **THEN** the dialog shows an error and does not write the config

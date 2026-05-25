@@ -16,6 +16,7 @@
 //! `docs/history/v0.2-progress.md` notes around
 //! "paned drag freezes nested compositor".
 
+#![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::collapsible_match)]
 
 use std::os::fd::AsRawFd;

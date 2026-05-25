@@ -2,6 +2,11 @@
 
 Compact Nygard-style ADRs for lmux. One decision per file, numbered sequentially.
 
+Current behavior lives in [`../../openspec/specs/`](../../openspec/specs/).
+ADRs record why a direction was chosen at the time. Some older Accepted ADRs
+describe historical implementation plans that have since been superseded by the
+living capability specs or by later implementation work.
+
 ## Template
 
 ```
@@ -33,8 +38,8 @@ Compact Nygard-style ADRs for lmux. One decision per file, numbered sequentially
 
 - [ADR-0001](0001-rendering-stack.md) — Rendering stack: Rust + libghostty + GTK4 + portable-pty — **Accepted**
 - [ADR-0002](0002-anchor-satellites-bus.md) — Anchor + Satellites + Smart-open bus — **Accepted**
-- [ADR-0003](0003-path-a-spawn-and-track.md) — Path A: spawn-and-track (no Wayland reparenting) — **Accepted**
-- [ADR-0004](0004-compositor-control-trait.md) — CompositorControl trait: identify/control separation — **Accepted**
+- [ADR-0003](0003-path-a-spawn-and-track.md) — Historical Path A: spawn-and-track (no Wayland reparenting) — **Superseded**
+- [ADR-0004](0004-compositor-control-trait.md) — CompositorControl backend abstraction — **Accepted**
 
 ### Platform
 
@@ -51,16 +56,16 @@ Compact Nygard-style ADRs for lmux. One decision per file, numbered sequentially
 
 ### Operations / policy
 
-- [ADR-0012](0012-session-persistence-earn-it.md) — Session state persistence: earn it or drop — **Accepted**
+- [ADR-0012](0012-session-persistence-earn-it.md) — Session state persistence: earned snapshot layers — **Accepted**
 - [ADR-0013](0013-distribution-static-binary.md) — Distribution channel: static binary authoritative — **Accepted**
 - [ADR-0014](0014-product-name.md) — Product name — **Deferred**
 
 ### v0.2 — bus, satellites, compositor pivot
 
 - [ADR-0015](0015-lmux-bus-architecture.md) — lmux-bus architecture (transport, framing, kinds) — **Accepted**
-- [ADR-0016](0016-smart-open-event-set-v0.2.md) — Smart-open event set, v0.2 — **Accepted**
-- [ADR-0017](0017-compositor-control-v0.2-surface.md) — `CompositorControl` v0.2 method surface — **Accepted**
-- [ADR-0018](0018-nested-wayland-compositor-for-satellites.md) — Nested Wayland compositor for GUI satellites (smithay) — **Proposed**
+- [ADR-0016](0016-smart-open-event-set-v0.2.md) — lmux bus v0.2 kind catalog — **Accepted**
+- [ADR-0017](0017-compositor-control-v0.2-surface.md) — `CompositorControl` current method surface — **Accepted**
+- [ADR-0018](0018-nested-wayland-compositor-for-satellites.md) — Nested Wayland host for pane-native satellites — **Accepted**
 
 ### v0.2 — UX
 

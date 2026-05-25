@@ -47,7 +47,7 @@ pub fn open(anchor: &ApplicationWindow, state: &SharedAppState) {
     body.set_size_request(320, 280);
 
     let entry = Entry::new();
-    entry.set_placeholder_text(Some("Switch session…"));
+    entry.set_placeholder_text(Some("Switch session or workspace..."));
     body.append(&entry);
 
     let scroller = ScrolledWindow::new();
@@ -57,7 +57,10 @@ pub fn open(anchor: &ApplicationWindow, state: &SharedAppState) {
     scroller.set_child(Some(&list));
     body.append(&scroller);
 
-    let empty_label = Label::new(Some("(no sessions)"));
+    let empty_label = Label::new(Some(
+        "No saved sessions yet.\nAdvanced: lmux-cli session new <name>",
+    ));
+    empty_label.set_wrap(true);
     empty_label.add_css_class("dim-label");
 
     rebuild_rows(&list, &empty_label, &entries, "");

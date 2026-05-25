@@ -11,6 +11,67 @@ pub enum KeyAction {
     Write(Vec<u8>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutPlatform {
+    Default,
+    Macos,
+}
+
+impl ShortcutPlatform {
+    pub fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::Macos
+        } else {
+            Self::Default
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalShortcut {
+    Copy,
+    Paste,
+}
+
+pub fn classify_terminal_shortcut(
+    keyval: gdk::Key,
+    modifier: gdk::ModifierType,
+) -> Option<TerminalShortcut> {
+    classify_terminal_shortcut_for_platform(keyval, modifier, ShortcutPlatform::current())
+}
+
+pub fn classify_terminal_shortcut_for_platform(
+    keyval: gdk::Key,
+    modifier: gdk::ModifierType,
+    platform: ShortcutPlatform,
+) -> Option<TerminalShortcut> {
+    let ch = keyval.to_unicode()?.to_ascii_lowercase();
+    if has_control_shift(modifier) {
+        return match ch {
+            'c' => Some(TerminalShortcut::Copy),
+            'v' => Some(TerminalShortcut::Paste),
+            _ => None,
+        };
+    }
+    if platform == ShortcutPlatform::Macos && has_command(modifier) {
+        return match ch {
+            'c' => Some(TerminalShortcut::Copy),
+            'v' => Some(TerminalShortcut::Paste),
+            _ => None,
+        };
+    }
+    None
+}
+
+fn has_control_shift(modifier: gdk::ModifierType) -> bool {
+    let needed = gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK;
+    modifier.contains(needed)
+}
+
+fn has_command(modifier: gdk::ModifierType) -> bool {
+    modifier.intersects(gdk::ModifierType::META_MASK | gdk::ModifierType::SUPER_MASK)
+}
+
 /// Classify a GDK key press. Returns the action to execute on the focused pane.
 pub fn classify_key(keyval: gdk::Key, modifier: gdk::ModifierType, page_rows: u16) -> KeyAction {
     use gdk::Key;
@@ -65,6 +126,10 @@ mod tests {
         gdk::ModifierType::empty()
     }
 
+    fn ctrl_shift() -> gdk::ModifierType {
+        gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK
+    }
+
     #[test]
     fn page_up_scrolls_a_full_page() {
         let out = classify_key(gdk::Key::Page_Up, no_mods(), 24);
@@ -97,6 +162,66 @@ mod tests {
     fn ctrl_c_maps_to_0x03() {
         let bytes = translate_key(gdk::Key::c, gdk::ModifierType::CONTROL_MASK);
         assert_eq!(bytes, vec![0x03]);
+    }
+
+    #[test]
+    fn ctrl_shift_copy_paste_are_terminal_shortcuts_on_all_platforms() {
+        assert_eq!(
+            classify_terminal_shortcut_for_platform(
+                gdk::Key::c,
+                ctrl_shift(),
+                ShortcutPlatform::Default,
+            ),
+            Some(TerminalShortcut::Copy)
+        );
+        assert_eq!(
+            classify_terminal_shortcut_for_platform(
+                gdk::Key::V,
+                ctrl_shift(),
+                ShortcutPlatform::Macos,
+            ),
+            Some(TerminalShortcut::Paste)
+        );
+    }
+
+    #[test]
+    fn command_copy_paste_are_terminal_shortcuts_on_macos() {
+        assert_eq!(
+            classify_terminal_shortcut_for_platform(
+                gdk::Key::c,
+                gdk::ModifierType::META_MASK,
+                ShortcutPlatform::Macos,
+            ),
+            Some(TerminalShortcut::Copy)
+        );
+        assert_eq!(
+            classify_terminal_shortcut_for_platform(
+                gdk::Key::v,
+                gdk::ModifierType::SUPER_MASK,
+                ShortcutPlatform::Macos,
+            ),
+            Some(TerminalShortcut::Paste)
+        );
+    }
+
+    #[test]
+    fn command_copy_paste_are_not_terminal_shortcuts_on_default_platforms() {
+        assert_eq!(
+            classify_terminal_shortcut_for_platform(
+                gdk::Key::c,
+                gdk::ModifierType::META_MASK,
+                ShortcutPlatform::Default,
+            ),
+            None
+        );
+        assert_eq!(
+            classify_terminal_shortcut_for_platform(
+                gdk::Key::v,
+                gdk::ModifierType::SUPER_MASK,
+                ShortcutPlatform::Default,
+            ),
+            None
+        );
     }
 
     #[test]

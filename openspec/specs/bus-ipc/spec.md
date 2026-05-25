@@ -2,129 +2,138 @@
 
 ## Purpose
 
-Internal control plane for the cockpit: a Unix-socket bus at `$XDG_RUNTIME_DIR/lmux/bus.sock` speaking length-prefixed JSON with a versioned envelope. It lets a thin CLI client drive the running cockpit for session CRUD, `satellite.open`, anchor lifecycle, compositor ops, and status queries. Peer-authenticated to the cockpit UID, robust against stale sockets and malformed payloads.
+The cockpit exposes a local Unix-socket control bus at
+`$XDG_RUNTIME_DIR/lmux/bus.sock`. Frames are length-prefixed JSON envelopes.
+`lmux-cli` is the implemented user-facing client. The bus handles read-only
+queries on its Tokio thread and forwards cockpit mutations to the GTK main
+thread.
 
 ## Requirements
 
 ### Requirement: Length-prefixed JSON wire format
 
-The bus SHALL frame every message as a big-endian `u32` length followed by a JSON body; the maximum accepted frame is 4 MiB and oversized frames MUST be rejected without crashing the parser.
+Every bus message SHALL be framed as a big-endian `u32` length followed by one
+JSON body. The maximum accepted body is 4 MiB.
 
-#### Scenario: Valid frame round-trips across partial reads
+#### Scenario: Partial reads reassemble one frame
 
-- **WHEN** a client writes a frame of length N split across multiple `write` syscalls
-- **THEN** the server's reader reassembles exactly N bytes and decodes the JSON body; no frame boundaries are lost
+- **WHEN** a client writes one frame across multiple writes
+- **THEN** `read_frame` reassembles exactly the advertised body bytes
 
 #### Scenario: Oversize frame is rejected
 
-- **WHEN** a client sends a length header greater than 4 MiB
-- **THEN** the server closes the connection with `error.frame_too_large` and does not attempt to allocate the advertised buffer
+- **WHEN** a frame length is greater than 4 MiB
+- **THEN** the parser returns `FrameTooLarge` without allocating the advertised
+  body
 
-#### Scenario: Fuzz harness exists and passes
+### Requirement: Versioned envelope and handshake
 
-- **WHEN** `cargo fuzz run parse_frame` is invoked against `crates/lmux-bus/fuzz/fuzz_targets/parse_frame.rs`
-- **THEN** a 30-second corpus run completes without any crash, panic, or out-of-memory termination
+Every request SHALL carry `v`, `kind`, and `id`. Clients MUST send `hello`
+before any non-meta request.
 
-### Requirement: Versioned envelope with explicit handshake
+#### Scenario: Handshake succeeds
 
-Every bus message SHALL carry `{"v": 2, "kind": "...", "id": "<uuid>"}`, and a client MUST complete a `hello` → `hello_ack` handshake before any domain kind is dispatched.
+- **WHEN** a same-UID client connects and sends `hello`
+- **THEN** the server replies `hello_ack` with `cockpit_version`
+- **AND** later domain requests on the same connection are accepted
 
-#### Scenario: Handshake succeeds on matching version
+#### Scenario: Domain request before hello is rejected
 
-- **WHEN** a client opens a connection and sends `hello`
-- **THEN** the server replies `hello_ack` with `cockpit_version` and the connection becomes ready for domain kinds
+- **WHEN** a client sends any non-`hello` request before handshake completion
+- **THEN** the server replies with `error.bad_request`
 
-#### Scenario: Version mismatch is rejected
+#### Scenario: Unknown kind is structured
 
-- **WHEN** a client sends a frame with `v` other than `2`
-- **THEN** the server responds with `error.version_mismatch` and closes the connection before dispatching the payload
+- **WHEN** a request contains an unknown `kind`
+- **THEN** the server replies with `error.unknown_kind` and includes
+  `kind_received`
 
-#### Scenario: Unknown kinds are rejected
+### Requirement: Implemented kind schema
 
-- **WHEN** a client sends a frame whose `kind` is not present in the frozen schema
-- **THEN** the server responds with `error.unknown_kind` including a `kind_received` field
+The bus SHALL expose the kinds currently defined by `lmux_bus::Kind`.
 
-### Requirement: Frozen kind schema
+#### Scenario: Core read kinds are handled on the bus thread
 
-The bus SHALL expose the kind schema defined in ADR-0016: request/response kinds under `session.*`, `anchor.*`, `satellite.*`, `compositor.*`, plus meta kinds `hello`, `hello_ack`, `status.get`, generic `ok`, and `error.*`; unknown kinds are rejected deterministically.
+- **WHEN** a client sends `session.list`, `status.get`, or
+  `satellite.list_windows`
+- **THEN** the bus handler answers without borrowing GTK state except where the
+  compositor backend itself is queried
 
-#### Scenario: Every frozen kind round-trips through serde
+#### Scenario: GTK mutation kinds are deferred
 
-- **WHEN** `cargo test -p lmux-bus` runs the kinds module round-trip suite
-- **THEN** each defined kind serializes to JSON and deserializes back to an equal value; deny-list tests confirm unknown kinds fail to deserialize cleanly
+- **WHEN** a client sends `session.new`, `session.rename`, `session.delete`,
+  `session.open`, `pane.list`, `anchor.*`, or `satellite.attach_window`
+- **THEN** the request is sent to the GTK-thread dispatcher and the bus reply is
+  sent after that dispatcher resolves it
 
-#### Scenario: Required domain kinds are present
+#### Scenario: Unimplemented defined kinds fail explicitly
 
-- **WHEN** the bus server initializes
-- **THEN** it handles at minimum: `session.list`, `session.new`, `session.rename`, `session.delete`, `session.open`, `anchor.tag`, `anchor.untag`, `anchor.pause`, `anchor.resume`, `anchor.hide`, `anchor.reattach`, `satellite.open`, `compositor.status`, `status.get`
+- **WHEN** a defined kind has no dispatcher implementation
+- **THEN** the server returns a domain error beginning with `not_implemented`
 
-### Requirement: Peer authentication via SO_PEERCRED
+### Requirement: Peer authentication and socket lifecycle
 
-The bus socket SHALL be created with mode `0600` and MUST reject any connecting client whose UID does not match the cockpit's UID.
+The bus socket SHALL be same-UID only and SHALL manage stale socket files on
+startup.
 
-#### Scenario: Same-UID connection is accepted
+#### Scenario: Socket is private
 
-- **WHEN** a client process running under the cockpit's UID connects to `bus.sock`
-- **THEN** the connection completes and the handshake proceeds
+- **WHEN** the bus binds `bus.sock`
+- **THEN** the socket mode is set to `0600`
+- **AND** `bus.sock.pid` is written next to it
 
-#### Scenario: Cross-UID connection is denied
+#### Scenario: Same UID accepted
 
-- **WHEN** a client process running under a different UID connects
-- **THEN** the server reads `SO_PEERCRED`, sees the UID mismatch, and closes the connection with `error.peer_denied`
+- **WHEN** `SO_PEERCRED` reports the same UID as the cockpit
+- **THEN** the connection may proceed to handshake
 
-#### Scenario: Socket file mode is 0600
+#### Scenario: Cross UID denied
 
-- **WHEN** `ls -l $XDG_RUNTIME_DIR/lmux/bus.sock` is run while the cockpit is up
-- **THEN** the mode bits show `srw-------`
+- **WHEN** `SO_PEERCRED` reports a different UID
+- **THEN** the server writes `error.peer_denied` and closes the logical request
 
-### Requirement: Socket lifecycle and stale-socket recovery
+#### Scenario: Stale socket reclaimed
 
-The cockpit SHALL create `bus.sock` and a companion `bus.sock.pid` on startup, remove both on clean exit, and reclaim stale files on crash-restart without manual cleanup.
+- **WHEN** `bus.sock` and `bus.sock.pid` exist but the recorded PID is not live
+- **THEN** the server removes stale files and binds a fresh socket
 
-#### Scenario: Clean startup creates fresh socket
+### Requirement: `lmux-cli` client
 
-- **WHEN** the cockpit starts with no pre-existing bus files
-- **THEN** it creates `$XDG_RUNTIME_DIR/lmux/bus.sock` (mode 0600) and `bus.sock.pid` containing its own PID
+The implemented CLI binary SHALL be `lmux-cli`.
 
-#### Scenario: Stale socket is reclaimed
+#### Scenario: Session commands map to one bus kind
 
-- **WHEN** the cockpit starts and finds `bus.sock` + `bus.sock.pid` with a PID that no longer exists
-- **THEN** it unlinks both files and creates fresh ones, logging the reclaim at INFO
+- **WHEN** the user runs `lmux-cli session list`, `new`, `rename`, `delete`, or
+  `open`
+- **THEN** the CLI connects to the default bus socket, handshakes, sends the
+  matching `session.*` kind, and exits non-zero on bus errors
 
-#### Scenario: Refuse to start against a live cockpit
+#### Scenario: Anchor commands use UUIDs
 
-- **WHEN** the cockpit starts and `bus.sock.pid` references a PID still running
-- **THEN** it exits with a non-zero status and a clear diagnostic naming the other PID, leaving the existing cockpit undisturbed
+- **WHEN** the user runs `lmux-cli anchor pause|resume|hide|reattach|untag|activate <uuid>`
+- **THEN** the UUID is interpreted as an anchor UUID and resolved to the live
+  pane on the GTK thread
 
-### Requirement: Thin CLI client
+#### Scenario: Pane list exposes pane UUIDs
 
-The `lmux` binary SHALL expose a thin CLI that connects to the bus, performs the handshake, and implements every user-facing subcommand in terms of exactly one bus kind.
+- **WHEN** the user runs `lmux-cli pane list`
+- **THEN** the CLI prints each live pane UUID, optional anchor UUID, and
+  best-effort cwd
 
-#### Scenario: `lmux session list` round-trip
+#### Scenario: Native attach commands are available
 
-- **WHEN** the user runs `lmux session list`
-- **THEN** the CLI connects to `bus.sock`, handshakes, sends `session.list`, and pretty-prints a table of sessions; exit code is `0` on success
+- **WHEN** the user runs `lmux-cli satellite list-windows` or
+  `satellite attach-window`
+- **THEN** the request uses the implemented `satellite.list_windows` and
+  `satellite.attach_window` bus kinds
 
-#### Scenario: Machine-readable output
+### Requirement: Status snapshot
 
-- **WHEN** the user runs `lmux session list --json`
-- **THEN** the CLI emits a JSON document containing the server's response suitable for piping into `jq` or other shell tooling
+The bus SHALL expose a compact `status.get.result` snapshot.
 
-#### Scenario: Missing cockpit yields a clear error
+#### Scenario: Status fields match implementation
 
-- **WHEN** the user runs any non-launch `lmux` subcommand with no cockpit process running
-- **THEN** the CLI exits non-zero with a stderr message identifying the absent cockpit and pointing at the expected socket path
-
-### Requirement: Hostile input safety
-
-The bus SHALL never panic, crash, or leak unbounded memory from malformed input at any frame size up to the declared maximum.
-
-#### Scenario: Malformed JSON is rejected per message
-
-- **WHEN** a connected client sends a syntactically valid frame containing invalid JSON
-- **THEN** the server responds with `error.malformed_body`, keeps the connection open, and awaits the next frame
-
-#### Scenario: Schema-violating payloads are rejected
-
-- **WHEN** a client sends JSON whose shape does not match the declared kind
-- **THEN** the server responds with `error.schema_violation` naming the failing field; no dispatch occurs
+- **WHEN** a client sends `status.get`
+- **THEN** the response includes `cockpit_version`, `pid`, `session_count`,
+  `anchor_count`, `compositor`, `satellite_spawn_ok`, and
+  `satellite_spawn_fail`

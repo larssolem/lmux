@@ -34,4 +34,4 @@ They are **read-only reference**. For current requirements, consult `openspec/sp
 - Epics files (11-epic decomposition for v0.2) — fully superseded by `openspec/specs/` + `openspec/changes/`.
 - Architecture docs (v0.1 + v0.2) — superseded by ADRs under `docs/adr/` plus the `## Purpose` sections of each capability spec.
 - Prior-version drafts of PRD/epics/brief that were superseded before v0.2 shipped.
-- `_bmad/` framework tree — BMad Method config was the planning tool, not a lmux artifact.
+- Planning-tool framework config trees — removed because they were not lmux artifacts.

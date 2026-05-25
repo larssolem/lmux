@@ -313,8 +313,8 @@ Before locking the roadmap with any real confidence, prototype these (1–3 days
 ### Recommended Next Steps
 
 1. **Run the 4 validation spikes** before committing to the roadmap. 1–3 days each, ~2 weeks total.
-2. **Create a Product Brief** (consider the `bmad-product-brief` skill) capturing this session's synthesis — differentiators, taste filters, roadmap.
-3. **Create a PRD** (consider the `bmad-create-prd` skill) focused specifically on v0.1 scope — one detailed document per release, not a monster all-versions PRD.
+2. **Create a Product Brief** capturing this session's synthesis — differentiators, taste filters, roadmap.
+3. **Create a PRD** focused specifically on v0.1 scope — one detailed document per release, not a monster all-versions PRD.
 4. **Set up the Rust project** with libghostty FFI as the first integration test. v0.1 starts the moment the FFI demo renders one PTY.
 5. **Name decision** — do a short brand/name pass if "lmux" isn't final. Matters for public communication but not for building.
 
@@ -338,4 +338,3 @@ Before locking the roadmap with any real confidence, prototype these (1–3 days
 
 **Energy Flow:**
 - High through Phase 1 and 2, focused through Phase 3, decisive through Phase 4. Never depleted; just concluded cleanly.
-

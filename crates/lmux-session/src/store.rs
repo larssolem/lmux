@@ -88,6 +88,7 @@ impl SessionStore {
 
     /// Rename a session. FR2.
     pub fn rename(&self, from: &str, to: &str) -> Result<(), StoreError> {
+        validate_name(from)?;
         validate_name(to)?;
         let src = self.session_path(from);
         let dst = self.session_path(to);
@@ -111,6 +112,7 @@ impl SessionStore {
 
     /// Delete a session. FR3. No-op if missing.
     pub fn delete(&self, name: &str) -> Result<(), StoreError> {
+        validate_name(name)?;
         let p = self.session_path(name);
         if p.exists() {
             std::fs::remove_file(&p)?;
@@ -125,6 +127,7 @@ impl SessionStore {
     /// `<name>.toml.bad.<ts>` and an empty session with the same name is
     /// returned; FR62 (corruption never blocks startup).
     pub fn load(&self, name: &str) -> Result<Session, StoreError> {
+        validate_name(name)?;
         let path = self.session_path(name);
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
@@ -348,6 +351,31 @@ mod tests {
                 matches!(err, StoreError::InvalidName { .. }),
                 "name: {bad:?}"
             );
+        }
+    }
+
+    #[test]
+    fn unsafe_names_are_rejected_for_all_path_based_operations() {
+        let store = SessionStore::new(tempdir());
+        store.create("alpha", 100).unwrap();
+
+        for bad in ["../escape", "nested/name", ".hidden", "has space"] {
+            assert!(matches!(
+                store.load(bad),
+                Err(StoreError::InvalidName { .. })
+            ));
+            assert!(matches!(
+                store.delete(bad),
+                Err(StoreError::InvalidName { .. })
+            ));
+            assert!(matches!(
+                store.rename(bad, "beta"),
+                Err(StoreError::InvalidName { .. })
+            ));
+            assert!(matches!(
+                store.rename("alpha", bad),
+                Err(StoreError::InvalidName { .. })
+            ));
         }
     }
 

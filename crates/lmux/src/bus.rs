@@ -17,7 +17,7 @@ use std::thread;
 
 use async_trait::async_trait;
 use lmux_bus::{
-    kinds::CompositorState,
+    kinds::{CompositorState, WindowCandidate},
     paths::{bus_pid_path, bus_socket_path},
     BusError, Kind, PaneSummary, Server, SessionSummary, StatusSnapshot,
 };
@@ -25,6 +25,13 @@ use lmux_compositor::{CompositorControl, Health};
 use tokio::sync::oneshot;
 
 use crate::state::SharedAppState;
+
+#[derive(Clone)]
+pub struct SatelliteCounters {
+    #[allow(dead_code)]
+    pub spawn_ok: Arc<AtomicU32>,
+    pub spawn_fail: Arc<AtomicU32>,
+}
 
 /// Envelope posted from the tokio bus thread to the GTK main thread for
 /// kinds that need cockpit state. The oneshot sender carries the reply
@@ -67,14 +74,7 @@ impl lmux_bus::Handler for LmuxBusHandler {
         match req {
             Kind::SessionList {} => self.handle_session_list().await,
             Kind::StatusGet {} => self.handle_status_get().await,
-            Kind::SatelliteOpen {
-                argv,
-                target_pane,
-                no_sandbox,
-            } => {
-                self.handle_satellite_open(argv, target_pane, no_sandbox)
-                    .await
-            }
+            Kind::SatelliteListWindows {} => self.handle_satellite_list_windows().await,
             other => self.dispatch_to_gtk(other).await,
         }
     }
@@ -158,38 +158,21 @@ impl LmuxBusHandler {
         }))
     }
 
-    /// Satellite spawn (Epic 9). Runs on the tokio bus thread so the child
-    /// fork doesn't block the GTK loop. `target_pane` and `no_sandbox` are
-    /// accepted on the wire but not yet wired through to the compositor
-    /// script — for v0.2 we only guarantee the child process gets launched
-    /// with an `LMUX_SATELLITE_ID` tag; docking (geometry / detach) arrives
-    /// with v0.3 once the KWin script echoes a `satellite.map`.
-    async fn handle_satellite_open(
-        &self,
-        argv: Vec<String>,
-        _target_pane: uuid::Uuid,
-        _no_sandbox: bool,
-    ) -> Result<Kind, BusError> {
-        if argv.is_empty() {
-            self.ctx
-                .satellite_spawn_fail
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(BusError::Domain("satellite.open: argv is empty".into()));
+    async fn handle_satellite_list_windows(&self) -> Result<Kind, BusError> {
+        let caps = self.ctx.compositor.window_control_capabilities();
+        if !caps.list_windows {
+            return Err(BusError::Domain(
+                "satellite.list_windows: native window listing is not supported by this compositor"
+                    .into(),
+            ));
         }
-        match self.ctx.compositor.spawn_satellite(&argv, None).await {
-            Ok(_request_id) => {
-                self.ctx.satellite_spawn_ok.fetch_add(1, Ordering::Relaxed);
-                Ok(Kind::Ok {
-                    of: Some("satellite.open".into()),
-                })
-            }
-            Err(err) => {
-                self.ctx
-                    .satellite_spawn_fail
-                    .fetch_add(1, Ordering::Relaxed);
-                Err(BusError::Domain(format!("satellite.open: {err}")))
-            }
-        }
+        let windows = self
+            .ctx
+            .compositor
+            .list_windows()
+            .await
+            .map_err(|err| BusError::Domain(format!("satellite.list_windows: {err}")))?;
+        Ok(Kind::SatelliteListWindowsResult { windows })
     }
 }
 
@@ -205,17 +188,22 @@ pub async fn run_dispatcher(
     rx: DeferredRequestReceiver,
     store_root: std::path::PathBuf,
     state: SharedAppState,
+    compositor: Arc<dyn CompositorControl>,
+    satellite_counters: SatelliteCounters,
 ) {
     while let Ok((req, resp_tx)) = rx.recv().await {
-        let result = handle_deferred(req, &store_root, &state);
+        let result =
+            handle_deferred(req, &store_root, &state, &compositor, &satellite_counters).await;
         let _ = resp_tx.send(result);
     }
 }
 
-fn handle_deferred(
+async fn handle_deferred(
     req: Kind,
     store_root: &std::path::Path,
     state: &SharedAppState,
+    compositor: &Arc<dyn CompositorControl>,
+    satellite_counters: &SatelliteCounters,
 ) -> Result<Kind, BusError> {
     match req {
         Kind::AnchorPause { pane_id } => {
@@ -334,6 +322,120 @@ fn handle_deferred(
             st.add_anchor(pid);
             Ok(Kind::Ok {
                 of: Some("anchor.tag".into()),
+            })
+        }
+        Kind::AnchorNew {} => {
+            let mut st = state.borrow_mut();
+            st.create_new_anchor();
+            Ok(Kind::Ok {
+                of: Some("anchor.new".into()),
+            })
+        }
+        Kind::AnchorActivate { pane_id } => {
+            let mut st = state.borrow_mut();
+            let pid = st.pane_for_anchor_id(pane_id).ok_or_else(|| {
+                BusError::Domain(format!("anchor.activate: unknown anchor {pane_id}"))
+            })?;
+            st.set_active_anchor(Some(pid));
+            Ok(Kind::Ok {
+                of: Some("anchor.activate".into()),
+            })
+        }
+        Kind::SatelliteOpen {
+            argv,
+            target_pane: _,
+            no_sandbox: _,
+        } => {
+            #[cfg(target_os = "macos")]
+            {
+                let _ = argv;
+                satellite_counters
+                    .spawn_fail
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(BusError::Domain(
+                    "satellite.open is disabled on macOS; focus a native window and use satellite.attach_focused".into(),
+                ));
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                if argv.is_empty() {
+                    satellite_counters
+                        .spawn_fail
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(BusError::Domain("satellite.open: argv is empty".into()));
+                }
+                match lmux_compositor::spawn::spawn_tagged_with_env(&argv, None, None) {
+                    Ok((request_id, pid)) => {
+                        satellite_counters.spawn_ok.fetch_add(1, Ordering::Relaxed);
+                        tracing::info!(
+                            pid,
+                            %request_id,
+                            "satellite.open: launched external app without ownership; use satellite.attach_window to manage it"
+                        );
+                        Ok(Kind::Ok {
+                            of: Some("satellite.open".into()),
+                        })
+                    }
+                    Err(err) => {
+                        satellite_counters
+                            .spawn_fail
+                            .fetch_add(1, Ordering::Relaxed);
+                        Err(BusError::Domain(format!("satellite.open: {err}")))
+                    }
+                }
+            }
+        }
+        Kind::SatelliteAttachFocused {} => {
+            #[cfg(target_os = "macos")]
+            {
+                let mut st = state.borrow_mut();
+                st.attach_focused_macos_window_to_active_anchor()
+                    .map_err(|err| BusError::Domain(format!("satellite.attach_focused: {err}")))?;
+                Ok(Kind::Ok {
+                    of: Some("satellite.attach_focused".into()),
+                })
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err(BusError::Domain(
+                    "satellite.attach_focused: macOS only".into(),
+                ))
+            }
+        }
+        Kind::SatelliteAttachWindow {
+            backend,
+            backend_window_id,
+            pid,
+            app_identity,
+            title,
+            workspace,
+            output,
+        } => {
+            let caps = compositor.window_control_capabilities();
+            if !caps.attach_window {
+                return Err(BusError::Domain(
+                    "satellite.attach_window: native window attachment is not supported by this compositor"
+                        .into(),
+                ));
+            }
+            let candidate = WindowCandidate {
+                backend,
+                backend_window_id,
+                pid,
+                app_identity,
+                title,
+                workspace,
+                output,
+            };
+            let window = compositor
+                .attach_window(&candidate)
+                .await
+                .map_err(|err| BusError::Domain(format!("satellite.attach_window: {err}")))?;
+            let mut st = state.borrow_mut();
+            st.attach_native_window_to_active_anchor(&candidate, window)
+                .map_err(|err| BusError::Domain(format!("satellite.attach_window: {err}")))?;
+            Ok(Kind::Ok {
+                of: Some("satellite.attach_window".into()),
             })
         }
         other => Err(BusError::Domain(format!(

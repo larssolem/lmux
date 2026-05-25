@@ -12,7 +12,7 @@
 //! ```toml
 //! [general]
 //! font_family = "JetBrains Mono"
-//! font_size = 11
+//! font_size = 11 # macOS default: 13
 //!
 //! [keymap]
 //! prefix = "ctrl+b"
@@ -85,8 +85,25 @@ pub enum FocusMode {
 fn default_font_family() -> String {
     "JetBrains Mono".into()
 }
+
+#[cfg(test)]
+fn default_font_family_name() -> &'static str {
+    "JetBrains Mono"
+}
+
 fn default_font_size() -> u32 {
-    11
+    #[cfg(target_os = "macos")]
+    {
+        13
+    }
+    #[cfg(target_os = "linux")]
+    {
+        11
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        11
+    }
 }
 
 /// Keymap — v0.2 scopes this to the prefix key per the Norwegian-keyboard
@@ -274,6 +291,16 @@ pub fn load(path: &Path) -> Result<Config, LoadError> {
     })
 }
 
+/// Persist a complete config. Parent directory is created if needed.
+pub fn save(path: &Path, cfg: &Config) -> Result<(), LoadError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let text = toml::to_string_pretty(cfg)?;
+    std::fs::write(path, text)?;
+    Ok(())
+}
+
 /// Load `path`, or if it doesn't exist, write defaults there and return
 /// them. Parent directory is created if needed. FR59: first-run behaviour
 /// must not surprise the user — we leave a file they can edit.
@@ -285,8 +312,7 @@ pub fn load_or_provision(path: &Path) -> Result<(Config, ProvisionOutcome), Load
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let text = toml::to_string_pretty(&cfg)?;
-    std::fs::write(path, text)?;
+    save(path, &cfg)?;
     tracing::info!(path = %path.display(), "wrote default lmux config");
     Ok((cfg, ProvisionOutcome::Provisioned))
 }
@@ -304,6 +330,7 @@ mod tests {
     #[test]
     fn defaults_roundtrip_through_toml() {
         let cfg = Config::default();
+        assert_eq!(cfg.general.font_family, default_font_family_name());
         let s = toml::to_string_pretty(&cfg).unwrap();
         let back: Config = toml::from_str(&s).unwrap();
         assert_eq!(cfg, back);
@@ -330,6 +357,21 @@ mod tests {
         // Second call is a plain load.
         let (_, outcome2) = load_or_provision(&path).unwrap();
         assert_eq!(outcome2, ProvisionOutcome::Loaded);
+    }
+
+    #[test]
+    fn save_persists_updated_font_settings() {
+        let dir = tempdir();
+        let path = dir.join("config.toml");
+        let mut cfg = Config::default();
+        cfg.general.font_family = "Fira Code".into();
+        cfg.general.font_size = 16;
+
+        save(&path, &cfg).unwrap();
+
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.general.font_family, "Fira Code");
+        assert_eq!(loaded.general.font_size, 16);
     }
 
     #[test]

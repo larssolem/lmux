@@ -10,16 +10,23 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod kwin;
+pub mod macos;
 pub mod noop;
 pub mod spawn;
+pub mod x11;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
 pub use kwin::KwinCompositor;
+pub use lmux_bus::kinds::{WindowAppIdentity, WindowCandidate, WindowCandidateBackend};
+pub use macos::MacWindowCompositor;
 pub use noop::NoopCompositor;
+pub use x11::X11Compositor;
 
 /// Rect in compositor screen coordinates. Mirrors [`lmux_bus::kinds::Rect`]
 /// intentionally — the trait level does not depend on the bus types so that
@@ -36,6 +43,150 @@ pub struct Rect {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowId(pub String);
 
+/// Backend namespace for a managed satellite window identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowBackend {
+    Kwin,
+    X11,
+    Hyprland,
+    Sway,
+    Macos,
+    Noop,
+    Unknown(String),
+}
+
+impl From<&WindowCandidateBackend> for WindowBackend {
+    fn from(value: &WindowCandidateBackend) -> Self {
+        match value {
+            WindowCandidateBackend::Macos => Self::Macos,
+            WindowCandidateBackend::Kwin => Self::Kwin,
+            WindowCandidateBackend::X11 => Self::X11,
+            WindowCandidateBackend::Hyprland => Self::Hyprland,
+            WindowCandidateBackend::Sway => Self::Sway,
+            WindowCandidateBackend::Noop => Self::Noop,
+            WindowCandidateBackend::Unsupported => Self::Unknown("unsupported".into()),
+        }
+    }
+}
+
+/// Stable cross-backend identity for one GUI satellite window.
+///
+/// PID-only matching is enough for the current KWin visibility path, but
+/// macOS needs per-window identity because single-instance apps can own
+/// windows for multiple anchors in the same process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SatelliteWindowId {
+    pub backend: WindowBackend,
+    pub request_id: Option<Uuid>,
+    pub pid: Option<u32>,
+    pub backend_window_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+impl SatelliteWindowId {
+    pub fn for_attached(candidate: &WindowCandidate) -> Self {
+        Self {
+            backend: WindowBackend::from(&candidate.backend),
+            request_id: None,
+            pid: candidate.pid,
+            backend_window_id: candidate.backend_window_id.clone(),
+            bundle_id: match &candidate.app_identity {
+                Some(WindowAppIdentity::BundleId(value)) => Some(value.clone()),
+                _ => None,
+            },
+            title: candidate.title.clone(),
+        }
+    }
+
+    pub fn for_pid(backend: WindowBackend, pid: u32) -> Self {
+        Self {
+            backend,
+            request_id: None,
+            pid: Some(pid),
+            backend_window_id: format!("pid:{pid}"),
+            bundle_id: None,
+            title: None,
+        }
+    }
+
+    pub fn for_spawn(backend: WindowBackend, request_id: Uuid, pid: u32) -> Self {
+        Self {
+            backend,
+            request_id: Some(request_id),
+            pid: Some(pid),
+            backend_window_id: format!("pid:{pid}"),
+            bundle_id: None,
+            title: None,
+        }
+    }
+
+    pub fn for_spawn_with_bundle(
+        backend: WindowBackend,
+        request_id: Uuid,
+        pid: u32,
+        bundle_id: Option<String>,
+    ) -> Self {
+        Self {
+            backend,
+            request_id: Some(request_id),
+            pid: Some(pid),
+            backend_window_id: format!("pid:{pid}"),
+            bundle_id,
+            title: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FocusPolicy {
+    Terminal,
+    LastSatellite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowGroupSwitch {
+    pub hide: Vec<SatelliteWindowId>,
+    pub show: Vec<SatelliteWindowId>,
+    pub focus_policy: FocusPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowOpResult {
+    pub window: SatelliteWindowId,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WindowControlCapabilities {
+    pub list_windows: bool,
+    pub attach_window: bool,
+    pub set_visible: bool,
+    pub raise_window: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowPreviewData {
+    EncodedImage(Vec<u8>),
+    Bgra {
+        width: u32,
+        height: u32,
+        bytes_per_row: usize,
+        data: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowPreview {
+    pub data: WindowPreviewData,
+}
+
 /// Health status reported by [`CompositorControl::health`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Health {
@@ -51,6 +202,8 @@ pub enum Health {
 /// onto a user-visible "re-inject" toast (FR14).
 #[derive(Debug, Error)]
 pub enum CompositorError {
+    #[error("unsupported compositor operation: {0}")]
+    Unsupported(String),
     #[error("compositor script not loaded")]
     ScriptMissing,
     #[error("compositor offline: {0}")]
@@ -74,6 +227,13 @@ pub trait CompositorControl: Send + Sync {
     /// Probe compositor health. MUST NOT have side effects.
     async fn health(&self) -> Health;
 
+    /// Capability report for native-window operations. Unsupported window
+    /// managers should return false for unsupported actions while keeping
+    /// terminal/session behavior alive.
+    fn window_control_capabilities(&self) -> WindowControlCapabilities {
+        WindowControlCapabilities::default()
+    }
+
     /// Spawn `argv` with an lmux tag, and return the request id the
     /// compositor will echo back via `satellite.map` when the new window
     /// appears. Returning `Ok` does NOT mean the window is visible yet —
@@ -94,6 +254,46 @@ pub trait CompositorControl: Send + Sync {
     /// Re-attach a previously detached satellite.
     async fn attach(&self, window: &WindowId) -> Result<(), CompositorError>;
 
+    /// List native windows that can be explicitly attached.
+    async fn list_windows(&self) -> Result<Vec<WindowCandidate>, CompositorError> {
+        Err(CompositorError::Unsupported(
+            "native window listing is not supported by this compositor".into(),
+        ))
+    }
+
+    /// Best-effort preview image for a native attach candidate. Backends
+    /// should return `Ok(None)` when the platform does not support previews
+    /// or when user/session policy denies screenshots.
+    async fn window_preview(
+        &self,
+        _candidate: &WindowCandidate,
+        _max_width: u32,
+        _max_height: u32,
+    ) -> Result<Option<WindowPreview>, CompositorError> {
+        Ok(None)
+    }
+
+    /// Validate and convert an attach candidate into the managed satellite
+    /// identity stored by AppState.
+    async fn attach_window(
+        &self,
+        candidate: &WindowCandidate,
+    ) -> Result<SatelliteWindowId, CompositorError> {
+        if candidate.backend_window_id.trim().is_empty() {
+            return Err(CompositorError::Domain(
+                "native window candidate has no backend window id".into(),
+            ));
+        }
+        Ok(SatelliteWindowId::for_attached(candidate))
+    }
+
+    /// Raise or focus a native window when the backend supports it.
+    async fn raise_window(&self, _window: &SatelliteWindowId) -> Result<(), CompositorError> {
+        Err(CompositorError::Unsupported(
+            "native window raise/focus is not supported by this compositor".into(),
+        ))
+    }
+
     /// Show or hide the compositor window whose PID matches `pid`. Used by
     /// the cockpit to tie satellite lifetimes to the active anchor: on
     /// anchor switch, windows owned by the incoming anchor are shown and
@@ -107,6 +307,83 @@ pub trait CompositorControl: Send + Sync {
     ) -> Result<(), CompositorError> {
         Ok(())
     }
+
+    /// Show or hide a specific managed satellite window. New backends should
+    /// implement this identity-based method; the default preserves the
+    /// existing PID path for KWin and Noop.
+    async fn set_window_visible(
+        &self,
+        window: &SatelliteWindowId,
+        visible: bool,
+    ) -> Result<(), CompositorError> {
+        if let Some(pid) = window.pid {
+            self.set_window_visible_by_pid(pid, visible).await
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Apply an anchor switch as one group operation. Backends with native
+    /// batching (macOS helper) can override; the default runs each window
+    /// operation independently and returns per-window results.
+    async fn apply_window_group_switch(
+        &self,
+        switch: WindowGroupSwitch,
+    ) -> Result<Vec<WindowOpResult>, CompositorError> {
+        let mut out = Vec::with_capacity(switch.hide.len() + switch.show.len());
+        for window in switch.hide {
+            let result = self.set_window_visible(&window, false).await;
+            out.push(WindowOpResult {
+                window,
+                ok: result.is_ok(),
+                error: result.err().map(|e| e.to_string()),
+            });
+        }
+        for window in switch.show {
+            let result = self.set_window_visible(&window, true).await;
+            out.push(WindowOpResult {
+                window,
+                ok: result.is_ok(),
+                error: result.err().map(|e| e.to_string()),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Apply a grouped switch with latest-wins cancellation context. The
+    /// default implementation checks the shared sequence before each window
+    /// operation so stale work stops as soon as possible.
+    async fn apply_window_group_switch_latest(
+        &self,
+        switch: WindowGroupSwitch,
+        sequence: u64,
+        latest_sequence: Arc<AtomicU64>,
+    ) -> Result<Vec<WindowOpResult>, CompositorError> {
+        let mut out = Vec::with_capacity(switch.hide.len() + switch.show.len());
+        for window in switch.hide {
+            if latest_sequence.load(Ordering::Relaxed) > sequence {
+                break;
+            }
+            let result = self.set_window_visible(&window, false).await;
+            out.push(WindowOpResult {
+                window,
+                ok: result.is_ok(),
+                error: result.err().map(|e| e.to_string()),
+            });
+        }
+        for window in switch.show {
+            if latest_sequence.load(Ordering::Relaxed) > sequence {
+                break;
+            }
+            let result = self.set_window_visible(&window, true).await;
+            out.push(WindowOpResult {
+                window,
+                ok: result.is_ok(),
+                error: result.err().map(|e| e.to_string()),
+            });
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -114,11 +391,65 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use std::sync::atomic::AtomicU64;
+    use tokio::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingCompositor {
+        visible: Mutex<Vec<(String, bool)>>,
+    }
+
+    #[async_trait]
+    impl CompositorControl for RecordingCompositor {
+        async fn ensure_script_loaded(&self) -> Result<(), CompositorError> {
+            Ok(())
+        }
+
+        async fn health(&self) -> Health {
+            Health::Online
+        }
+
+        async fn spawn_satellite(
+            &self,
+            _argv: &[String],
+            _cwd: Option<&str>,
+        ) -> Result<Uuid, CompositorError> {
+            Ok(Uuid::from_u128(1))
+        }
+
+        async fn set_geometry(
+            &self,
+            _window: &WindowId,
+            _rect: Rect,
+        ) -> Result<(), CompositorError> {
+            Ok(())
+        }
+
+        async fn detach(&self, _window: &WindowId) -> Result<(), CompositorError> {
+            Ok(())
+        }
+
+        async fn attach(&self, _window: &WindowId) -> Result<(), CompositorError> {
+            Ok(())
+        }
+
+        async fn set_window_visible(
+            &self,
+            window: &SatelliteWindowId,
+            visible: bool,
+        ) -> Result<(), CompositorError> {
+            self.visible
+                .lock()
+                .await
+                .push((window.backend_window_id.clone(), visible));
+            Ok(())
+        }
+    }
 
     #[tokio::test]
-    async fn noop_compositor_health_reports_online() {
+    async fn noop_compositor_health_reports_offline() {
         let c = NoopCompositor::default();
-        assert_eq!(c.health().await, Health::Online);
+        assert!(matches!(c.health().await, Health::Offline { .. }));
     }
 
     #[tokio::test]
@@ -132,6 +463,31 @@ mod tests {
             .unwrap();
         // Non-nil: trait guarantees callers can correlate.
         assert_ne!(id, Uuid::nil());
+    }
+
+    #[test]
+    fn satellite_window_id_for_spawn_keeps_request_id_and_pid() {
+        let request_id = Uuid::from_u128(42);
+        let window = SatelliteWindowId::for_spawn(WindowBackend::Macos, request_id, 123);
+
+        assert_eq!(window.backend, WindowBackend::Macos);
+        assert_eq!(window.request_id, Some(request_id));
+        assert_eq!(window.pid, Some(123));
+        assert_eq!(window.backend_window_id, "pid:123");
+    }
+
+    #[test]
+    fn satellite_window_id_for_spawn_can_keep_bundle_id() {
+        let request_id = Uuid::from_u128(43);
+        let window = SatelliteWindowId::for_spawn_with_bundle(
+            WindowBackend::Macos,
+            request_id,
+            123,
+            Some("com.microsoft.VSCode".into()),
+        );
+
+        assert_eq!(window.request_id, Some(request_id));
+        assert_eq!(window.bundle_id.as_deref(), Some("com.microsoft.VSCode"));
     }
 
     #[tokio::test]
@@ -151,5 +507,26 @@ mod tests {
             .await
             .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn latest_group_switch_skips_stale_sequence() {
+        let c = RecordingCompositor::default();
+        let latest = Arc::new(AtomicU64::new(2));
+        let result = c
+            .apply_window_group_switch_latest(
+                WindowGroupSwitch {
+                    hide: vec![SatelliteWindowId::for_pid(WindowBackend::Macos, 1)],
+                    show: vec![SatelliteWindowId::for_pid(WindowBackend::Macos, 2)],
+                    focus_policy: FocusPolicy::Terminal,
+                },
+                1,
+                latest,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_empty());
+        assert!(c.visible.lock().await.is_empty());
     }
 }

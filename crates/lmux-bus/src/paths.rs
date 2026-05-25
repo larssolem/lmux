@@ -4,16 +4,30 @@ use std::path::PathBuf;
 
 use crate::error::BusError;
 
-/// Resolve `$XDG_RUNTIME_DIR/lmux/bus.sock`. Errors if `$XDG_RUNTIME_DIR`
-/// is unset (server cannot safely pick a default — running-user state must
-/// live under the per-session runtime dir).
+/// Resolve the lmux bus socket path.
+///
+/// Linux follows `$XDG_RUNTIME_DIR/lmux/bus.sock`. macOS commonly has no
+/// `XDG_RUNTIME_DIR`, so fall back to a user-private directory under
+/// `$TMPDIR` (or `/tmp`) while keeping the same `lmux/bus.sock` suffix.
 pub fn bus_socket_path() -> Result<PathBuf, BusError> {
-    match std::env::var("XDG_RUNTIME_DIR") {
-        Ok(s) if !s.is_empty() => Ok(PathBuf::from(s).join("lmux").join("bus.sock")),
-        _ => Err(BusError::Domain(
-            "$XDG_RUNTIME_DIR is not set; cannot resolve bus.sock path".into(),
-        )),
+    if let Ok(s) = std::env::var("XDG_RUNTIME_DIR") {
+        if !s.is_empty() {
+            return Ok(PathBuf::from(s).join("lmux").join("bus.sock"));
+        }
     }
+    #[cfg(target_os = "macos")]
+    {
+        let base = std::env::var_os("TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        return Ok(base
+            .join(format!("lmux-{}", unsafe { libc::getuid() }))
+            .join("bus.sock"));
+    }
+    #[cfg(not(target_os = "macos"))]
+    Err(BusError::Domain(
+        "$XDG_RUNTIME_DIR is not set; cannot resolve bus.sock path".into(),
+    ))
 }
 
 /// Companion pid-file path, `bus.sock.pid`, used for stale-socket recovery.

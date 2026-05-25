@@ -2,176 +2,184 @@
 
 ## Purpose
 
-Bring GUI applications (JetBrains IDE, browser, Figma) into the cockpit as "satellites" bound to a pane. Two docking paths coexist: (1) on KWin, spawn a process with a unique `WM_CLASS`, correlate via bus events, and nudge it into place with a one-shot KWin script; (2) everywhere, a nested Wayland host (smithay) renders satellite toplevels into `SatelliteWidget`s inside the cockpit window. Sandboxed by default via bubblewrap with a safe escape hatch. A `.desktop`-aware GUI launcher exposes the feature to the user.
+A satellite is an app/window associated with an anchor workspace. The current
+product model is explicit attach first: the user opens native app windows where
+they want them, then adds the exact window to the active workspace. On anchor
+switch, lmux asks the compositor backend to hide/show or raise the attached
+windows. lmux does not own monitor placement.
+
+Linux also contains an experimental nested-Wayland satellite path and a legacy
+spawn path, but explicit native window attach is the reliable current workflow.
 
 ## Requirements
 
-### Requirement: `lmux open` launches a docked satellite
+### Requirement: Explicit native window listing
 
-The user SHALL spawn a satellite targeting the focused pane via `lmux open <app> [args...]`; the CLI MUST return immediately after a handshake without blocking on the docking result.
+The cockpit SHALL list native windows when the active compositor backend
+supports it.
 
-#### Scenario: CLI handshake returns a request id
+#### Scenario: Sidebar add-window button opens picker
 
-- **WHEN** the user runs `lmux open kate` with a running cockpit and a focused pane
-- **THEN** the CLI sends `satellite.open { argv: ["kate"], target_pane: <id> }` on the bus, receives a `request_id` in the ack, and exits `0` immediately
+- **WHEN** the backend reports `attach_window = true`
+- **THEN** the sidebar header shows an enabled add-window button
+- **AND** clicking it opens a modal "Add window" picker
 
-#### Scenario: Missing cockpit yields a clear error
+#### Scenario: Unsupported backend disables picker
 
-- **WHEN** the user runs `lmux open kate` with no cockpit running
-- **THEN** the CLI exits non-zero with a diagnostic naming the absent cockpit and suggesting `lmux` be started first
+- **WHEN** the backend cannot attach native windows
+- **THEN** the add-window button is disabled with a tooltip explaining that
+  native window attach is unavailable
 
-### Requirement: Satellites tagged by env id and sandboxed by default
+#### Scenario: Picker ranks attached windows first
 
-The cockpit SHALL stamp `LMUX_SATELLITE_ID=<uuid>` on every satellite child's environment, attempt to spawn under a bubblewrap profile when available, and fall back to direct spawn with a warning toast when bubblewrap is missing.
+- **WHEN** the picker renders candidates
+- **THEN** windows already attached to the active workspace rank first,
+  windows attached to another workspace rank next, and unattached windows rank
+  last
 
-#### Scenario: Environment carries the satellite id
+#### Scenario: Picker displays ownership state
 
-- **WHEN** the cockpit spawns a satellite child
-- **THEN** the child's environment includes `LMUX_SATELLITE_ID=<uuid>` matching the `request_id`
+- **WHEN** a listed window is already attached
+- **THEN** the row says either `Active workspace` or `Other workspace: <label>`
+- **AND** the action label is `Active`, `Move here`, or `Add`
 
-#### Scenario: Bubblewrap profile binds sensitive paths read-only-none
+### Requirement: Explicit native window attach
 
-- **WHEN** `bwrap` is present on `PATH`
-- **THEN** the cockpit prefixes argv with `bwrap` and the default profile (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config/lmux/config.toml`, `$XDG_RUNTIME_DIR/lmux/` bound such that satellites cannot read them)
+The cockpit SHALL attach a selected native window to the currently active
+anchor.
 
-#### Scenario: `--no-sandbox` bypasses bwrap
+#### Scenario: Attach requires active anchor
 
-- **WHEN** the user runs `lmux open --no-sandbox <app>`
-- **THEN** the cockpit spawns the app directly without `bwrap`, for that invocation only
+- **WHEN** the user attaches a native window and no active anchor exists
+- **THEN** the operation fails with `no active anchor`
 
-#### Scenario: Missing bwrap warns but does not fail
+#### Scenario: Attach validates backend identity
 
-- **WHEN** `bwrap` is not on `PATH` and the user runs `lmux open <app>`
-- **THEN** the cockpit spawns the app directly, shows a warning toast, and never errors out solely because of missing bwrap
+- **WHEN** `satellite.attach_window` is handled
+- **THEN** the compositor backend validates and converts the candidate into a
+  `SatelliteWindowId`
+- **AND** `AppState` registers that exact window under the active anchor
 
-### Requirement: Nested Wayland host for in-process satellites
+#### Scenario: Moving attached window between anchors
 
-The cockpit SHALL run a smithay-based Wayland compositor on a dedicated OS thread, binding `wl_compositor`, `wl_shm`, `wl_seat`, and `xdg_wm_base` on a socket under `$XDG_RUNTIME_DIR/lmux-<pid>`, and SHALL expose host events (`Ready`, `ToplevelCreated`, `ToplevelClosed`, `FrameReady`, `Stopped`) to the GTK main loop.
+- **WHEN** a backend window id already belongs to another anchor and is attached
+  to the active anchor
+- **THEN** lmux removes the old owner record and registers the window under the
+  active anchor
 
-#### Scenario: Nested socket binds on startup
+### Requirement: Anchor-owned native windows
 
-- **WHEN** the cockpit launches and nested-compositor support is available
-- **THEN** the host thread starts, binds a Wayland socket under `$XDG_RUNTIME_DIR/lmux-<pid>`, and emits `HostEvent::Ready`; the cockpit records the socket name in `wayland_display_name`
+Native windows SHALL be tracked per anchor and switched by anchor activation.
 
-#### Scenario: Host failure does not block cockpit boot
+#### Scenario: Registering native window triggers visibility sync
 
-- **WHEN** the nested host fails to start for any reason
-- **THEN** the cockpit logs a warning and continues running as a pure-terminal multiplexer; `wayland_display_name` remains `None`
+- **WHEN** a window is registered under an anchor
+- **THEN** lmux immediately queues a compositor group-switch based on the current
+  active anchor
 
-#### Scenario: Clean shutdown of the host on drop
+#### Scenario: Anchor switch shows active windows
 
-- **WHEN** the `HostHandle` is dropped or `HostCommand::Shutdown` is sent
-- **THEN** the host thread unbinds the socket, emits `HostEvent::Stopped`, and joins within the cockpit's shutdown budget
+- **WHEN** active anchor changes
+- **THEN** windows owned by the new active anchor are sent in the show list
+- **AND** windows owned by every other anchor are sent in the hide list
 
-### Requirement: Satellite panes rendered in-process
+#### Scenario: Same-process app windows stay independent
 
-The cockpit SHALL represent each nested-host toplevel as a `SatelliteWidget` housed in a `Pane::Satellite` variant; the widget MUST paint `FrameReady` buffers as GDK textures and forward keyboard, pointer, and scroll events back as `HostCommand`s.
+- **WHEN** two windows from the same application process are attached to
+  different anchors and have distinct backend window ids
+- **THEN** lmux tracks and switches them independently
 
-#### Scenario: New toplevel splits into a pane
+### Requirement: User-controlled placement
 
-- **WHEN** the nested host emits `ToplevelCreated`
-- **THEN** the cockpit allocates a fresh `PaneId`, builds a `SatelliteWidget`, splices the pane into the focused workspace (default split direction, 0.5 ratio), and maintains `surface_to_pane`, `pane_uuids`, and `pane_workspace` entries for it
+lmux SHALL respect the user's native window placement.
 
-#### Scenario: Toplevel closed removes the pane
+#### Scenario: Attach does not move the window
 
-- **WHEN** the nested host emits `ToplevelClosed`
-- **THEN** the satellite pane is marked closed and removed from the layout unless it is the last pane; sibling panes collapse into the vacated slot
+- **WHEN** a user attaches an already-open native window
+- **THEN** lmux records ownership but does not choose a display or rewrite the
+  window's geometry
 
-#### Scenario: Input events forward back to the client
+#### Scenario: Anchor switch does not manage displays
 
-- **WHEN** the user presses a key, moves the pointer, scrolls, or clicks inside a `SatelliteWidget`
-- **THEN** the event is translated to the matching `HostCommand::SendKey`/`SendPointer`/`SendScroll` and delivered to the nested client with XKB keycodes offset by `+8`
+- **WHEN** an attached window is shown for the active anchor
+- **THEN** it stays wherever the user/compositor placed it
 
-### Requirement: Launcher UI spawns satellites
+### Requirement: macOS explicit attach
 
-The cockpit SHALL provide a `.desktop`-driven spotlight launcher, bound by default to `prefix + l` (and reachable from a sidebar header button), that scans `$XDG_DATA_HOME/applications` and `$XDG_DATA_DIRS`, substring-filters on Name and Comment, and spawns the chosen entry via the same spawn path as `lmux open`.
+On macOS, lmux SHALL use exact window identities instead of app-bundle-wide
+ownership.
 
-#### Scenario: Launcher opens a modal window
+#### Scenario: Focused macOS attach requires stable identity
 
-- **WHEN** the user presses `prefix + l`
-- **THEN** a modal window appears centered on the cockpit with a filter input focused; typing filters the entry list on Name + Comment
+- **WHEN** `satellite.attach_focused` is used on macOS
+- **THEN** lmux reads the focused helper window and requires a stable window id
+  before registering it
 
-#### Scenario: Spawn on Enter
+#### Scenario: Selected macOS attach accepts window id or index
 
-- **WHEN** the user presses `Enter` on a launcher entry
-- **THEN** the Exec line is parsed (stripping `%u`, `%f`, `%F`, `%i`, `%c`, `%k`), and the resulting argv is spawned via the tagged spawn entry point
+- **WHEN** `satellite.attach_window` targets macOS
+- **THEN** lmux accepts a helper window with a stable window id or window index
+- **AND** stores bundle id and title when available
 
-#### Scenario: Modal window, not popover
+#### Scenario: macOS launcher is disabled
 
-- **WHEN** the launcher is opened inside a Wayland KWin session
-- **THEN** it is implemented as a `gtk::Window`, not a `Popover`, to avoid KWin-Wayland popover placement issues
+- **WHEN** the launcher open function is called on macOS
+- **THEN** it logs that launcher is disabled and expects users to attach
+  already-open native windows
 
-### Requirement: Wayland-aware env override for nested satellites
+### Requirement: Linux native attach
 
-When a nested Wayland host is active the cockpit SHALL force `WAYLAND_DISPLAY=<nested socket>`, `GDK_BACKEND=wayland`, and `QT_QPA_PLATFORM=wayland` on the spawned child, and SHALL strip `DISPLAY` so a toolkit cannot fall back to X11.
+On Linux, KWin and X11 backends SHALL provide native window listing/attach when
+their required compositor/tools are available.
 
-#### Scenario: Nested env forces Wayland
+#### Scenario: KWin candidate carries backend id
 
-- **WHEN** the cockpit spawns a satellite and `wayland_display_name` is `Some(...)`
-- **THEN** the child's environment contains the three forced variables, `DISPLAY` is absent, and `LMUX_SATELLITE_ID` is still set
+- **WHEN** KWin lists windows
+- **THEN** each attachable candidate carries a backend window id used for exact
+  visibility and raise operations
 
-#### Scenario: No host, parent env passes through
+#### Scenario: X11 candidate uses xprop/xdotool
 
-- **WHEN** the cockpit spawns a satellite and no nested host is available
-- **THEN** the child inherits the parent environment unchanged except for the `LMUX_SATELLITE_ID` addition
+- **WHEN** X11 support is available
+- **THEN** listing uses X11 window properties and visibility/raise uses
+  `xdotool`
 
-### Requirement: KWin best-effort placement
+### Requirement: Legacy `satellite.open`
 
-On KWin the cockpit SHALL additionally schedule a one-shot KWin script that finds the window whose PID matches the freshly-spawned satellite and snaps it into the right half of its screen's placement area.
+The bus SHALL keep a legacy spawn kind, but it is not the managed attach
+workflow.
 
-#### Scenario: One-shot placement script runs
+#### Scenario: Non-macOS open launches without ownership
 
-- **WHEN** `KwinCompositor::spawn_satellite` is called on a KWin session
-- **THEN** the cockpit returns `(request_id, pid)` immediately and schedules an async task that writes a `lmux-place-<pid>` script, loads and runs it over D-Bus, then unloads it
+- **WHEN** `satellite.open` succeeds on a non-macOS build
+- **THEN** it spawns the process and increments the success counter
+- **AND** logs that the app was launched without ownership and must be attached
+  separately to be managed
 
-#### Scenario: Placement is best-effort, not gating
+#### Scenario: macOS open is disabled
 
-- **WHEN** the KWin placement script fails or the window cannot be found
-- **THEN** the satellite remains running as a floating window without any error surfaced to the user
+- **WHEN** `satellite.open` is called on macOS
+- **THEN** it increments the failure counter and returns an error instructing
+  the user to use focused/native attach
 
-### Requirement: Per-anchor satellite visibility
+### Requirement: Nested Wayland host
 
-The cockpit SHALL bind each satellite to the anchor that was active at spawn time; switching the active anchor MUST minimize satellites bound to the outgoing anchor and restore satellites bound to the incoming anchor.
+On Linux, lmux SHALL be able to run a nested Wayland host for in-process
+satellite panes when the host starts successfully.
 
-#### Scenario: Switching anchor away minimizes satellites
+#### Scenario: Host ready records display name
 
-- **WHEN** the active anchor transitions from `A` to `B`
-- **THEN** the cockpit broadcasts `SetSatelliteVisible { pid, visible: false }` for satellites owned by `A` and `SetSatelliteVisible { pid, visible: true }` for satellites owned by `B` via the compositor bridge
+- **WHEN** the host emits `Ready { display_name }`
+- **THEN** `AppState` records the display name for child environment use
 
-#### Scenario: KWin toggles minimization on command
+#### Scenario: New toplevel creates satellite pane
 
-- **WHEN** `KwinCompositor::set_window_visible_by_pid(pid, visible)` is invoked
-- **THEN** a one-shot KWin script toggles `w.minimized` for the matching window; failure is logged but does not propagate
+- **WHEN** the host emits a toplevel-created event
+- **THEN** lmux allocates a new satellite pane in the active workspace and maps
+  the surface id to that pane
 
-### Requirement: Correlation timeout and floating fallback
+#### Scenario: Frame events update satellite widget
 
-When KWin script correlation of a spawned satellite does not complete within 500 ms the cockpit SHALL mark the satellite as `floating_fallback` and MUST retry correlation on subsequent `configure` events for up to 2 seconds total before giving up.
-
-#### Scenario: Correlation timeout surfaces a toast
-
-- **WHEN** a satellite does not produce a `satellite.map` within 500 ms of `lmux open`
-- **THEN** the cockpit emits `satellite.status { state: "floating_fallback", reason: "correlation_timeout" }` on the bus and the sidebar shows a toast "Could not dock <app> — opened as floating window"
-
-#### Scenario: Retry window extends for slow mappers
-
-- **WHEN** the KWin script reports a `configure` event during the 2-second retry window
-- **THEN** the cockpit attempts correlation again; a successful match transitions the satellite out of `floating_fallback`
-
-#### Scenario: Non-KWin environments skip correlation
-
-- **WHEN** `NoopCompositor` is the active implementor
-- **THEN** `satellite.open` marks the satellite as `floating_fallback` without attempting correlation and without surfacing an error
-
-### Requirement: Spawn metrics for dogfooding
-
-The cockpit SHALL increment in-memory counters `satellite_spawn_ok` and `satellite_spawn_fail` on each resolved `satellite.open` dispatch and expose them via `status.get.result` and the `lmux status` CLI.
-
-#### Scenario: Counters surface via status.get
-
-- **WHEN** a client sends `status.get`
-- **THEN** the response includes both counters and their current values
-
-#### Scenario: `lmux status` prints the ratio
-
-- **WHEN** the user runs `lmux status`
-- **THEN** the printed output includes a line of the form `satellites: ok=N fail=M`
+- **WHEN** the host emits frame, dmabuf, popup, title, app-id, or close events
+- **THEN** lmux routes them to the owning `SatelliteWidget` or removes the pane
+  on close

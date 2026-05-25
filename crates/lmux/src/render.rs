@@ -53,8 +53,21 @@ impl<'a> CairoRenderer<'a> {
         // characters land on integer x positions.
         if let Ok(mut opts) = cairo::FontOptions::new() {
             opts.set_hint_metrics(cairo::HintMetrics::On);
-            opts.set_hint_style(cairo::HintStyle::Slight);
-            opts.set_antialias(cairo::Antialias::Subpixel);
+            #[cfg(target_os = "macos")]
+            {
+                opts.set_hint_style(cairo::HintStyle::None);
+                opts.set_antialias(cairo::Antialias::Gray);
+            }
+            #[cfg(target_os = "linux")]
+            {
+                opts.set_hint_style(cairo::HintStyle::Slight);
+                opts.set_antialias(cairo::Antialias::Subpixel);
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                opts.set_hint_style(cairo::HintStyle::Slight);
+                opts.set_antialias(cairo::Antialias::Subpixel);
+            }
             pangocairo::functions::context_set_font_options(&pctx, Some(&opts));
         }
         let layout = pango::Layout::new(&pctx);

@@ -33,7 +33,9 @@ impl CompositorControl for NoopCompositor {
     }
 
     async fn health(&self) -> Health {
-        Health::Online
+        Health::Offline {
+            reason: "native compositor integration unavailable".into(),
+        }
     }
 
     async fn spawn_satellite(

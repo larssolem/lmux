@@ -6,6 +6,7 @@ target/
 # Zig build artefacts from crates/lmux-libghostty/vendor-ghostty/
 **/vendor-ghostty/zig-out/
 **/vendor-ghostty/.zig-cache/
+**/vendor-ghostty/zig-pkg/
 
 # Editor / OS
 .DS_Store
