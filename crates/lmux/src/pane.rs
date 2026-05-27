@@ -14,7 +14,7 @@ use gtk4::{
 };
 use lmux_config::FocusMode;
 use lmux_libghostty::{
-    CellView, CursorPos, Frame as LgFrame, RenderVisitor, Terminal, ViewportPoint,
+    CellView, CursorPos, Frame as LgFrame, RenderVisitor, Rgb, ScreenPoint, Terminal, ViewportPoint,
 };
 use lmux_pty::{self, Pane as PtyPane};
 
@@ -26,7 +26,7 @@ const WHEEL_ROWS_PER_TICK: i32 = 3;
 
 const INIT_COLS: u16 = 100;
 const INIT_ROWS: u16 = 30;
-const SCROLLBACK: usize = 10_000;
+const SCROLLBACK: usize = 100_000;
 const READER_CHAN_CAPACITY: usize = 64;
 #[cfg(target_os = "macos")]
 const DEFAULT_FONT_FAMILY: &str = "JetBrains Mono";
@@ -146,8 +146,10 @@ struct Inner {
     cols: u16,
     rows: u16,
     font_desc: pango::FontDescription,
-    selection: Option<(ViewportPoint, ViewportPoint)>,
-    drag_anchor: Option<ViewportPoint>,
+    selection: Option<(ScreenPoint, ScreenPoint)>,
+    drag_anchor: Option<ScreenPoint>,
+    drag_pointer: Option<(f64, f64)>,
+    frozen_frame: Option<FrozenFrame>,
     exit_code: Option<i32>,
 }
 
@@ -198,6 +200,8 @@ impl TerminalPane {
             font_desc: font_desc.clone(),
             selection: None,
             drag_anchor: None,
+            drag_pointer: None,
+            frozen_frame: None,
             exit_code: None,
         }));
 
@@ -385,11 +389,17 @@ impl TerminalPane {
                     }
                     b.term.scroll_to_bottom();
                     b.selection = None;
+                    b.frozen_frame = None;
                     drop(b);
                     area.queue_draw();
                 }
                 KeyAction::ScrollRows(delta) => {
-                    inner.borrow_mut().term.scroll_delta(delta as isize);
+                    let mut b = inner.borrow_mut();
+                    b.term.scroll_delta(delta as isize);
+                    if b.selection.is_some() {
+                        b.freeze_viewport();
+                    }
+                    drop(b);
                     area.queue_draw();
                 }
                 KeyAction::Write(_) => {}
@@ -406,7 +416,31 @@ impl TerminalPane {
         scroll.connect_scroll(move |_ctrl, _dx, dy| {
             let rows = (dy * f64::from(WHEEL_ROWS_PER_TICK)).round() as i32;
             if rows != 0 {
-                inner.borrow_mut().term.scroll_delta(rows as isize);
+                let mut b = inner.borrow_mut();
+                b.term.scroll_delta(rows as isize);
+                if let Some(anchor) = b.drag_anchor {
+                    let viewport_row = if rows < 0 {
+                        0
+                    } else {
+                        b.rows.saturating_sub(1)
+                    };
+                    let viewport_col = if rows < 0 {
+                        0
+                    } else {
+                        b.cols.saturating_sub(1)
+                    };
+                    let viewport_point = ViewportPoint {
+                        row: viewport_row,
+                        col: viewport_col,
+                    };
+                    if let Some(end) = b.term.screen_point_from_viewport(viewport_point) {
+                        b.selection = Some((anchor, end));
+                    }
+                }
+                if b.selection.is_some() {
+                    b.freeze_viewport();
+                }
+                drop(b);
                 area.queue_draw();
             }
             glib::Propagation::Stop
@@ -421,11 +455,43 @@ impl TerminalPane {
         let area = self.drawing_area.clone();
         drag.connect_drag_begin(move |_g, x, y| {
             let mut b = inner.borrow_mut();
-            let anchor = b.point_from_px(x, y);
-            b.drag_anchor = Some(anchor);
-            b.selection = Some((anchor, anchor));
+            if let Some(anchor) = b.screen_point_from_px(x, y) {
+                b.drag_anchor = Some(anchor);
+                b.selection = Some((anchor, anchor));
+                b.drag_pointer = Some((x, y));
+                b.freeze_viewport();
+            }
             drop(b);
             area.queue_draw();
+        });
+        let inner_scroll = self.inner.clone();
+        let area_scroll = self.drawing_area.clone();
+        drag.connect_drag_begin(move |_g, _x, _y| {
+            let inner_scroll = inner_scroll.clone();
+            let area_scroll = area_scroll.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                let mut b = inner_scroll.borrow_mut();
+                let Some(anchor) = b.drag_anchor else {
+                    return glib::ControlFlow::Break;
+                };
+                let Some((x, y)) = b.drag_pointer else {
+                    return glib::ControlFlow::Continue;
+                };
+                if y < 0.0 {
+                    b.term.scroll_delta(-(WHEEL_ROWS_PER_TICK as isize));
+                } else if y >= f64::from(area_scroll.height().max(1)) {
+                    b.term.scroll_delta(WHEEL_ROWS_PER_TICK as isize);
+                } else {
+                    return glib::ControlFlow::Continue;
+                }
+                b.freeze_viewport();
+                if let Some(end) = b.screen_point_from_px(x, y) {
+                    b.selection = Some((anchor, end));
+                }
+                drop(b);
+                area_scroll.queue_draw();
+                glib::ControlFlow::Continue
+            });
         });
         let inner_up = self.inner.clone();
         let area_up = self.drawing_area.clone();
@@ -433,12 +499,23 @@ impl TerminalPane {
             let Some((sx, sy)) = g.start_point() else {
                 return;
             };
+            let x = sx + dx;
+            let y = sy + dy;
             let mut b = inner_up.borrow_mut();
             let Some(anchor) = b.drag_anchor else {
                 return;
             };
-            let end = b.point_from_px(sx + dx, sy + dy);
-            b.selection = Some((anchor, end));
+            b.drag_pointer = Some((x, y));
+            if y < 0.0 {
+                b.term.scroll_delta(-(WHEEL_ROWS_PER_TICK as isize));
+                b.freeze_viewport();
+            } else if y >= f64::from(area_up.height().max(1)) {
+                b.term.scroll_delta(WHEEL_ROWS_PER_TICK as isize);
+                b.freeze_viewport();
+            }
+            if let Some(end) = b.screen_point_from_px(x, y) {
+                b.selection = Some((anchor, end));
+            }
             drop(b);
             area_up.queue_draw();
         });
@@ -448,15 +525,18 @@ impl TerminalPane {
             let selection = {
                 let mut b = inner_end.borrow_mut();
                 b.drag_anchor = None;
+                b.drag_pointer = None;
                 b.selection
             };
             if let Some((start, end)) = selection {
                 if start == end {
-                    inner_end.borrow_mut().selection = None;
+                    let mut b = inner_end.borrow_mut();
+                    b.selection = None;
+                    b.frozen_frame = None;
                     area_end.queue_draw();
                     return;
                 }
-                let text = inner_end.borrow().term.selection_text(start, end);
+                let text = inner_end.borrow().term.selection_text_screen(start, end);
                 if let Some(text) = text.filter(|t| !t.is_empty()) {
                     if let Some(display) = gdk::Display::default() {
                         display.clipboard().set_text(&text);
@@ -578,13 +658,28 @@ impl Inner {
         let row = (row as u16).min(self.rows.saturating_sub(1));
         ViewportPoint { row, col }
     }
+
+    fn screen_point_from_px(&self, x: f64, y: f64) -> Option<ScreenPoint> {
+        self.term
+            .screen_point_from_viewport(self.point_from_px(x, y))
+    }
+
+    fn freeze_viewport(&mut self) {
+        let Some(top_screen_row) = self.term.viewport_top_screen_row() else {
+            self.frozen_frame = None;
+            return;
+        };
+        let mut visitor = FrozenVisitor::new(top_screen_row);
+        self.term.render(&mut visitor);
+        self.frozen_frame = visitor.into_frame();
+    }
 }
 
 fn copy_selection_to_clipboard(inner: &Rc<RefCell<Inner>>) {
     let text = {
         let b = inner.borrow();
         match b.selection {
-            Some((s, e)) if s != e => b.term.selection_text(s, e),
+            Some((s, e)) if s != e => b.term.selection_text_screen(s, e),
             _ => None,
         }
     };
@@ -593,6 +688,68 @@ fn copy_selection_to_clipboard(inner: &Rc<RefCell<Inner>>) {
             display.clipboard().set_text(&text);
         }
     }
+}
+
+#[derive(Clone)]
+struct FrozenFrame {
+    top_screen_row: u32,
+    frame: LgFrame,
+    cells: Vec<FrozenCell>,
+}
+
+#[derive(Clone)]
+struct FrozenCell {
+    row: u16,
+    col: u16,
+    text: String,
+    fg: Rgb,
+    bg: Rgb,
+    bg_is_default: bool,
+}
+
+struct FrozenVisitor {
+    top_screen_row: u32,
+    frame: Option<LgFrame>,
+    cells: Vec<FrozenCell>,
+}
+
+impl FrozenVisitor {
+    fn new(top_screen_row: u32) -> Self {
+        Self {
+            top_screen_row,
+            frame: None,
+            cells: Vec::new(),
+        }
+    }
+
+    fn into_frame(self) -> Option<FrozenFrame> {
+        self.frame.map(|frame| FrozenFrame {
+            top_screen_row: self.top_screen_row,
+            frame,
+            cells: self.cells,
+        })
+    }
+}
+
+impl RenderVisitor for FrozenVisitor {
+    fn begin(&mut self, frame: &LgFrame) {
+        self.frame = Some(*frame);
+        self.cells.clear();
+    }
+
+    fn cell(&mut self, cell: &CellView<'_>) {
+        self.cells.push(FrozenCell {
+            row: cell.row,
+            col: cell.col,
+            text: cell.text.to_string(),
+            fg: cell.fg,
+            bg: cell.bg,
+            bg_is_default: cell.bg_is_default,
+        });
+    }
+
+    fn cursor(&mut self, _cursor: &CursorPos) {}
+    fn end(&mut self) {}
 }
 
 fn request_paste_from_clipboard(area: &DrawingArea, inner: &Rc<RefCell<Inner>>) {
@@ -667,6 +824,8 @@ fn paste_text(inner: &Rc<RefCell<Inner>>, area: &DrawingArea, text: &str) {
         let _ = b.pty.writer().write_all(b"\x1b[201~");
     }
     b.term.scroll_to_bottom();
+    b.selection = None;
+    b.frozen_frame = None;
     drop(b);
     area.queue_draw();
 }
@@ -996,12 +1155,34 @@ fn install_draw_func(area: &DrawingArea, inner: &Rc<RefCell<Inner>>) {
         let cell_w = b.cell_w;
         let cell_h = b.cell_h;
         let font = b.font_desc.clone();
-        let selection = b.selection.map(|(s, e)| Selection::new(s, e));
+        let frozen = b.frozen_frame.clone();
+        let viewport_top = frozen
+            .as_ref()
+            .map(|frame| Some(frame.top_screen_row))
+            .unwrap_or_else(|| b.term.viewport_top_screen_row());
+        let selection = b
+            .selection
+            .and_then(|(s, e)| viewport_top.map(|top| Selection::new(s, e, top)));
         let exit = b.exit_code;
         let cols = b.cols;
         let mut renderer =
             CairoRenderer::new(cr, &font, cell_w, cell_h, selection.as_ref(), exit, cols);
-        b.term.render(&mut renderer);
+        if let Some(frozen) = frozen {
+            renderer.begin(&frozen.frame);
+            for cell in &frozen.cells {
+                renderer.cell(&CellView {
+                    row: cell.row,
+                    col: cell.col,
+                    text: &cell.text,
+                    fg: cell.fg,
+                    bg: cell.bg,
+                    bg_is_default: cell.bg_is_default,
+                });
+            }
+            renderer.end();
+        } else {
+            b.term.render(&mut renderer);
+        }
     });
 }
 
@@ -1067,7 +1248,10 @@ fn start_pty_reader(
             let span = tracing::info_span!("pty_to_paint", len = bytes.len());
             let _g = span.enter();
             let bells = scanner.scan(&bytes);
-            inner_chan.borrow_mut().term.feed(&bytes);
+            {
+                let mut b = inner_chan.borrow_mut();
+                b.term.feed(&bytes);
+            }
             area_chan.queue_draw();
             if bells > 0 {
                 let now = std::time::Instant::now();

@@ -1,26 +1,31 @@
 use gtk4::cairo;
 use gtk4::pango;
-use lmux_libghostty::{CellView, CursorPos, Frame, RenderVisitor, Rgb, ViewportPoint};
+use lmux_libghostty::{CellView, CursorPos, Frame, RenderVisitor, Rgb, ScreenPoint};
 
 /// A selection range, already normalised so `start <= end` in row-major order.
 #[derive(Clone, Copy, Debug)]
 pub struct Selection {
-    pub start: ViewportPoint,
-    pub end: ViewportPoint,
+    pub start: ScreenPoint,
+    pub end: ScreenPoint,
+    viewport_top_screen_row: u32,
 }
 
 impl Selection {
-    pub fn new(a: ViewportPoint, b: ViewportPoint) -> Self {
+    pub fn new(a: ScreenPoint, b: ScreenPoint, viewport_top_screen_row: u32) -> Self {
         let (start, end) = if (a.row, a.col) <= (b.row, b.col) {
             (a, b)
         } else {
             (b, a)
         };
-        Self { start, end }
+        Self {
+            start,
+            end,
+            viewport_top_screen_row,
+        }
     }
 
     fn contains(&self, row: u16, col: u16) -> bool {
-        let pos = (row, col);
+        let pos = (self.viewport_top_screen_row + u32::from(row), col);
         let s = (self.start.row, self.start.col);
         let e = (self.end.row, self.end.col);
         pos >= s && pos <= e

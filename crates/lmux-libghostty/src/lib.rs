@@ -71,6 +71,14 @@ pub struct ViewportPoint {
     pub col: u16,
 }
 
+/// A point in full-screen coordinates, including scrollback. `row = 0` is the
+/// oldest retained row in the active screen buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScreenPoint {
+    pub row: u32,
+    pub col: u16,
+}
+
 /// Sink for render events. `render()` calls `begin()` once, `cell()` for every
 /// non-empty cell in row-major order, optionally `cursor()`, then `end()`.
 pub trait RenderVisitor {
@@ -206,6 +214,112 @@ impl Terminal {
         unsafe {
             let s_point = make_viewport_point(s);
             let e_point = make_viewport_point(e);
+
+            let mut start_ref: ffi::GhosttyGridRef = std::mem::zeroed();
+            start_ref.size = std::mem::size_of::<ffi::GhosttyGridRef>();
+            let r = ffi::ghostty_terminal_grid_ref(self.term, s_point, &mut start_ref);
+            if r != ffi::GhosttyResult_GHOSTTY_SUCCESS {
+                return None;
+            }
+
+            let mut end_ref: ffi::GhosttyGridRef = std::mem::zeroed();
+            end_ref.size = std::mem::size_of::<ffi::GhosttyGridRef>();
+            let r = ffi::ghostty_terminal_grid_ref(self.term, e_point, &mut end_ref);
+            if r != ffi::GhosttyResult_GHOSTTY_SUCCESS {
+                return None;
+            }
+
+            let mut sel: ffi::GhosttySelection = std::mem::zeroed();
+            sel.size = std::mem::size_of::<ffi::GhosttySelection>();
+            sel.start = start_ref;
+            sel.end = end_ref;
+            sel.rectangle = false;
+
+            let mut opts: ffi::GhosttyFormatterTerminalOptions = std::mem::zeroed();
+            opts.size = std::mem::size_of::<ffi::GhosttyFormatterTerminalOptions>();
+            opts.emit = ffi::GhosttyFormatterFormat_GHOSTTY_FORMATTER_FORMAT_PLAIN;
+            opts.trim = true;
+            opts.selection = &sel;
+
+            let mut formatter: ffi::GhosttyFormatter = ptr::null_mut();
+            let r =
+                ffi::ghostty_formatter_terminal_new(ptr::null(), &mut formatter, self.term, opts);
+            if r != ffi::GhosttyResult_GHOSTTY_SUCCESS || formatter.is_null() {
+                return None;
+            }
+
+            let mut out_ptr: *mut u8 = ptr::null_mut();
+            let mut out_len: usize = 0;
+            let r = ffi::ghostty_formatter_format_alloc(
+                formatter,
+                ptr::null(),
+                &mut out_ptr,
+                &mut out_len,
+            );
+            ffi::ghostty_formatter_free(formatter);
+
+            if r != ffi::GhosttyResult_GHOSTTY_SUCCESS || out_ptr.is_null() {
+                return None;
+            }
+
+            let slice = std::slice::from_raw_parts(out_ptr, out_len);
+            let text = String::from_utf8_lossy(slice).into_owned();
+            ffi::ghostty_free(ptr::null(), out_ptr, out_len);
+            Some(text)
+        }
+    }
+
+    /// Convert a visible viewport point to a full-screen point. Screen points
+    /// remain meaningful as the viewport scrolls, which makes them suitable
+    /// for selections that span beyond the currently visible rows.
+    pub fn screen_point_from_viewport(&self, point: ViewportPoint) -> Option<ScreenPoint> {
+        // SAFETY: All FFI calls use `self.term`, valid for the lifetime of
+        // `self`, and stack-allocated output structs.
+        unsafe {
+            let mut grid_ref: ffi::GhosttyGridRef = std::mem::zeroed();
+            grid_ref.size = std::mem::size_of::<ffi::GhosttyGridRef>();
+            let r = ffi::ghostty_terminal_grid_ref(
+                self.term,
+                make_viewport_point(point),
+                &mut grid_ref,
+            );
+            if r != ffi::GhosttyResult_GHOSTTY_SUCCESS {
+                return None;
+            }
+
+            let mut coord: ffi::GhosttyPointCoordinate = std::mem::zeroed();
+            let r = ffi::ghostty_terminal_point_from_grid_ref(
+                self.term,
+                &grid_ref,
+                ffi::GhosttyPointTag_GHOSTTY_POINT_TAG_SCREEN,
+                &mut coord,
+            );
+            if r != ffi::GhosttyResult_GHOSTTY_SUCCESS {
+                return None;
+            }
+
+            Some(ScreenPoint {
+                row: coord.y,
+                col: coord.x,
+            })
+        }
+    }
+
+    /// Screen row corresponding to viewport row zero.
+    pub fn viewport_top_screen_row(&self) -> Option<u32> {
+        self.screen_point_from_viewport(ViewportPoint { row: 0, col: 0 })
+            .map(|p| p.row)
+    }
+
+    /// Extract text from a range expressed in full-screen coordinates.
+    pub fn selection_text_screen(&self, start: ScreenPoint, end: ScreenPoint) -> Option<String> {
+        let (s, e) = normalise_screen_range(start, end);
+        // SAFETY: Mirrors `selection_text`, but resolves `ScreenPoint` values
+        // instead of viewport-local points before handing the range to the
+        // Ghostty formatter.
+        unsafe {
+            let s_point = make_screen_point(s);
+            let e_point = make_screen_point(e);
 
             let mut start_ref: ffi::GhosttyGridRef = std::mem::zeroed();
             start_ref.size = std::mem::size_of::<ffi::GhosttyGridRef>();
@@ -450,12 +564,30 @@ fn normalise_range(a: ViewportPoint, b: ViewportPoint) -> (ViewportPoint, Viewpo
     }
 }
 
+fn normalise_screen_range(a: ScreenPoint, b: ScreenPoint) -> (ScreenPoint, ScreenPoint) {
+    if (a.row, a.col) <= (b.row, b.col) {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
 fn make_viewport_point(p: ViewportPoint) -> ffi::GhosttyPoint {
     let mut value: ffi::GhosttyPointValue = unsafe { std::mem::zeroed() };
     value.coordinate.x = p.col;
     value.coordinate.y = u32::from(p.row);
     ffi::GhosttyPoint {
         tag: ffi::GhosttyPointTag_GHOSTTY_POINT_TAG_VIEWPORT,
+        value,
+    }
+}
+
+fn make_screen_point(p: ScreenPoint) -> ffi::GhosttyPoint {
+    let mut value: ffi::GhosttyPointValue = unsafe { std::mem::zeroed() };
+    value.coordinate.x = p.col;
+    value.coordinate.y = p.row;
+    ffi::GhosttyPoint {
+        tag: ffi::GhosttyPointTag_GHOSTTY_POINT_TAG_SCREEN,
         value,
     }
 }
