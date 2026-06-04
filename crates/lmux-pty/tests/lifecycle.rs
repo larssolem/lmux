@@ -28,6 +28,17 @@ fn with_no_trampoline<R>(f: impl FnOnce() -> R) -> R {
     out
 }
 
+fn with_env_var<R>(key: &str, value: &str, f: impl FnOnce() -> R) -> R {
+    let prev = std::env::var_os(key);
+    std::env::set_var(key, value);
+    let out = f();
+    match prev {
+        Some(v) => std::env::set_var(key, v),
+        None => std::env::remove_var(key),
+    }
+    out
+}
+
 #[test]
 fn spawn_echo_roundtrip() {
     with_no_trampoline(|| {
@@ -81,6 +92,68 @@ fn spawn_echo_roundtrip() {
 
         pane.kill().ok();
         let _ = pane.try_wait();
+    });
+}
+
+#[test]
+fn spawn_advertises_color_capabilities() {
+    with_no_trampoline(|| {
+        with_env_var("NO_COLOR", "1", || {
+            let (mut pane, reader) = spawn(SpawnOpts {
+                shell: "/bin/sh".into(),
+                cols: 80,
+                rows: 24,
+                cwd: None,
+            })
+            .expect("spawn");
+
+            let (tx, rx) = mpsc::channel::<Vec<u8>>();
+            let mut reader = reader;
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = reader.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            pane.writer()
+                .write_all(
+                    b"printf '%s|%s|%s|%s\\n' \"$TERM\" \"$COLORTERM\" \"$TERM_PROGRAM\" \"$NO_COLOR\"\n",
+                )
+                .expect("write env check");
+
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut acc = Vec::new();
+            while Instant::now() < deadline {
+                match rx.recv_timeout(Duration::from_millis(200)) {
+                    Ok(chunk) => {
+                        acc.extend_from_slice(&chunk);
+                        if acc
+                            .windows(30)
+                            .any(|w| w == b"xterm-256color|truecolor|lmux|")
+                        {
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+
+            let text = String::from_utf8_lossy(&acc);
+            assert!(
+                text.contains("xterm-256color|truecolor|lmux|"),
+                "color env was not advertised or NO_COLOR leaked; saw: {text:?}"
+            );
+
+            pane.kill().ok();
+            let _ = pane.try_wait();
+        });
     });
 }
 

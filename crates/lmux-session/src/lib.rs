@@ -18,7 +18,7 @@ pub use store::{SessionStore, StoreError};
 
 use std::path::PathBuf;
 
-use lmux_state::{LayoutNode, SessionSnapshot};
+use lmux_state::{LayoutNode, PaneTitleSnapshot, SessionSnapshot, TerminalTabStackSnapshot};
 use serde::{Deserialize, Serialize};
 
 /// One named session persisted as `sessions/<name>.toml`. Layout reuses
@@ -43,6 +43,20 @@ pub struct Session {
     /// in v0.1 migration).
     #[serde(default)]
     pub anchors: Vec<AnchorRef>,
+    #[serde(
+        default,
+        with = "pane_titles_serde",
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    pub pane_titles: std::collections::BTreeMap<u32, PaneTitleSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub terminal_tabs: Vec<TerminalTabStackSnapshot>,
+    #[serde(
+        default,
+        with = "pane_roots_serde",
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    pub pane_terminal_tab_roots: std::collections::BTreeMap<u32, u32>,
 }
 
 impl Session {
@@ -55,6 +69,9 @@ impl Session {
             layout: LayoutNode::Leaf { pane_id: 1 },
             cwds: std::collections::BTreeMap::new(),
             anchors: Vec::new(),
+            pane_titles: std::collections::BTreeMap::new(),
+            terminal_tabs: Vec::new(),
+            pane_terminal_tab_roots: std::collections::BTreeMap::new(),
         }
     }
 
@@ -72,6 +89,9 @@ impl Session {
             layout: snap.layout,
             cwds: snap.cwds,
             anchors: Vec::new(),
+            pane_titles: snap.pane_titles,
+            terminal_tabs: snap.terminal_tabs,
+            pane_terminal_tab_roots: snap.pane_terminal_tab_roots,
         }
     }
 }
@@ -166,6 +186,67 @@ mod cwds_serde {
         D: Deserializer<'de>,
     {
         let stringified: BTreeMap<String, String> = BTreeMap::deserialize(de)?;
+        stringified
+            .into_iter()
+            .map(|(k, v)| {
+                k.parse::<u32>()
+                    .map(|k| (k, v))
+                    .map_err(serde::de::Error::custom)
+            })
+            .collect()
+    }
+}
+
+mod pane_titles_serde {
+    use std::collections::BTreeMap;
+
+    use lmux_state::PaneTitleSnapshot;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(map: &BTreeMap<u32, PaneTitleSnapshot>, ser: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let stringified: BTreeMap<String, &PaneTitleSnapshot> =
+            map.iter().map(|(k, v)| (k.to_string(), v)).collect();
+        stringified.serialize(ser)
+    }
+
+    pub fn deserialize<'de, D>(de: D) -> Result<BTreeMap<u32, PaneTitleSnapshot>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let stringified: BTreeMap<String, PaneTitleSnapshot> = BTreeMap::deserialize(de)?;
+        stringified
+            .into_iter()
+            .map(|(k, v)| {
+                k.parse::<u32>()
+                    .map(|k| (k, v))
+                    .map_err(serde::de::Error::custom)
+            })
+            .collect()
+    }
+}
+
+mod pane_roots_serde {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(map: &BTreeMap<u32, u32>, ser: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let stringified: BTreeMap<String, u32> =
+            map.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+        stringified.serialize(ser)
+    }
+
+    pub fn deserialize<'de, D>(de: D) -> Result<BTreeMap<u32, u32>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let stringified: BTreeMap<String, u32> = BTreeMap::deserialize(de)?;
         stringified
             .into_iter()
             .map(|(k, v)| {

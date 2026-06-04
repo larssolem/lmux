@@ -175,6 +175,10 @@ pub fn spawn(opts: SpawnOpts<'_>) -> Result<(Pane, Box<dyn Read + Send>), Error>
         c
     };
     cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    cmd.env("TERM_PROGRAM", "lmux");
+    cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+    cmd.env_remove("NO_COLOR");
     if let Some(cwd) = opts.cwd {
         cmd.cwd(cwd);
     }

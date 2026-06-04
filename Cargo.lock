@@ -1198,6 +1198,8 @@ dependencies = [
  "lmux-bus",
  "lmux-control",
  "lmux-session",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1284,6 +1286,17 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
+]
+
+[[package]]
+name = "lmux-mcp"
+version = "0.1.0-dev"
+dependencies = [
+ "lmux-bus",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

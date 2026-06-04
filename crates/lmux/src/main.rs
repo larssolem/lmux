@@ -1,3 +1,4 @@
+mod agent_control;
 mod app;
 mod bus;
 mod compositor_bridge;

@@ -34,6 +34,19 @@ frame.pane--anchor.pane--focused {
     background-color: alpha(#3b82f6, 0.18);
     border-radius: 6px;
 }
+.lmux-sidebar__row {
+    border: 1px solid alpha(#64748b, 0.28);
+    border-radius: 6px;
+    padding: 5px 6px;
+    background-color: alpha(#0f172a, 0.04);
+}
+.lmux-sidebar__row:hover {
+    background-color: alpha(#3b82f6, 0.10);
+    border-color: alpha(#3b82f6, 0.45);
+}
+.lmux-sidebar__row--active {
+    border-color: alpha(#3b82f6, 0.75);
+}
 .lmux-sidebar__active-dot {
     color: #3b82f6;
     font-size: 10pt;
@@ -93,6 +106,28 @@ frame.pane--anchor.pane--focused {
     padding: 6px 10px;
     font-size: 10pt;
 }
+.lmux-terminal-tabs {
+    padding: 5px 6px;
+    background-color: alpha(#0f172a, 0.06);
+    border-bottom: 1px solid alpha(#64748b, 0.28);
+}
+.lmux-terminal-tab {
+    min-height: 26px;
+    min-width: 84px;
+    padding: 3px 10px;
+    border: 1px solid alpha(#64748b, 0.36);
+    border-radius: 6px;
+    background-color: alpha(#ffffff, 0.08);
+}
+.lmux-terminal-tab:hover {
+    background-color: alpha(#3b82f6, 0.12);
+    border-color: alpha(#3b82f6, 0.55);
+}
+.lmux-terminal-tab--active {
+    background-color: alpha(#3b82f6, 0.22);
+    border-color: #3b82f6;
+    font-weight: 700;
+}
 ";
 
 use std::sync::Arc;
@@ -122,7 +157,7 @@ pub fn activate(app: &Application) {
     install_css();
 
     let snapshot = load_snapshot();
-    let restored = snapshot.and_then(|s| build_restored(&s));
+    let restored = snapshot.as_ref().and_then(build_restored);
 
     let root = gtk4::Box::new(Orientation::Vertical, 0);
     root.set_hexpand(true);
@@ -135,7 +170,7 @@ pub fn activate(app: &Application) {
                 // Parent will be set by rebuild inside new_from_snapshot.
                 let _ = pane;
             }
-            let st = AppState::new_from_snapshot(
+            let mut st = AppState::new_from_snapshot(
                 root.clone(),
                 r.panes,
                 r.layout,
@@ -143,6 +178,9 @@ pub fn activate(app: &Application) {
                 r.anchors,
                 r.next_id,
             );
+            if let Some(snapshot) = snapshot.as_ref() {
+                st.restore_snapshot_metadata(snapshot);
+            }
             tracing::info!(
                 panes = st.pane_count(),
                 "session restored from last-session.json"
@@ -193,6 +231,9 @@ pub fn activate(app: &Application) {
     let focus_cb = make_focus_cb(&state);
     let reparent_cb = make_reparent_cb(&state);
     let terminal_action_cb = make_terminal_action_cb(&state);
+    let terminal_exit_cb = make_terminal_exit_cb(&state);
+    let terminal_tab_cb = make_terminal_tab_cb(&state);
+    let terminal_tab_rename_cb = make_terminal_tab_rename_cb(&state);
     {
         let mut s = state.borrow_mut();
         s.attach_controllers_for_all(
@@ -201,6 +242,9 @@ pub fn activate(app: &Application) {
             shortcut_prefix.clone(),
         );
         s.attach_rearrange_for_all(reparent_cb);
+        s.set_terminal_exit_callback(terminal_exit_cb);
+        s.set_terminal_tab_activated_callback(terminal_tab_cb);
+        s.set_terminal_tab_rename_callback(terminal_tab_rename_cb);
     }
 
     let compositor = build_compositor();
@@ -283,6 +327,47 @@ fn make_focus_cb(state: &SharedAppState) -> Rc<dyn Fn(PaneId)> {
                 b.set_focused(id);
             } else {
                 tracing::debug!(pane = id, "focus cb skipped (state busy)");
+            }
+        }
+    })
+}
+
+fn make_terminal_exit_cb(state: &SharedAppState) -> crate::pane::TerminalExitCallback {
+    let weak = Rc::downgrade(state);
+    Rc::new(move |id| {
+        if let Some(s) = weak.upgrade() {
+            gtk4::glib::idle_add_local_once(move || {
+                if let Ok(mut state) = s.try_borrow_mut() {
+                    state.close_exited_pane(id);
+                } else {
+                    tracing::debug!(pane = id, "terminal exit close skipped (state busy)");
+                }
+            });
+        }
+    })
+}
+
+fn make_terminal_tab_cb(state: &SharedAppState) -> crate::state::TerminalTabActivatedCallback {
+    let weak = Rc::downgrade(state);
+    Rc::new(move |anchor, tab| {
+        if let Some(s) = weak.upgrade() {
+            if let Ok(mut state) = s.try_borrow_mut() {
+                state.activate_terminal_tab(anchor, tab);
+            } else {
+                tracing::debug!(anchor, tab, "terminal tab switch skipped (state busy)");
+            }
+        }
+    })
+}
+
+fn make_terminal_tab_rename_cb(state: &SharedAppState) -> crate::state::TerminalTabRenameCallback {
+    let weak = Rc::downgrade(state);
+    Rc::new(move |pane_id, title| {
+        if let Some(s) = weak.upgrade() {
+            if let Ok(mut state) = s.try_borrow_mut() {
+                state.rename_pane_title_for_user(pane_id, title);
+            } else {
+                tracing::debug!(pane = pane_id, "terminal tab rename skipped (state busy)");
             }
         }
     })

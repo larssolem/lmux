@@ -33,6 +33,15 @@ pub struct SessionSnapshot {
     /// Spawn CWD per leaf pane id. Absent entries fall back to `$HOME` on
     /// restore (Story 8.3 — recorded cwd missing → warn + $HOME).
     pub cwds: std::collections::BTreeMap<u32, String>,
+    /// Visible pane titles with provenance. Optional for legacy snapshots.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub pane_titles: std::collections::BTreeMap<u32, PaneTitleSnapshot>,
+    /// Anchor-local terminal tab stacks. Optional for legacy snapshots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub terminal_tabs: Vec<TerminalTabStackSnapshot>,
+    /// Pane id -> tab root pane id. Optional for legacy snapshots.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub pane_terminal_tab_roots: std::collections::BTreeMap<u32, u32>,
 }
 
 impl SessionSnapshot {
@@ -44,6 +53,30 @@ impl SessionSnapshot {
         }
         self.anchor_pane_id.into_iter().collect()
     }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct PaneTitleSnapshot {
+    pub title: String,
+    pub provenance: PaneTitleProvenanceSnapshot,
+    #[serde(default)]
+    pub pinned: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneTitleProvenanceSnapshot {
+    Default,
+    Agent,
+    User,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct TerminalTabStackSnapshot {
+    pub anchor_pane_id: u32,
+    pub tab_roots: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_tab: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -186,6 +219,9 @@ mod tests {
                 m.insert(2, "/home".to_string());
                 m
             },
+            pane_titles: std::collections::BTreeMap::new(),
+            terminal_tabs: Vec::new(),
+            pane_terminal_tab_roots: std::collections::BTreeMap::new(),
         }
     }
 
@@ -236,6 +272,9 @@ mod tests {
             anchor_pane_ids: vec![],
             layout: LayoutNode::Leaf { pane_id: 7 },
             cwds: std::collections::BTreeMap::new(),
+            pane_titles: std::collections::BTreeMap::new(),
+            terminal_tabs: Vec::new(),
+            pane_terminal_tab_roots: std::collections::BTreeMap::new(),
         };
         assert_eq!(snap.anchors(), vec![7]);
     }
@@ -249,6 +288,9 @@ mod tests {
             anchor_pane_ids: vec![3, 4],
             layout: LayoutNode::Leaf { pane_id: 3 },
             cwds: std::collections::BTreeMap::new(),
+            pane_titles: std::collections::BTreeMap::new(),
+            terminal_tabs: Vec::new(),
+            pane_terminal_tab_roots: std::collections::BTreeMap::new(),
         };
         assert_eq!(snap.anchors(), vec![3, 4]);
     }
@@ -266,6 +308,42 @@ mod tests {
         let snap: SessionSnapshot = serde_json::from_str(legacy).unwrap();
         assert_eq!(snap.anchors(), vec![5]);
         assert!(snap.anchor_pane_ids.is_empty());
+        assert!(snap.pane_titles.is_empty());
+        assert!(snap.terminal_tabs.is_empty());
+        assert!(snap.pane_terminal_tab_roots.is_empty());
+    }
+
+    #[test]
+    fn pane_titles_and_terminal_tabs_roundtrip() {
+        let mut snap = sample();
+        snap.pane_titles.insert(
+            1,
+            PaneTitleSnapshot {
+                title: "tests".into(),
+                provenance: PaneTitleProvenanceSnapshot::User,
+                pinned: true,
+            },
+        );
+        snap.terminal_tabs.push(TerminalTabStackSnapshot {
+            anchor_pane_id: 1,
+            tab_roots: vec![1, 2],
+            active_tab: Some(2),
+        });
+        snap.pane_terminal_tab_roots.insert(1, 1);
+        snap.pane_terminal_tab_roots.insert(2, 2);
+
+        let json = serde_json::to_string(&snap).unwrap();
+        let restored: SessionSnapshot = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            restored
+                .pane_titles
+                .get(&1)
+                .map(|title| title.title.as_str()),
+            Some("tests")
+        );
+        assert_eq!(restored.terminal_tabs[0].active_tab, Some(2));
+        assert_eq!(restored.pane_terminal_tab_roots.get(&2), Some(&2));
     }
 
     fn tempdir() -> PathBuf {

@@ -24,6 +24,10 @@ pub use client::Client;
 pub use codec::{read_frame, write_frame, MAX_FRAME_BYTES};
 pub use envelope::{Envelope, PROTOCOL_VERSION};
 pub use error::{BusError, ErrorCode, ErrorPayload};
-pub use kinds::{ClientRole, Kind, PaneSummary, SessionSummary, StatusSnapshot};
+pub use kinds::{
+    AgentIdentity, AgentPaneStatus, AnchorSummary, ClientRole, GrantDecision, GrantRequest,
+    GrantScope, Kind, PaneNewResult, PanePlacement, PaneSummary, PaneTitle, PaneTitleProvenance,
+    SessionSummary, StatusSnapshot, TranscriptLine, TranscriptRange,
+};
 pub use paths::{bus_pid_path, bus_socket_path};
 pub use server::{Handler, RejectAllHandler, Server};

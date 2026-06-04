@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use lmux_control::{
     send_request, socket_path, Error as CtrlError, Request, Response, PROTOCOL_VERSION,
 };
@@ -11,6 +11,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Parser, Debug)]
 #[command(name = "lmux-cli", version, about = "lmux control CLI")]
 struct Cli {
+    /// Emit machine-readable JSON for commands that support it.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -20,6 +23,29 @@ enum Command {
     /// Promote the pane running this command to the session's anchor.
     /// Equivalent to pressing `Ctrl+B` then `a` in the pane.
     MarkAnchor,
+    /// tmux-compatible alias for `pane capture`.
+    CapturePane {
+        #[arg(short = 't', long = "target")]
+        target: String,
+        #[arg(short = 'n', long, default_value_t = 80)]
+        lines: u32,
+    },
+    /// tmux-compatible alias for `pane send`.
+    SendKeys {
+        #[arg(short = 't', long = "target")]
+        target: String,
+        #[arg(required = true, trailing_var_arg = true)]
+        keys: Vec<String>,
+    },
+    /// tmux-compatible alias for `pane new --tab`.
+    NewWindow {
+        #[arg(short = 't', long = "target", default_value = "current")]
+        target: String,
+        #[arg(short = 'n', long = "name")]
+        name: Option<String>,
+        #[arg(trailing_var_arg = true)]
+        argv: Vec<String>,
+    },
     /// Session management.
     #[command(subcommand)]
     Session(SessionCommand),
@@ -33,6 +59,9 @@ enum Command {
     /// GUI satellite control.
     #[command(subcommand)]
     Satellite(SatelliteCommand),
+    /// MCP adapter discovery and client configuration.
+    #[command(subcommand)]
+    Mcp(McpCommand),
     /// lmux process snapshot: pid, version, anchor count, session count,
     /// compositor state. Routed through the bus (`status.get`).
     Status,
@@ -40,6 +69,10 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum AnchorCommand {
+    /// List anchors/workspaces.
+    List,
+    /// Print the active anchor UUID.
+    Active,
     /// Create a new anchor pane and make it active.
     New,
     /// Activate an existing anchor by its anchor UUID.
@@ -63,12 +96,62 @@ enum PaneCommand {
     /// List every live pane, its UUID, whether it's tagged as an anchor,
     /// and its last-known cwd.
     List,
+    /// Create a terminal pane in the current or selected anchor.
+    New {
+        /// Anchor UUID, or `current` for the active anchor.
+        #[arg(long, default_value = "current")]
+        anchor: String,
+        /// Place the new pane as a tab once tab stacks are available.
+        #[arg(long, conflicts_with_all = ["split_right", "split_down"])]
+        tab: bool,
+        /// Split the target anchor to the right.
+        #[arg(long = "split-right", conflicts_with_all = ["tab", "split_down"])]
+        split_right: bool,
+        /// Split the target anchor downward.
+        #[arg(long = "split-down", conflicts_with_all = ["tab", "split_right"])]
+        split_down: bool,
+        /// Visible pane title.
+        #[arg(long)]
+        name: Option<String>,
+        /// Agent-visible purpose string.
+        #[arg(long)]
+        purpose: Option<String>,
+        /// Focus the new pane after creation.
+        #[arg(long)]
+        activate: bool,
+        /// Optional command argv to send to the new shell.
+        #[arg(trailing_var_arg = true)]
+        argv: Vec<String>,
+    },
+    /// Print recent transcript output for a terminal pane UUID.
+    Tail {
+        uuid: String,
+        #[arg(long, default_value_t = 80)]
+        lines: u32,
+    },
+    /// Print transcript output newer than a sequence number.
+    Capture {
+        uuid: String,
+        #[arg(long)]
+        since: Option<u64>,
+        #[arg(long)]
+        max_lines: Option<u32>,
+    },
+    /// Send text to a terminal pane UUID.
+    Send {
+        uuid: String,
+        text: String,
+        /// Append Enter after the provided text.
+        #[arg(long)]
+        enter: bool,
+    },
+    /// Rename a pane and pin the title as user-provided.
+    Rename { uuid: String, title: String },
 }
 
 #[derive(Subcommand, Debug)]
 enum SatelliteCommand {
     /// Legacy spawn path. Prefer `list-windows` + `attach-window`.
-    #[command(hide = true)]
     Open {
         /// Target pane UUID the satellite should dock to once the KWin
         /// script-side correlation lands (v0.3). v0.2 accepts it but
@@ -106,6 +189,47 @@ enum SatelliteCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum McpCommand {
+    /// Show whether lmux-mcp and known AI CLI clients are available.
+    Status,
+    /// Configure a known AI CLI client to launch lmux-mcp.
+    Install {
+        /// Client to configure. `auto` installs every supported client found in PATH.
+        #[arg(long, value_enum, default_value_t = McpClientSelection::Auto)]
+        client: McpClientSelection,
+        /// Print commands without executing them.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Print MCP server config snippets for manual setup.
+    PrintConfig {
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = McpConfigFormat::Json)]
+        format: McpConfigFormat,
+        /// Agent id advertised by lmux-mcp in grant prompts.
+        #[arg(long, default_value = "lmux-mcp")]
+        agent_id: String,
+        /// Agent name advertised by lmux-mcp in grant prompts.
+        #[arg(long, default_value = "lmux MCP")]
+        agent_name: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum McpClientSelection {
+    Auto,
+    Codex,
+    Claude,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum McpConfigFormat {
+    Json,
+    ClaudeProject,
+    CodexToml,
+}
+
 #[derive(Debug)]
 struct AttachWindowOptions {
     backend: String,
@@ -117,6 +241,19 @@ struct AttachWindowOptions {
     app_identity_kind: Option<String>,
     app_identity_value: Option<String>,
     title: Option<String>,
+}
+
+#[derive(Debug)]
+struct PaneNewOptions {
+    anchor: String,
+    tab: bool,
+    split_right: bool,
+    split_down: bool,
+    name: Option<String>,
+    purpose: Option<String>,
+    activate: bool,
+    argv: Vec<String>,
+    json: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -148,13 +285,29 @@ fn main() -> ExitCode {
         .init();
 
     let cli = Cli::parse();
+    let json = cli.json;
     match cli.command {
         Command::MarkAnchor => run_mark_anchor(),
+        Command::CapturePane { target, lines } => run_pane_tail(&target, lines, json),
+        Command::SendKeys { target, keys } => run_send_keys_alias(&target, keys),
+        Command::NewWindow { target, name, argv } => run_pane_new(PaneNewOptions {
+            anchor: target,
+            tab: true,
+            split_right: false,
+            split_down: false,
+            name,
+            purpose: None,
+            activate: true,
+            argv,
+            json,
+        }),
         Command::Session(SessionCommand::List) => run_session_list(),
         Command::Session(SessionCommand::New { name }) => run_session_new(&name),
         Command::Session(SessionCommand::Rename { from, to }) => run_session_rename(&from, &to),
         Command::Session(SessionCommand::Delete { name }) => run_session_delete(&name),
         Command::Session(SessionCommand::Open { name }) => run_session_open(&name),
+        Command::Anchor(AnchorCommand::List) => run_anchor_list(json),
+        Command::Anchor(AnchorCommand::Active) => run_anchor_active(json),
         Command::Anchor(AnchorCommand::New) => run_anchor_new(),
         Command::Anchor(AnchorCommand::Activate { uuid }) => run_anchor_activate(&uuid),
         Command::Anchor(AnchorCommand::Pause { uuid }) => run_anchor_pause(&uuid),
@@ -164,6 +317,36 @@ fn main() -> ExitCode {
         Command::Anchor(AnchorCommand::Untag { uuid }) => run_anchor_untag(&uuid),
         Command::Anchor(AnchorCommand::Tag { uuid }) => run_anchor_tag(&uuid),
         Command::Pane(PaneCommand::List) => run_pane_list(),
+        Command::Pane(PaneCommand::New {
+            anchor,
+            tab,
+            split_right,
+            split_down,
+            name,
+            purpose,
+            activate,
+            argv,
+        }) => run_pane_new(PaneNewOptions {
+            anchor,
+            tab,
+            split_right,
+            split_down,
+            name,
+            purpose,
+            activate,
+            argv,
+            json,
+        }),
+        Command::Pane(PaneCommand::Tail { uuid, lines }) => run_pane_tail(&uuid, lines, json),
+        Command::Pane(PaneCommand::Capture {
+            uuid,
+            since,
+            max_lines,
+        }) => run_pane_capture(&uuid, since, max_lines, json),
+        Command::Pane(PaneCommand::Send { uuid, text, enter }) => {
+            run_pane_send(&uuid, &text, enter)
+        }
+        Command::Pane(PaneCommand::Rename { uuid, title }) => run_pane_rename(&uuid, &title),
         Command::Satellite(SatelliteCommand::Open { target, argv }) => {
             run_satellite_open(&target, argv)
         }
@@ -190,6 +373,13 @@ fn main() -> ExitCode {
             app_identity_value,
             title,
         }),
+        Command::Mcp(McpCommand::Status) => run_mcp_status(json),
+        Command::Mcp(McpCommand::Install { client, dry_run }) => run_mcp_install(client, dry_run),
+        Command::Mcp(McpCommand::PrintConfig {
+            format,
+            agent_id,
+            agent_name,
+        }) => run_mcp_print_config(format, &agent_id, &agent_name),
         Command::Status => run_status(),
     }
 }
@@ -294,6 +484,7 @@ fn run_satellite_attach_window(options: AttachWindowOptions) -> ExitCode {
         title,
         workspace: None,
         output: None,
+        agent: agent_from_env(),
     }) {
         Ok(()) => {
             println!("window attached");
@@ -412,6 +603,57 @@ fn run_anchor_new() -> ExitCode {
     }
 }
 
+fn run_anchor_list(json: bool) -> ExitCode {
+    match run_bus_request(lmux_bus::Kind::AnchorList {}) {
+        Ok(lmux_bus::Kind::AnchorListResult { anchors }) => {
+            if json {
+                return print_json(&anchors);
+            }
+            if anchors.is_empty() {
+                println!("(no anchors)");
+                return ExitCode::SUCCESS;
+            }
+            for anchor in anchors {
+                let active = if anchor.active { "*" } else { " " };
+                let pane = anchor
+                    .pane_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "-".into());
+                println!(
+                    "{active} {}  pane={}  {}",
+                    anchor.anchor_id, pane, anchor.label
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(other) => unexpected_response(other),
+        Err(err) => print_error(err),
+    }
+}
+
+fn run_anchor_active(json: bool) -> ExitCode {
+    match run_bus_request(lmux_bus::Kind::AnchorList {}) {
+        Ok(lmux_bus::Kind::AnchorListResult { anchors }) => {
+            let active = anchors.into_iter().find(|anchor| anchor.active);
+            if json {
+                return print_json(&active);
+            }
+            match active {
+                Some(anchor) => {
+                    println!("{}", anchor.anchor_id);
+                    ExitCode::SUCCESS
+                }
+                None => {
+                    eprintln!("lmux-cli: no active anchor");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        Ok(other) => unexpected_response(other),
+        Err(err) => print_error(err),
+    }
+}
+
 fn run_anchor_activate(uuid: &str) -> ExitCode {
     match uuid.parse::<uuid::Uuid>() {
         Ok(parsed) => match run_bus_write(lmux_bus::Kind::AnchorActivate { pane_id: parsed }) {
@@ -510,6 +752,419 @@ fn run_pane_list() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn run_pane_new(options: PaneNewOptions) -> ExitCode {
+    let target_anchor = if options.anchor == "current" {
+        None
+    } else {
+        match parse_uuid(&options.anchor) {
+            Ok(parsed) => Some(parsed),
+            Err(code) => return code,
+        }
+    };
+    let placement = if options.tab {
+        lmux_bus::PanePlacement::Tab
+    } else if options.split_down {
+        lmux_bus::PanePlacement::SplitDown
+    } else {
+        let _ = options.split_right;
+        lmux_bus::PanePlacement::SplitRight
+    };
+    match run_bus_request(lmux_bus::Kind::PaneNew {
+        target_anchor,
+        placement,
+        activate: options.activate,
+        title: options.name,
+        argv: options.argv,
+        agent: agent_from_env(),
+        purpose: options.purpose,
+    }) {
+        Ok(lmux_bus::Kind::PaneNewResult(created)) => {
+            if options.json {
+                return print_json(&created);
+            }
+            println!(
+                "pane: {}  anchor: {}  placement: {:?}",
+                created.pane_id, created.anchor_id, created.placement
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(other) => unexpected_response(other),
+        Err(err) => print_error(err),
+    }
+}
+
+fn run_pane_tail(uuid: &str, lines: u32, json: bool) -> ExitCode {
+    let pane_id = match parse_uuid(uuid) {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
+    };
+    match run_bus_request(lmux_bus::Kind::PaneTail {
+        pane_id,
+        lines,
+        agent: agent_from_env(),
+    }) {
+        Ok(lmux_bus::Kind::PaneTranscriptResult(range)) => print_transcript_range(range, json),
+        Ok(other) => unexpected_response(other),
+        Err(err) => print_error(err),
+    }
+}
+
+fn run_pane_capture(
+    uuid: &str,
+    since_sequence: Option<u64>,
+    max_lines: Option<u32>,
+    json: bool,
+) -> ExitCode {
+    let pane_id = match parse_uuid(uuid) {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
+    };
+    match run_bus_request(lmux_bus::Kind::PaneCapture {
+        pane_id,
+        since_sequence,
+        max_lines,
+        agent: agent_from_env(),
+    }) {
+        Ok(lmux_bus::Kind::PaneTranscriptResult(range)) => print_transcript_range(range, json),
+        Ok(other) => unexpected_response(other),
+        Err(err) => print_error(err),
+    }
+}
+
+fn print_transcript_range(range: lmux_bus::TranscriptRange, json: bool) -> ExitCode {
+    if json {
+        return print_json(&range);
+    }
+    if range.truncated {
+        eprintln!("lmux-cli: transcript truncated before requested sequence");
+    }
+    for line in range.lines {
+        println!("{}", line.text);
+    }
+    ExitCode::SUCCESS
+}
+
+fn run_pane_send(uuid: &str, text: &str, enter: bool) -> ExitCode {
+    let pane_id = match parse_uuid(uuid) {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
+    };
+    let mut text = text.to_string();
+    if enter {
+        text.push('\n');
+    }
+    match run_bus_write(lmux_bus::Kind::PaneSendInput {
+        pane_id,
+        text,
+        agent: agent_from_env(),
+    }) {
+        Ok(()) => {
+            println!("sent: {uuid}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => print_error(err),
+    }
+}
+
+fn run_send_keys_alias(uuid: &str, keys: Vec<String>) -> ExitCode {
+    let mut text = String::new();
+    for key in keys {
+        match key.as_str() {
+            "Enter" | "enter" | "Return" | "return" => text.push('\n'),
+            other => {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push(' ');
+                }
+                text.push_str(other);
+            }
+        }
+    }
+    run_pane_send(uuid, &text, false)
+}
+
+fn run_pane_rename(uuid: &str, title: &str) -> ExitCode {
+    let pane_id = match parse_uuid(uuid) {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
+    };
+    match run_bus_write(lmux_bus::Kind::PaneRename {
+        pane_id,
+        title: title.to_string(),
+        pin: true,
+        agent: None,
+    }) {
+        Ok(()) => {
+            println!("renamed: {uuid}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => print_error(err),
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct McpStatus {
+    lmux_mcp: ToolAvailability,
+    codex: ToolAvailability,
+    claude: ToolAvailability,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ToolAvailability {
+    command: String,
+    path: Option<String>,
+    available: bool,
+}
+
+fn run_mcp_status(json: bool) -> ExitCode {
+    let status = McpStatus {
+        lmux_mcp: lmux_mcp_availability(),
+        codex: tool_availability("codex"),
+        claude: tool_availability("claude"),
+    };
+    if json {
+        return print_json(&status);
+    }
+    print_tool_status("lmux-mcp", &status.lmux_mcp);
+    print_tool_status("codex", &status.codex);
+    print_tool_status("claude", &status.claude);
+    ExitCode::SUCCESS
+}
+
+fn print_tool_status(label: &str, tool: &ToolAvailability) {
+    let state = if tool.available { "found" } else { "missing" };
+    let path = tool.path.as_deref().unwrap_or("-");
+    println!("{label}: {state} ({path})");
+}
+
+fn run_mcp_install(selection: McpClientSelection, dry_run: bool) -> ExitCode {
+    let lmux_mcp = lmux_mcp_availability();
+    let lmux_mcp_command = lmux_mcp.path.as_deref().unwrap_or("lmux-mcp").to_string();
+    if dry_run {
+        for client in selected_mcp_clients(selection) {
+            println!(
+                "{}",
+                shell_command_line(&client.install_command(&lmux_mcp_command))
+            );
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    if !lmux_mcp.available {
+        eprintln!(
+            "lmux-cli: lmux-mcp not found in PATH or next to lmux-cli; build/install lmux-mcp first"
+        );
+        return ExitCode::from(1);
+    }
+
+    let clients = selected_mcp_clients(selection);
+    let mut attempted = 0usize;
+    let mut failed = false;
+    for client in clients {
+        let command = client.install_command(&lmux_mcp_command);
+        if !tool_availability(&command[0]).available {
+            if selection != McpClientSelection::Auto {
+                eprintln!("lmux-cli: {} not found in PATH", command[0]);
+                return ExitCode::from(1);
+            }
+            continue;
+        }
+        attempted = attempted.saturating_add(1);
+        match std::process::Command::new(&command[0])
+            .args(&command[1..])
+            .status()
+        {
+            Ok(status) if status.success() => {
+                println!("installed lmux MCP for {}", client.name());
+            }
+            Ok(status) => {
+                eprintln!("lmux-cli: {} exited with {status}", client.name());
+                failed = true;
+            }
+            Err(err) => {
+                eprintln!("lmux-cli: failed to run {}: {err}", command[0]);
+                failed = true;
+            }
+        }
+    }
+
+    if attempted == 0 {
+        eprintln!("lmux-cli: no supported MCP clients found in PATH");
+        return ExitCode::from(1);
+    }
+    if failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn run_mcp_print_config(format: McpConfigFormat, agent_id: &str, agent_name: &str) -> ExitCode {
+    let command = lmux_mcp_availability()
+        .path
+        .unwrap_or_else(|| "lmux-mcp".to_string());
+    match format {
+        McpConfigFormat::Json | McpConfigFormat::ClaudeProject => {
+            let value = serde_json::json!({
+                "mcpServers": {
+                    "lmux": {
+                        "command": command,
+                        "args": [],
+                        "env": {
+                            "LMUX_AGENT_ID": agent_id,
+                            "LMUX_AGENT_NAME": agent_name,
+                        }
+                    }
+                }
+            });
+            print_json(&value)
+        }
+        McpConfigFormat::CodexToml => {
+            println!("[mcp_servers.lmux]");
+            println!("command = \"{}\"", toml_escape(&command));
+            println!("args = []");
+            println!("[mcp_servers.lmux.env]");
+            println!("LMUX_AGENT_ID = \"{}\"", toml_escape(agent_id));
+            println!("LMUX_AGENT_NAME = \"{}\"", toml_escape(agent_name));
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SupportedMcpClient {
+    Codex,
+    Claude,
+}
+
+impl SupportedMcpClient {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+
+    fn install_command(self, lmux_mcp_command: &str) -> Vec<String> {
+        let mut command: Vec<String> = match self {
+            Self::Codex => vec![
+                "codex",
+                "mcp",
+                "add",
+                "--env",
+                "LMUX_AGENT_ID=codex",
+                "--env",
+                "LMUX_AGENT_NAME=Codex",
+                "lmux",
+                "--",
+            ],
+            Self::Claude => vec![
+                "claude",
+                "mcp",
+                "add",
+                "--scope",
+                "user",
+                "-e",
+                "LMUX_AGENT_ID=claude",
+                "-e",
+                "LMUX_AGENT_NAME=Claude",
+                "lmux",
+                "--",
+            ],
+        }
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        command.push(lmux_mcp_command.to_string());
+        command
+    }
+}
+
+fn selected_mcp_clients(selection: McpClientSelection) -> Vec<SupportedMcpClient> {
+    match selection {
+        McpClientSelection::Auto => vec![SupportedMcpClient::Codex, SupportedMcpClient::Claude],
+        McpClientSelection::Codex => vec![SupportedMcpClient::Codex],
+        McpClientSelection::Claude => vec![SupportedMcpClient::Claude],
+    }
+}
+
+fn tool_availability(command: &str) -> ToolAvailability {
+    let path = find_in_path(command).map(|path| path.display().to_string());
+    ToolAvailability {
+        command: command.to_string(),
+        available: path.is_some(),
+        path,
+    }
+}
+
+fn lmux_mcp_availability() -> ToolAvailability {
+    let path = find_in_path("lmux-mcp")
+        .or_else(lmux_mcp_next_to_current_exe)
+        .map(|path| path.display().to_string());
+    ToolAvailability {
+        command: "lmux-mcp".to_string(),
+        available: path.is_some(),
+        path,
+    }
+}
+
+fn lmux_mcp_next_to_current_exe() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let candidate = dir.join("lmux-mcp");
+    is_executable_file(&candidate).then_some(candidate)
+}
+
+fn find_in_path(command: &str) -> Option<std::path::PathBuf> {
+    if command.contains(std::path::MAIN_SEPARATOR) {
+        let path = std::path::PathBuf::from(command);
+        return is_executable_file(&path).then_some(path);
+    }
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(command))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+fn is_executable_file(path: &std::path::Path) -> bool {
+    let Ok(meta) = path.metadata() else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn shell_command_line(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b':' | b'=')
+        })
+    {
+        return arg.to_string();
+    }
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+fn toml_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn run_anchor_pause(uuid: &str) -> ExitCode {
@@ -670,6 +1325,56 @@ fn run_session_delete(name: &str) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn parse_uuid(value: &str) -> Result<uuid::Uuid, ExitCode> {
+    value.parse::<uuid::Uuid>().map_err(|err| {
+        eprintln!("lmux-cli: invalid UUID: {err}");
+        ExitCode::from(2)
+    })
+}
+
+fn agent_from_env() -> Option<lmux_bus::AgentIdentity> {
+    let id = std::env::var("LMUX_AGENT_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())?;
+    let name = std::env::var("LMUX_AGENT_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    Some(lmux_bus::AgentIdentity { id, name })
+}
+
+fn print_json<T: serde::Serialize>(value: &T) -> ExitCode {
+    match serde_json::to_string_pretty(value) {
+        Ok(json) => {
+            println!("{json}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("lmux-cli: json: {err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn print_error(err: anyhow::Error) -> ExitCode {
+    eprintln!("lmux-cli: {err}");
+    ExitCode::from(1)
+}
+
+fn unexpected_response(other: lmux_bus::Kind) -> ExitCode {
+    eprintln!("lmux-cli: unexpected bus response: {other:?}");
+    ExitCode::from(1)
+}
+
+fn run_bus_request(kind: lmux_bus::Kind) -> anyhow::Result<lmux_bus::Kind> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let mut client = lmux_bus::Client::connect_default(lmux_bus::ClientRole::LmuxCli).await?;
+        client.request(kind).await.map_err(Into::into)
+    })
 }
 
 fn run_bus_write(kind: lmux_bus::Kind) -> anyhow::Result<()> {

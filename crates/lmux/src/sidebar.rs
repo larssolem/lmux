@@ -43,7 +43,7 @@ use lmux_macos_helper::WindowPreview as MacosWindowPreview;
 
 use crate::layout::PaneId;
 use crate::pane::ShortcutPrefixCell;
-use crate::state::SharedAppState;
+use crate::state::{AnchorAgentActivity, AnchorGrantView, SharedAppState};
 
 type ActiveRows = Rc<RefCell<HashMap<PaneId, ActiveRow>>>;
 
@@ -478,13 +478,14 @@ fn refresh_list(
             list.append(&header);
             last_group = Some(group.clone());
         }
-        let (current_name, is_active) = {
+        let (current_name, is_active, activity) = {
             let s = state.borrow();
             (
                 s.anchor_for_pane(pane_id)
                     .and_then(|a| a.name.clone())
                     .unwrap_or_default(),
                 s.active_anchor() == Some(pane_id),
+                s.anchor_agent_activity(pane_id),
             )
         };
         let current_group = group.clone().unwrap_or_default();
@@ -496,6 +497,7 @@ fn refresh_list(
             group.clone(),
             group_order.clone(),
             is_active,
+            activity,
             state.clone(),
             preview,
             active_rows.clone(),
@@ -539,6 +541,7 @@ fn build_row(
     group_key: Option<String>,
     group_order: Rc<std::collections::HashMap<Option<String>, Vec<PaneId>>>,
     is_active: bool,
+    activity: AnchorAgentActivity,
     state: SharedAppState,
     preview: PreviewCfg,
     active_rows: ActiveRows,
@@ -619,6 +622,15 @@ fn build_row(
     menu_btn.add_css_class("flat");
     menu_btn.set_tooltip_text(Some("Workspace actions"));
     header_row.append(&menu_btn);
+
+    if let Some(text) = agent_activity_text(&activity) {
+        let activity_label = Label::new(Some(&text));
+        activity_label.set_xalign(0.0);
+        activity_label.set_wrap(true);
+        activity_label.add_css_class("dim-label");
+        row.append(&activity_label);
+    }
+
     let row_for_btn = row.downgrade();
     let state_for_btn = state.clone();
     let name_for_btn = current_name.clone();
@@ -697,6 +709,33 @@ fn build_row(
     row.add_controller(long_press);
 
     row.upcast()
+}
+
+fn agent_activity_text(activity: &AnchorAgentActivity) -> Option<String> {
+    let mut parts: Vec<String> = activity
+        .agents
+        .iter()
+        .map(|status| {
+            let agent = status
+                .agent
+                .name
+                .as_deref()
+                .unwrap_or(status.agent.id.as_str());
+            match (&status.title, &status.purpose) {
+                (Some(title), Some(purpose)) => format!("{agent}: {title} ({purpose})"),
+                (Some(title), None) => format!("{agent}: {title}"),
+                (None, Some(purpose)) => format!("{agent}: {purpose}"),
+                (None, None) => agent.to_string(),
+            }
+        })
+        .collect();
+    if activity.pending_grants > 0 {
+        parts.push(format!("{} pending", activity.pending_grants));
+    }
+    if activity.active_grants > 0 {
+        parts.push(format!("{} active", activity.active_grants));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 /// Install a low-res pane thumbnail under the row header. The `Picture`
@@ -1565,6 +1604,26 @@ fn show_row_popover(
         body.append(&uuid_label);
     }
 
+    let activity = state.borrow().anchor_agent_activity(pane_id);
+    if let Some(text) = agent_activity_text(&activity) {
+        let activity_label = Label::new(Some(&text));
+        activity_label.set_xalign(0.0);
+        activity_label.set_wrap(true);
+        activity_label.add_css_class("dim-label");
+        body.append(&activity_label);
+    }
+
+    let grants = state.borrow().anchor_grant_views(pane_id);
+    if !grants.is_empty() {
+        let grants_label = Label::new(Some("Agent access"));
+        grants_label.set_xalign(0.0);
+        grants_label.add_css_class("dim-label");
+        body.append(&grants_label);
+        for grant in grants {
+            body.append(&grant_row(grant, state.clone()));
+        }
+    }
+
     let name_label = Label::new(Some("Name"));
     name_label.set_xalign(0.0);
     name_label.add_css_class("dim-label");
@@ -1659,6 +1718,96 @@ fn show_row_popover(
 
     popover.popup();
     name_entry.grab_focus();
+}
+
+fn grant_row(grant: AnchorGrantView, state: SharedAppState) -> gtk4::Widget {
+    let row = GtkBox::new(Orientation::Vertical, 4);
+    row.add_css_class("lmux-sidebar__grant-row");
+
+    let requester = grant
+        .requester
+        .name
+        .as_deref()
+        .unwrap_or(grant.requester.id.as_str());
+    let state_text = if grant.pending { "pending" } else { "active" };
+    let mut text = format!("{requester} · {:?} · {state_text}", grant.scope);
+    if let Some(reason) = &grant.reason {
+        text.push_str(" · ");
+        text.push_str(reason);
+    }
+    let label = Label::new(Some(&text));
+    label.set_xalign(0.0);
+    label.set_wrap(true);
+    row.append(&label);
+
+    let buttons = GtkBox::new(Orientation::Horizontal, 4);
+    buttons.set_halign(Align::End);
+    if grant.pending {
+        let allow_once = Button::with_label("Allow once");
+        let allow_timed = Button::with_label("Allow 10m");
+        let deny = Button::with_label("Deny");
+        deny.add_css_class("destructive-action");
+
+        let state_once = state.clone();
+        let once_id = grant.grant_id;
+        allow_once.connect_clicked(move |_| {
+            if let Err(err) = state_once
+                .borrow_mut()
+                .decide_grant(once_id, lmux_bus::GrantDecision::AllowOnce)
+            {
+                tracing::warn!(error = %err, "grant allow-once failed");
+            }
+        });
+
+        let state_timed = state.clone();
+        let timed_id = grant.grant_id;
+        allow_timed.connect_clicked(move |_| {
+            let expires_at_unix_seconds = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs() + 600)
+                .unwrap_or(600);
+            if let Err(err) = state_timed.borrow_mut().decide_grant(
+                timed_id,
+                lmux_bus::GrantDecision::AllowUntil {
+                    expires_at_unix_seconds,
+                },
+            ) {
+                tracing::warn!(error = %err, "grant allow-timed failed");
+            }
+        });
+
+        let state_deny = state;
+        let deny_id = grant.grant_id;
+        deny.connect_clicked(move |_| {
+            if let Err(err) = state_deny
+                .borrow_mut()
+                .decide_grant(deny_id, lmux_bus::GrantDecision::Deny)
+            {
+                tracing::warn!(error = %err, "grant deny failed");
+            }
+        });
+
+        buttons.append(&allow_once);
+        buttons.append(&allow_timed);
+        buttons.append(&deny);
+    } else if grant.active {
+        let revoke = Button::with_label("Revoke");
+        revoke.add_css_class("destructive-action");
+        let state_revoke = state;
+        let revoke_id = grant.grant_id;
+        revoke.connect_clicked(move |_| {
+            if let Err(err) = state_revoke
+                .borrow_mut()
+                .decide_grant(revoke_id, lmux_bus::GrantDecision::Revoke)
+            {
+                tracing::warn!(error = %err, "grant revoke failed");
+            }
+        });
+        buttons.append(&revoke);
+    }
+
+    row.append(&buttons);
+    row.upcast()
 }
 
 fn trim_to_option(s: &gtk4::glib::GString) -> Option<String> {

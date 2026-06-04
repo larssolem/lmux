@@ -103,6 +103,11 @@ fn error_payload_to_bus_error(p: &crate::error::ErrorPayload) -> BusError {
             code: ErrorCode::PeerDenied,
         },
         ErrorCode::BadRequest => BusError::BadRequest(p.message.clone()),
+        ErrorCode::Unauthorized => BusError::Unauthorized(p.message.clone()),
+        ErrorCode::GrantDenied => BusError::GrantDenied(p.message.clone()),
+        ErrorCode::TranscriptUnavailable => BusError::TranscriptUnavailable(p.message.clone()),
+        ErrorCode::StaleSequence => BusError::StaleSequence(p.message.clone()),
+        ErrorCode::UserPinnedTitle => BusError::UserPinnedTitle(p.message.clone()),
         _ => BusError::Domain(p.message.clone()),
     }
 }

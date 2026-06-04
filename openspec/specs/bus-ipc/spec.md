@@ -117,8 +117,8 @@ The implemented CLI binary SHALL be `lmux-cli`.
 #### Scenario: Pane list exposes pane UUIDs
 
 - **WHEN** the user runs `lmux-cli pane list`
-- **THEN** the CLI prints each live pane UUID, optional anchor UUID, and
-  best-effort cwd
+- **THEN** the CLI prints each live pane UUID, owning anchor UUID when the pane
+  belongs to an anchor workspace or terminal tab stack, and best-effort cwd
 
 #### Scenario: Native attach commands are available
 

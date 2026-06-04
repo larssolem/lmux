@@ -24,6 +24,16 @@ pub enum ErrorCode {
     /// Handler rejected the operation due to domain-level state (e.g.
     /// session not found). Carries a human-readable message.
     Domain,
+    /// Requester is not authorized to perform the operation.
+    Unauthorized,
+    /// User denied or revoked the grant needed for the operation.
+    GrantDenied,
+    /// Requested pane has no transcript surface.
+    TranscriptUnavailable,
+    /// Requested transcript sequence has fallen out of the ringbuffer.
+    StaleSequence,
+    /// Pane title is user-pinned and cannot be overwritten automatically.
+    UserPinnedTitle,
     /// Catch-all for internal I/O errors surfaced to the client.
     Io,
 }
@@ -61,6 +71,21 @@ pub enum BusError {
     #[error("domain error: {0}")]
     Domain(String),
 
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
+
+    #[error("grant denied: {0}")]
+    GrantDenied(String),
+
+    #[error("transcript unavailable: {0}")]
+    TranscriptUnavailable(String),
+
+    #[error("stale transcript sequence: {0}")]
+    StaleSequence(String),
+
+    #[error("user-pinned title: {0}")]
+    UserPinnedTitle(String),
+
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 
@@ -78,6 +103,11 @@ impl BusError {
             | BusError::PeerDenied { code } => *code,
             BusError::BadRequest(_) => ErrorCode::BadRequest,
             BusError::Domain(_) => ErrorCode::Domain,
+            BusError::Unauthorized(_) => ErrorCode::Unauthorized,
+            BusError::GrantDenied(_) => ErrorCode::GrantDenied,
+            BusError::TranscriptUnavailable(_) => ErrorCode::TranscriptUnavailable,
+            BusError::StaleSequence(_) => ErrorCode::StaleSequence,
+            BusError::UserPinnedTitle(_) => ErrorCode::UserPinnedTitle,
             BusError::Json(_) => ErrorCode::BadRequest,
             BusError::Io(_) => ErrorCode::Io,
         }
@@ -110,6 +140,11 @@ mod tests {
             ErrorCode::PeerDenied,
             ErrorCode::BadRequest,
             ErrorCode::Domain,
+            ErrorCode::Unauthorized,
+            ErrorCode::GrantDenied,
+            ErrorCode::TranscriptUnavailable,
+            ErrorCode::StaleSequence,
+            ErrorCode::UserPinnedTitle,
             ErrorCode::Io,
         ] {
             let s = serde_json::to_string(&code).unwrap();

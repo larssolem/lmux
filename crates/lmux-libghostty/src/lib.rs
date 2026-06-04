@@ -96,8 +96,58 @@ pub struct Terminal {
     rs: ffi::GhosttyRenderState,
     iter: ffi::GhosttyRenderStateRowIterator,
     cells: ffi::GhosttyRenderStateRowCells,
+    pty_output: Box<PtyOutput>,
+    pending_osc_query: Vec<u8>,
     cols: u16,
     rows: u16,
+}
+
+struct PtyOutput {
+    bytes: Vec<u8>,
+}
+
+const DEFAULT_FG: ffi::GhosttyColorRgb = ffi::GhosttyColorRgb {
+    r: 238,
+    g: 238,
+    b: 238,
+};
+const DEFAULT_BG: ffi::GhosttyColorRgb = ffi::GhosttyColorRgb { r: 0, g: 0, b: 0 };
+const DEFAULT_CURSOR: ffi::GhosttyColorRgb = ffi::GhosttyColorRgb {
+    r: 238,
+    g: 238,
+    b: 238,
+};
+const MAX_PENDING_OSC_QUERY: usize = 64;
+
+unsafe extern "C" fn write_pty_callback(
+    _terminal: ffi::GhosttyTerminal,
+    userdata: *mut c_void,
+    data: *const u8,
+    len: usize,
+) {
+    if userdata.is_null() || data.is_null() || len == 0 {
+        return;
+    }
+    // SAFETY: `userdata` points at `Terminal::pty_output`, a stable heap
+    // allocation. Ghostty invokes this synchronously during `feed`, while the
+    // caller holds `&mut self`, so there is no concurrent mutation.
+    let output = unsafe { &mut *(userdata.cast::<PtyOutput>()) };
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    output.bytes.extend_from_slice(bytes);
+}
+
+unsafe extern "C" fn color_scheme_callback(
+    _terminal: ffi::GhosttyTerminal,
+    _userdata: *mut c_void,
+    out_scheme: *mut ffi::GhosttyColorScheme,
+) -> bool {
+    if out_scheme.is_null() {
+        return false;
+    }
+    unsafe {
+        *out_scheme = ffi::GhosttyColorScheme_GHOSTTY_COLOR_SCHEME_DARK;
+    }
+    true
 }
 
 impl Terminal {
@@ -116,6 +166,22 @@ impl Terminal {
             };
             let r = ffi::ghostty_terminal_new(ptr::null(), &mut term, opts);
             if r != ffi::GhosttyResult_GHOSTTY_SUCCESS || term.is_null() {
+                return None;
+            }
+            if !set_terminal_color(
+                term,
+                ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND,
+                &DEFAULT_FG,
+            ) || !set_terminal_color(
+                term,
+                ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND,
+                &DEFAULT_BG,
+            ) || !set_terminal_color(
+                term,
+                ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_COLOR_CURSOR,
+                &DEFAULT_CURSOR,
+            ) {
+                ffi::ghostty_terminal_free(term);
                 return None;
             }
 
@@ -143,11 +209,52 @@ impl Terminal {
                 return None;
             }
 
+            let mut pty_output = Box::new(PtyOutput { bytes: Vec::new() });
+            let userdata = pty_output.as_mut() as *mut PtyOutput as *const c_void;
+            let r = ffi::ghostty_terminal_set(
+                term,
+                ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_USERDATA,
+                userdata,
+            );
+            if r != ffi::GhosttyResult_GHOSTTY_SUCCESS {
+                ffi::ghostty_render_state_row_cells_free(cells);
+                ffi::ghostty_render_state_row_iterator_free(iter);
+                ffi::ghostty_render_state_free(rs);
+                ffi::ghostty_terminal_free(term);
+                return None;
+            }
+            let r = ffi::ghostty_terminal_set(
+                term,
+                ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_WRITE_PTY,
+                write_pty_callback as *const () as *const c_void,
+            );
+            if r != ffi::GhosttyResult_GHOSTTY_SUCCESS {
+                ffi::ghostty_render_state_row_cells_free(cells);
+                ffi::ghostty_render_state_row_iterator_free(iter);
+                ffi::ghostty_render_state_free(rs);
+                ffi::ghostty_terminal_free(term);
+                return None;
+            }
+            let r = ffi::ghostty_terminal_set(
+                term,
+                ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_COLOR_SCHEME,
+                color_scheme_callback as *const () as *const c_void,
+            );
+            if r != ffi::GhosttyResult_GHOSTTY_SUCCESS {
+                ffi::ghostty_render_state_row_cells_free(cells);
+                ffi::ghostty_render_state_row_iterator_free(iter);
+                ffi::ghostty_render_state_free(rs);
+                ffi::ghostty_terminal_free(term);
+                return None;
+            }
+
             Some(Self {
                 term,
                 rs,
                 iter,
                 cells,
+                pty_output,
+                pending_osc_query: Vec::new(),
                 cols,
                 rows,
             })
@@ -167,10 +274,17 @@ impl Terminal {
         if bytes.is_empty() {
             return;
         }
+        self.respond_to_terminal_queries(bytes);
         // SAFETY: `bytes` comes from a valid slice with length `bytes.len()`.
         unsafe {
             ffi::ghostty_terminal_vt_write(self.term, bytes.as_ptr(), bytes.len());
         }
+    }
+
+    /// Return response bytes generated by terminal queries since the last
+    /// call. The PTY owner should write these back to the child process.
+    pub fn take_pty_output(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pty_output.bytes)
     }
 
     /// Tell the VT it was resized to `(cols, rows)` cells of `(cell_w_px, cell_h_px)` pixels.
@@ -448,31 +562,41 @@ impl Terminal {
                         ffi::GhosttyRenderStateRowCellsData_GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN,
                         ptr::addr_of_mut!(len).cast::<c_void>(),
                     );
-                    if len == 0 {
-                        col_idx += 1;
-                        continue;
+                    let mut bg_cell = default_bg;
+                    let bg_result = ffi::ghostty_render_state_row_cells_get(
+                        self.cells,
+                        ffi::GhosttyRenderStateRowCellsData_GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR,
+                        ptr::addr_of_mut!(bg_cell).cast::<c_void>(),
+                    );
+                    let bg_is_default = bg_result != ffi::GhosttyResult_GHOSTTY_SUCCESS
+                        || rgb_eq(bg_cell, default_bg);
+
+                    let mut fg_cell = default_fg;
+                    let fg_result = ffi::ghostty_render_state_row_cells_get(
+                        self.cells,
+                        ffi::GhosttyRenderStateRowCellsData_GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR,
+                        ptr::addr_of_mut!(fg_cell).cast::<c_void>(),
+                    );
+                    if fg_result != ffi::GhosttyResult_GHOSTTY_SUCCESS {
+                        fg_cell = default_fg;
                     }
 
-                    let mut style: ffi::GhosttyStyle = std::mem::zeroed();
-                    style.size = std::mem::size_of::<ffi::GhosttyStyle>();
-                    ffi::ghostty_render_state_row_cells_get(
-                        self.cells,
-                        ffi::GhosttyRenderStateRowCellsData_GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE,
-                        ptr::addr_of_mut!(style).cast::<c_void>(),
-                    );
-
-                    let mut buf = [0u32; 16];
-                    let n = std::cmp::min(len as usize, buf.len());
-                    ffi::ghostty_render_state_row_cells_get(
-                        self.cells,
-                        ffi::GhosttyRenderStateRowCellsData_GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF,
-                        buf.as_mut_ptr().cast::<c_void>(),
-                    );
-                    let text: String = buf[..n].iter().filter_map(|c| char::from_u32(*c)).collect();
-
-                    let bg_cell = resolve_color(&style.bg_color, &colors, default_bg);
-                    let fg_cell = resolve_color(&style.fg_color, &colors, default_fg);
-                    let bg_is_default = rgb_eq(bg_cell, default_bg);
+                    let text = if len == 0 {
+                        if bg_is_default {
+                            col_idx += 1;
+                            continue;
+                        }
+                        String::new()
+                    } else {
+                        let mut buf = [0u32; 16];
+                        let n = std::cmp::min(len as usize, buf.len());
+                        ffi::ghostty_render_state_row_cells_get(
+                            self.cells,
+                            ffi::GhosttyRenderStateRowCellsData_GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF,
+                            buf.as_mut_ptr().cast::<c_void>(),
+                        );
+                        buf[..n].iter().filter_map(|c| char::from_u32(*c)).collect()
+                    };
 
                     visitor.cell(&CellView {
                         row: row_idx,
@@ -529,6 +653,87 @@ impl Terminal {
             visitor.end();
         }
     }
+}
+
+impl Terminal {
+    fn respond_to_terminal_queries(&mut self, bytes: &[u8]) {
+        let mut scan = std::mem::take(&mut self.pending_osc_query);
+        scan.extend_from_slice(bytes);
+
+        let mut index = 0;
+        while index < scan.len() {
+            if scan[index] != b'\x1b' {
+                index += 1;
+                continue;
+            }
+
+            if index + 1 >= scan.len() {
+                self.store_pending_osc_query(&scan[index..]);
+                return;
+            }
+
+            if scan[index + 1] != b']' {
+                index += 1;
+                continue;
+            }
+
+            let body_start = index + 2;
+            let Some((body_end, terminator_len)) = osc_body_end(&scan[body_start..]) else {
+                self.store_pending_osc_query(&scan[index..]);
+                return;
+            };
+
+            let body = &scan[body_start..body_start + body_end];
+            self.respond_to_osc_query(body);
+            index = body_start + body_end + terminator_len;
+        }
+
+        if scan.ends_with(b"\x1b]") {
+            self.store_pending_osc_query(b"\x1b]");
+        } else if scan.ends_with(b"\x1b") {
+            self.store_pending_osc_query(b"\x1b");
+        }
+    }
+
+    fn respond_to_osc_query(&mut self, body: &[u8]) {
+        match body {
+            b"10;?" => push_osc_color_response(&mut self.pty_output.bytes, 10, DEFAULT_FG),
+            b"11;?" => push_osc_color_response(&mut self.pty_output.bytes, 11, DEFAULT_BG),
+            b"12;?" => push_osc_color_response(&mut self.pty_output.bytes, 12, DEFAULT_CURSOR),
+            _ => {}
+        }
+    }
+
+    fn store_pending_osc_query(&mut self, bytes: &[u8]) {
+        self.pending_osc_query.clear();
+        if bytes.len() <= MAX_PENDING_OSC_QUERY {
+            self.pending_osc_query.extend_from_slice(bytes);
+        }
+    }
+}
+
+fn osc_body_end(bytes: &[u8]) -> Option<(usize, usize)> {
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\x07' => return Some((index, 1)),
+            b'\x1b' if index + 1 < bytes.len() && bytes[index + 1] == b'\\' => {
+                return Some((index, 2));
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn push_osc_color_response(output: &mut Vec<u8>, code: u8, color: ffi::GhosttyColorRgb) {
+    output.extend_from_slice(
+        format!(
+            "\x1b]{code};rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x1b\\",
+            color.r, color.r, color.g, color.g, color.b, color.b
+        )
+        .as_bytes(),
+    );
 }
 
 impl Drop for Terminal {
@@ -596,21 +801,13 @@ fn rgb_eq(a: ffi::GhosttyColorRgb, b: ffi::GhosttyColorRgb) -> bool {
     a.r == b.r && a.g == b.g && a.b == b.b
 }
 
-fn resolve_color(
-    color: &ffi::GhosttyStyleColor,
-    colors: &ffi::GhosttyRenderStateColors,
-    fallback: ffi::GhosttyColorRgb,
-) -> ffi::GhosttyColorRgb {
-    // SAFETY: Reading a C tagged union — `tag` disambiguates which `value`
-    // member is active, matching the C contract in ghostty/vt.h.
-    unsafe {
-        match color.tag {
-            ffi::GhosttyStyleColorTag_GHOSTTY_STYLE_COLOR_RGB => color.value.rgb,
-            ffi::GhosttyStyleColorTag_GHOSTTY_STYLE_COLOR_PALETTE => {
-                let idx = color.value.palette as usize;
-                colors.palette[idx]
-            }
-            _ => fallback,
-        }
-    }
+fn set_terminal_color(
+    term: ffi::GhosttyTerminal,
+    option: ffi::GhosttyTerminalOption,
+    color: &ffi::GhosttyColorRgb,
+) -> bool {
+    let result = unsafe {
+        ffi::ghostty_terminal_set(term, option, (color as *const ffi::GhosttyColorRgb).cast())
+    };
+    result == ffi::GhosttyResult_GHOSTTY_SUCCESS
 }

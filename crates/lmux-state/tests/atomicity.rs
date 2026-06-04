@@ -47,6 +47,9 @@ fn sample(counter: u64) -> SessionSnapshot {
             m.insert(2, format!("/tmp/b-{counter}"));
             m
         },
+        pane_titles: std::collections::BTreeMap::new(),
+        terminal_tabs: Vec::new(),
+        pane_terminal_tab_roots: std::collections::BTreeMap::new(),
     }
 }
 

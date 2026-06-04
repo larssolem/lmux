@@ -74,6 +74,15 @@ mod tests {
     }
 
     fn sample_snapshot() -> SessionSnapshot {
+        let mut pane_titles = std::collections::BTreeMap::new();
+        pane_titles.insert(
+            1,
+            lmux_state::PaneTitleSnapshot {
+                title: "logs".into(),
+                provenance: lmux_state::PaneTitleProvenanceSnapshot::User,
+                pinned: true,
+            },
+        );
         SessionSnapshot {
             v: SCHEMA_VERSION,
             created_at_unix_seconds: 1000,
@@ -90,6 +99,13 @@ mod tests {
                 m.insert(1, "/home/lars".into());
                 m
             },
+            pane_titles,
+            terminal_tabs: vec![lmux_state::TerminalTabStackSnapshot {
+                anchor_pane_id: 1,
+                tab_roots: vec![1, 2],
+                active_tab: Some(2),
+            }],
+            pane_terminal_tab_roots: std::collections::BTreeMap::from([(1, 1), (2, 2)]),
         }
     }
 
@@ -108,6 +124,12 @@ mod tests {
         assert_eq!(s.created_at_unix_seconds, 1000);
         assert_eq!(s.last_opened_at_unix_seconds, 2000);
         assert_eq!(s.cwds.get(&1).map(String::as_str), Some("/home/lars"));
+        assert_eq!(
+            s.pane_titles.get(&1).map(|title| title.title.as_str()),
+            Some("logs")
+        );
+        assert_eq!(s.terminal_tabs[0].active_tab, Some(2));
+        assert_eq!(s.pane_terminal_tab_roots.get(&2), Some(&2));
     }
 
     #[test]

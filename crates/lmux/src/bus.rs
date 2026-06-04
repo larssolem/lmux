@@ -10,10 +10,12 @@
 //! request. Kinds the GTK side doesn't recognise return
 //! `not_implemented`.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use lmux_bus::{
@@ -21,10 +23,10 @@ use lmux_bus::{
     paths::{bus_pid_path, bus_socket_path},
     BusError, Kind, PaneSummary, Server, SessionSummary, StatusSnapshot,
 };
-use lmux_compositor::{CompositorControl, Health};
+use lmux_compositor::{CompositorControl, Health, SatelliteWindowId};
 use tokio::sync::oneshot;
 
-use crate::state::SharedAppState;
+use crate::state::{PaneCreateRequest, SharedAppState};
 
 #[derive(Clone)]
 pub struct SatelliteCounters {
@@ -75,6 +77,14 @@ impl lmux_bus::Handler for LmuxBusHandler {
             Kind::SessionList {} => self.handle_session_list().await,
             Kind::StatusGet {} => self.handle_status_get().await,
             Kind::SatelliteListWindows {} => self.handle_satellite_list_windows().await,
+            Kind::AnchorList {}
+            | Kind::PaneNew { .. }
+            | Kind::PaneTail { .. }
+            | Kind::PaneCapture { .. }
+            | Kind::PaneSendInput { .. }
+            | Kind::PaneRename { .. }
+            | Kind::GrantRequest(_)
+            | Kind::GrantDecide { .. } => self.dispatch_to_gtk(req).await,
             other => self.dispatch_to_gtk(other).await,
         }
     }
@@ -173,6 +183,152 @@ impl LmuxBusHandler {
             .await
             .map_err(|err| BusError::Domain(format!("satellite.list_windows: {err}")))?;
         Ok(Kind::SatelliteListWindowsResult { windows })
+    }
+}
+
+fn window_candidate_key(window: &WindowCandidate) -> String {
+    format!("{:?}:{}", window.backend, window.backend_window_id)
+}
+
+fn launch_attach_candidate_matches(
+    window: &WindowCandidate,
+    before: &HashSet<String>,
+    spawned_pid: u32,
+    title_hint: Option<&str>,
+    app_hint: Option<&str>,
+) -> bool {
+    if window.pid == Some(spawned_pid) {
+        return true;
+    }
+    if before.contains(&window_candidate_key(window)) {
+        return false;
+    }
+    hint_matches(window.title.as_deref(), title_hint)
+        || hint_matches(window_app_identity_text(window).as_deref(), app_hint)
+}
+
+fn hint_matches(value: Option<&str>, hint: Option<&str>) -> bool {
+    let Some(hint) = hint.map(str::trim).filter(|hint| !hint.is_empty()) else {
+        return false;
+    };
+    value
+        .map(|value| value.to_lowercase().contains(&hint.to_lowercase()))
+        .unwrap_or(false)
+}
+
+fn window_app_identity_text(window: &WindowCandidate) -> Option<String> {
+    window.app_identity.as_ref().map(|identity| match identity {
+        lmux_bus::kinds::WindowAppIdentity::BundleId(value)
+        | lmux_bus::kinds::WindowAppIdentity::DesktopEntry(value)
+        | lmux_bus::kinds::WindowAppIdentity::WmClass(value)
+        | lmux_bus::kinds::WindowAppIdentity::AppId(value)
+        | lmux_bus::kinds::WindowAppIdentity::Other(value) => value.clone(),
+    })
+}
+
+async fn list_windows_for_dispatcher(
+    compositor: Arc<dyn CompositorControl>,
+    operation: &'static str,
+) -> Result<Vec<WindowCandidate>, BusError> {
+    let (tx, rx) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| err.to_string())
+            .and_then(|rt| {
+                rt.block_on(async move {
+                    compositor
+                        .list_windows()
+                        .await
+                        .map_err(|err| err.to_string())
+                })
+            });
+        let _ = tx.send_blocking(result);
+    });
+    rx.recv()
+        .await
+        .unwrap_or_else(|err| Err(format!("window list worker failed: {err}")))
+        .map_err(|err| BusError::Domain(format!("{operation}: {err}")))
+}
+
+async fn attach_window_for_dispatcher(
+    compositor: Arc<dyn CompositorControl>,
+    candidate: WindowCandidate,
+    operation: &'static str,
+) -> Result<SatelliteWindowId, BusError> {
+    let (tx, rx) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| err.to_string())
+            .and_then(|rt| {
+                rt.block_on(async move {
+                    compositor
+                        .attach_window(&candidate)
+                        .await
+                        .map_err(|err| err.to_string())
+                })
+            });
+        let _ = tx.send_blocking(result);
+    });
+    rx.recv()
+        .await
+        .unwrap_or_else(|err| Err(format!("window attach worker failed: {err}")))
+        .map_err(|err| BusError::Domain(format!("{operation}: {err}")))
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+
+    fn candidate(id: &str, pid: Option<u32>, title: &str) -> WindowCandidate {
+        WindowCandidate {
+            backend: lmux_bus::kinds::WindowCandidateBackend::Kwin,
+            backend_window_id: id.into(),
+            pid,
+            app_identity: Some(lmux_bus::kinds::WindowAppIdentity::DesktopEntry(
+                "org.kde.kate".into(),
+            )),
+            title: Some(title.into()),
+            workspace: None,
+            output: None,
+        }
+    }
+
+    #[test]
+    fn launch_attach_ignores_existing_hint_match() {
+        let existing = candidate("existing", Some(10), "notes");
+        let before = HashSet::from([window_candidate_key(&existing)]);
+
+        assert!(!launch_attach_candidate_matches(
+            &existing,
+            &before,
+            42,
+            Some("notes"),
+            Some("org.kde.kate"),
+        ));
+    }
+
+    #[test]
+    fn launch_attach_accepts_spawned_pid_or_new_hint_match() {
+        let before = HashSet::new();
+        assert!(launch_attach_candidate_matches(
+            &candidate("pid-match", Some(42), "other"),
+            &before,
+            42,
+            None,
+            None,
+        ));
+        assert!(launch_attach_candidate_matches(
+            &candidate("hint-match", Some(99), "notes"),
+            &before,
+            42,
+            Some("notes"),
+            None,
+        ));
     }
 }
 
@@ -309,6 +465,90 @@ async fn handle_deferred(
                 .collect();
             Ok(Kind::PaneListResult { panes })
         }
+        Kind::AnchorList {} => {
+            let st = state.borrow();
+            Ok(Kind::AnchorListResult {
+                anchors: st.anchor_listing(),
+            })
+        }
+        Kind::PaneNew {
+            target_anchor,
+            placement,
+            activate,
+            title,
+            argv,
+            agent,
+            purpose,
+        } => {
+            let mut st = state.borrow_mut();
+            let created = st.create_pane_from_bus(PaneCreateRequest {
+                target_anchor,
+                placement,
+                activate,
+                title,
+                argv,
+                agent,
+                purpose,
+            })?;
+            Ok(Kind::PaneNewResult(created))
+        }
+        Kind::PaneTail {
+            pane_id,
+            lines,
+            agent,
+        } => {
+            let mut st = state.borrow_mut();
+            let range = st.pane_transcript_tail(pane_id, lines, agent)?;
+            Ok(Kind::PaneTranscriptResult(range))
+        }
+        Kind::PaneCapture {
+            pane_id,
+            since_sequence,
+            max_lines,
+            agent,
+        } => {
+            let mut st = state.borrow_mut();
+            let range = st.pane_transcript_capture(pane_id, since_sequence, max_lines, agent)?;
+            Ok(Kind::PaneTranscriptResult(range))
+        }
+        Kind::PaneSendInput {
+            pane_id,
+            text,
+            agent,
+        } => {
+            let mut st = state.borrow_mut();
+            st.send_input_to_pane(pane_id, &text, agent)?;
+            Ok(Kind::Ok {
+                of: Some("pane.send_input".into()),
+            })
+        }
+        Kind::PaneRename {
+            pane_id,
+            title,
+            pin,
+            agent,
+        } => {
+            let mut st = state.borrow_mut();
+            st.rename_pane(pane_id, title, pin, agent)?;
+            Ok(Kind::Ok {
+                of: Some("pane.rename".into()),
+            })
+        }
+        Kind::GrantRequest(request) => {
+            let mut st = state.borrow_mut();
+            let request = st.register_grant_request(request);
+            Ok(Kind::GrantRequestResult {
+                grant_id: request.grant_id,
+                pending: true,
+            })
+        }
+        Kind::GrantDecide { grant_id, decision } => {
+            let mut st = state.borrow_mut();
+            st.decide_grant(grant_id, decision)?;
+            Ok(Kind::Ok {
+                of: Some("grant.decide".into()),
+            })
+        }
         Kind::AnchorTag { pane_id } => {
             let mut st = state.borrow_mut();
             let pid = st
@@ -385,6 +625,98 @@ async fn handle_deferred(
                 }
             }
         }
+        Kind::SatelliteLaunchAttach {
+            argv,
+            title_hint,
+            app_hint,
+            timeout_ms,
+            agent,
+        } => {
+            let caps = compositor.window_control_capabilities();
+            if !caps.list_windows || !caps.attach_window {
+                return Err(BusError::Domain(
+                    "satellite.launch_attach: native window listing and attachment are required"
+                        .into(),
+                ));
+            }
+            if argv.is_empty() {
+                satellite_counters
+                    .spawn_fail
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(BusError::Domain(
+                    "satellite.launch_attach: argv is empty".into(),
+                ));
+            }
+            {
+                let mut st = state.borrow_mut();
+                st.authorize_active_anchor_launch_attach(
+                    &argv,
+                    title_hint.as_deref(),
+                    app_hint.as_deref(),
+                    timeout_ms,
+                    agent,
+                )?;
+            }
+            let before = list_windows_for_dispatcher(compositor.clone(), "satellite.launch_attach")
+                .await?
+                .into_iter()
+                .map(|window| window_candidate_key(&window))
+                .collect::<HashSet<_>>();
+            let (request_id, pid) =
+                match lmux_compositor::spawn::spawn_tagged_with_env(&argv, None, None) {
+                    Ok(spawned) => {
+                        satellite_counters.spawn_ok.fetch_add(1, Ordering::Relaxed);
+                        spawned
+                    }
+                    Err(err) => {
+                        satellite_counters
+                            .spawn_fail
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Err(BusError::Domain(format!("satellite.launch_attach: {err}")));
+                    }
+                };
+            let timeout = Duration::from_millis(timeout_ms.unwrap_or(5_000).clamp(250, 30_000));
+            let deadline = Instant::now() + timeout;
+            loop {
+                let windows =
+                    list_windows_for_dispatcher(compositor.clone(), "satellite.launch_attach")
+                        .await?;
+                if let Some(candidate) = windows.into_iter().find(|window| {
+                    launch_attach_candidate_matches(
+                        window,
+                        &before,
+                        pid,
+                        title_hint.as_deref(),
+                        app_hint.as_deref(),
+                    )
+                }) {
+                    let window = attach_window_for_dispatcher(
+                        compositor.clone(),
+                        candidate.clone(),
+                        "satellite.launch_attach",
+                    )
+                    .await?;
+                    let mut st = state.borrow_mut();
+                    st.attach_native_window_to_active_anchor(&candidate, window)
+                        .map_err(|err| {
+                            BusError::Domain(format!("satellite.launch_attach: {err}"))
+                        })?;
+                    return Ok(Kind::Ok {
+                        of: Some("satellite.launch_attach".into()),
+                    });
+                }
+                if Instant::now() >= deadline {
+                    satellite_counters
+                        .spawn_fail
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(BusError::Domain(format!(
+                        "satellite.launch_attach: timed out after {}ms waiting for argv={argv:?} pid={pid} request_id={request_id}",
+                        timeout.as_millis()
+                    )));
+                }
+                gtk4::glib::timeout_future(Duration::from_millis(100)).await;
+            }
+        }
         Kind::SatelliteAttachFocused {} => {
             #[cfg(target_os = "macos")]
             {
@@ -410,6 +742,7 @@ async fn handle_deferred(
             title,
             workspace,
             output,
+            agent,
         } => {
             let caps = compositor.window_control_capabilities();
             if !caps.attach_window {
@@ -427,10 +760,16 @@ async fn handle_deferred(
                 workspace,
                 output,
             };
-            let window = compositor
-                .attach_window(&candidate)
-                .await
-                .map_err(|err| BusError::Domain(format!("satellite.attach_window: {err}")))?;
+            {
+                let mut st = state.borrow_mut();
+                st.authorize_active_anchor_window_attach(&candidate, agent)?;
+            }
+            let window = attach_window_for_dispatcher(
+                compositor.clone(),
+                candidate.clone(),
+                "satellite.attach_window",
+            )
+            .await?;
             let mut st = state.borrow_mut();
             st.attach_native_window_to_active_anchor(&candidate, window)
                 .map_err(|err| BusError::Domain(format!("satellite.attach_window: {err}")))?;

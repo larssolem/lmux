@@ -1,7 +1,9 @@
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::io::Read;
 use std::path::Path;
 use std::rc::Rc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use gtk4::gdk;
 use gtk4::glib;
@@ -27,6 +29,7 @@ const WHEEL_ROWS_PER_TICK: i32 = 3;
 const INIT_COLS: u16 = 100;
 const INIT_ROWS: u16 = 30;
 const SCROLLBACK: usize = 100_000;
+const TRANSCRIPT_MAX_LINES: usize = 10_000;
 const READER_CHAN_CAPACITY: usize = 64;
 #[cfg(target_os = "macos")]
 const DEFAULT_FONT_FAMILY: &str = "JetBrains Mono";
@@ -48,6 +51,7 @@ const MIN_ROWS: i32 = 3;
 
 pub type FocusCallback = Rc<dyn Fn(PaneId)>;
 pub type BellCallback = Rc<dyn Fn(PaneId)>;
+pub type TerminalExitCallback = Rc<dyn Fn(PaneId)>;
 pub type TerminalActionCallback = Rc<dyn Fn(PaneId, TerminalContextAction)>;
 pub type ShortcutPrefixCell = Rc<RefCell<String>>;
 
@@ -132,7 +136,9 @@ pub struct TerminalPane {
     frame: Frame,
     drawing_area: DrawingArea,
     inner: Rc<RefCell<Inner>>,
+    transcript: Rc<RefCell<TranscriptBuffer>>,
     bell_cb: Rc<RefCell<Option<BellCallback>>>,
+    exit_cb: Rc<RefCell<Option<TerminalExitCallback>>>,
     /// CWD passed at spawn time. Persisted as the snapshot's per-pane CWD
     /// fallback when `/proc/<pid>/cwd` can't be read at shutdown (Story 8.2).
     spawn_cwd: Option<std::path::PathBuf>,
@@ -151,6 +157,104 @@ struct Inner {
     drag_pointer: Option<(f64, f64)>,
     frozen_frame: Option<FrozenFrame>,
     exit_code: Option<i32>,
+}
+
+struct TranscriptBuffer {
+    max_lines: usize,
+    next_sequence: u64,
+    dropped_before: u64,
+    lines: VecDeque<lmux_bus::TranscriptLine>,
+}
+
+impl TranscriptBuffer {
+    fn new(max_lines: usize) -> Self {
+        Self {
+            max_lines,
+            next_sequence: 1,
+            dropped_before: 1,
+            lines: VecDeque::new(),
+        }
+    }
+
+    fn append_bytes(&mut self, bytes: &[u8]) {
+        let text = String::from_utf8_lossy(bytes);
+        for part in text.split_inclusive('\n') {
+            let line = part.trim_end_matches(['\r', '\n']);
+            if line.is_empty() {
+                continue;
+            }
+            self.append_line(line.to_string(), now_unix_millis());
+        }
+    }
+
+    fn append_line(&mut self, text: String, unix_millis: u64) {
+        let line = lmux_bus::TranscriptLine {
+            sequence: self.next_sequence,
+            unix_millis,
+            text,
+        };
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.lines.push_back(line);
+        while self.lines.len() > self.max_lines {
+            if let Some(dropped) = self.lines.pop_front() {
+                self.dropped_before = dropped.sequence.saturating_add(1);
+            }
+        }
+    }
+
+    fn tail(&self, pane_id: uuid::Uuid, max_lines: u32) -> lmux_bus::TranscriptRange {
+        let keep = max_lines as usize;
+        let start = self.lines.len().saturating_sub(keep);
+        self.range_from_iter(pane_id, self.lines.iter().skip(start).cloned(), false)
+    }
+
+    fn capture_since(
+        &self,
+        pane_id: uuid::Uuid,
+        since_sequence: Option<u64>,
+        max_lines: Option<u32>,
+    ) -> lmux_bus::TranscriptRange {
+        let since = since_sequence.unwrap_or(0);
+        let truncated = since > 0 && since < self.dropped_before;
+        let iter = self
+            .lines
+            .iter()
+            .filter(move |line| line.sequence > since)
+            .cloned();
+        let collected: Vec<_> = match max_lines {
+            Some(max) => iter.take(max as usize).collect(),
+            None => iter.collect(),
+        };
+        self.range_from_iter(pane_id, collected, truncated)
+    }
+
+    fn range_from_iter<I>(
+        &self,
+        pane_id: uuid::Uuid,
+        iter: I,
+        truncated: bool,
+    ) -> lmux_bus::TranscriptRange
+    where
+        I: IntoIterator<Item = lmux_bus::TranscriptLine>,
+    {
+        let lines: Vec<_> = iter.into_iter().collect();
+        let first_sequence = lines.first().map(|line| line.sequence).unwrap_or(0);
+        let last_sequence = lines.last().map(|line| line.sequence).unwrap_or(0);
+        lmux_bus::TranscriptRange {
+            pane_id,
+            first_sequence,
+            last_sequence,
+            truncated,
+            lines,
+        }
+    }
+}
+
+fn now_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl TerminalPane {
@@ -204,19 +308,31 @@ impl TerminalPane {
             frozen_frame: None,
             exit_code: None,
         }));
+        let transcript = Rc::new(RefCell::new(TranscriptBuffer::new(TRANSCRIPT_MAX_LINES)));
 
         let bell_cb: Rc<RefCell<Option<BellCallback>>> = Rc::new(RefCell::new(None));
+        let exit_cb: Rc<RefCell<Option<TerminalExitCallback>>> = Rc::new(RefCell::new(None));
 
         install_draw_func(&drawing_area, &inner);
         install_resize_handler(&drawing_area, &inner);
-        start_pty_reader(&drawing_area, &inner, reader, id, bell_cb.clone());
+        start_pty_reader(
+            &drawing_area,
+            &inner,
+            reader,
+            id,
+            transcript.clone(),
+            bell_cb.clone(),
+            exit_cb.clone(),
+        );
 
         Some(Self {
             id,
             frame,
             drawing_area,
             inner,
+            transcript,
             bell_cb,
+            exit_cb,
             spawn_cwd: cwd.map(std::path::Path::to_path_buf),
         })
     }
@@ -233,6 +349,35 @@ impl TerminalPane {
 
     pub fn set_bell_callback(&self, cb: BellCallback) {
         *self.bell_cb.borrow_mut() = Some(cb);
+    }
+
+    pub fn set_exit_callback(&self, cb: TerminalExitCallback) {
+        *self.exit_cb.borrow_mut() = Some(cb);
+    }
+
+    pub fn transcript_tail(&self, pane_id: uuid::Uuid, lines: u32) -> lmux_bus::TranscriptRange {
+        self.transcript.borrow().tail(pane_id, lines)
+    }
+
+    pub fn transcript_capture(
+        &self,
+        pane_id: uuid::Uuid,
+        since_sequence: Option<u64>,
+        max_lines: Option<u32>,
+    ) -> lmux_bus::TranscriptRange {
+        self.transcript
+            .borrow()
+            .capture_since(pane_id, since_sequence, max_lines)
+    }
+
+    pub fn send_input(&self, text: &str) -> std::io::Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        inner.pty.writer().write_all(text.as_bytes())?;
+        inner.term.scroll_to_bottom();
+        inner.selection = None;
+        drop(inner);
+        self.drawing_area.queue_draw();
+        Ok(())
     }
 
     pub fn id(&self) -> PaneId {
@@ -1215,7 +1360,9 @@ fn start_pty_reader(
     inner: &Rc<RefCell<Inner>>,
     mut reader: Box<dyn Read + Send>,
     id: PaneId,
+    transcript: Rc<RefCell<TranscriptBuffer>>,
     bell_cb: Rc<RefCell<Option<BellCallback>>>,
+    exit_cb: Rc<RefCell<Option<TerminalExitCallback>>>,
 ) {
     let (tx, rx) = async_channel::bounded::<Vec<u8>>(READER_CHAN_CAPACITY);
     std::thread::spawn(move || {
@@ -1248,9 +1395,17 @@ fn start_pty_reader(
             let span = tracing::info_span!("pty_to_paint", len = bytes.len());
             let _g = span.enter();
             let bells = scanner.scan(&bytes);
-            {
-                let mut b = inner_chan.borrow_mut();
-                b.term.feed(&bytes);
+            transcript.borrow_mut().append_bytes(&bytes);
+            let pty_output = {
+                let mut inner = inner_chan.borrow_mut();
+                inner.term.feed(&bytes);
+                inner.term.take_pty_output()
+            };
+            if !pty_output.is_empty() {
+                let write_result = inner_chan.borrow_mut().pty.writer().write_all(&pty_output);
+                if let Err(err) = write_result {
+                    tracing::warn!(error = %err, "pty response write failed");
+                }
             }
             area_chan.queue_draw();
             if bells > 0 {
@@ -1294,6 +1449,9 @@ fn start_pty_reader(
                     None => tracing::info!(code, "pane child exited"),
                 }
                 area_exit.queue_draw();
+                if let Some(cb) = exit_cb.borrow().clone() {
+                    cb(id);
+                }
                 glib::ControlFlow::Break
             }
             Ok(None) => glib::ControlFlow::Continue,
@@ -1408,6 +1566,45 @@ impl Pane {
         }
     }
 
+    pub fn transcript_tail(
+        &self,
+        pane_id: uuid::Uuid,
+        lines: u32,
+    ) -> Result<lmux_bus::TranscriptRange, lmux_bus::BusError> {
+        match self {
+            Self::Terminal(t) => Ok(t.transcript_tail(pane_id, lines)),
+            Self::Satellite(_) => Err(lmux_bus::BusError::TranscriptUnavailable(
+                "pane is a GUI satellite; only PTY-backed terminal panes have transcript output"
+                    .into(),
+            )),
+        }
+    }
+
+    pub fn transcript_capture(
+        &self,
+        pane_id: uuid::Uuid,
+        since_sequence: Option<u64>,
+        max_lines: Option<u32>,
+    ) -> Result<lmux_bus::TranscriptRange, lmux_bus::BusError> {
+        match self {
+            Self::Terminal(t) => Ok(t.transcript_capture(pane_id, since_sequence, max_lines)),
+            Self::Satellite(_) => Err(lmux_bus::BusError::TranscriptUnavailable(
+                "pane is a GUI satellite; only PTY-backed terminal panes have transcript output"
+                    .into(),
+            )),
+        }
+    }
+
+    pub fn send_input(&self, text: &str) -> Result<(), lmux_bus::BusError> {
+        match self {
+            Self::Terminal(t) => t.send_input(text).map_err(lmux_bus::BusError::Io),
+            Self::Satellite(_) => Err(lmux_bus::BusError::TranscriptUnavailable(
+                "pane is a GUI satellite; only PTY-backed terminal panes accept terminal input"
+                    .into(),
+            )),
+        }
+    }
+
     pub fn cell_size(&self) -> (i32, i32) {
         match self {
             Self::Terminal(t) => t.cell_size(),
@@ -1427,6 +1624,12 @@ impl Pane {
     pub fn set_bell_callback(&self, cb: BellCallback) {
         if let Self::Terminal(t) = self {
             t.set_bell_callback(cb);
+        }
+    }
+
+    pub fn set_exit_callback(&self, cb: TerminalExitCallback) {
+        if let Self::Terminal(t) = self {
+            t.set_exit_callback(cb);
         }
     }
 
@@ -1478,8 +1681,8 @@ impl Pane {
 }
 
 #[cfg(test)]
-mod bell_scanner_tests {
-    use super::BellScanner;
+mod tests {
+    use super::{BellScanner, TranscriptBuffer};
 
     #[test]
     fn counts_bare_bells() {
@@ -1523,5 +1726,68 @@ mod bell_scanner_tests {
         // still inside OSC and swallow the BEL in the second chunk.
         assert_eq!(s.scan(b"\x1b]0;par"), 0);
         assert_eq!(s.scan(b"tial\x07after\x07"), 1);
+    }
+
+    #[test]
+    fn transcript_sequences_increase() {
+        let pane_id = uuid::Uuid::new_v4();
+        let mut t = TranscriptBuffer::new(10);
+        t.append_line("one".into(), 1);
+        t.append_line("two".into(), 2);
+
+        let range = t.tail(pane_id, 10);
+
+        assert_eq!(range.first_sequence, 1);
+        assert_eq!(range.last_sequence, 2);
+        assert_eq!(range.lines[0].text, "one");
+        assert_eq!(range.lines[1].sequence, 2);
+    }
+
+    #[test]
+    fn transcript_tail_limits_lines() {
+        let pane_id = uuid::Uuid::new_v4();
+        let mut t = TranscriptBuffer::new(10);
+        for idx in 0..5 {
+            t.append_line(format!("line {idx}"), idx);
+        }
+
+        let range = t.tail(pane_id, 2);
+
+        assert_eq!(range.lines.len(), 2);
+        assert_eq!(range.first_sequence, 4);
+        assert_eq!(range.last_sequence, 5);
+        assert_eq!(range.lines[0].text, "line 3");
+    }
+
+    #[test]
+    fn transcript_capture_since_sequence() {
+        let pane_id = uuid::Uuid::new_v4();
+        let mut t = TranscriptBuffer::new(10);
+        for idx in 0..5 {
+            t.append_line(format!("line {idx}"), idx);
+        }
+
+        let range = t.capture_since(pane_id, Some(2), Some(2));
+
+        assert_eq!(range.lines.len(), 2);
+        assert_eq!(range.first_sequence, 3);
+        assert_eq!(range.last_sequence, 4);
+        assert!(!range.truncated);
+    }
+
+    #[test]
+    fn transcript_reports_truncation() {
+        let pane_id = uuid::Uuid::new_v4();
+        let mut t = TranscriptBuffer::new(2);
+        for idx in 0..5 {
+            t.append_line(format!("line {idx}"), idx);
+        }
+
+        let range = t.capture_since(pane_id, Some(1), None);
+
+        assert!(range.truncated);
+        assert_eq!(range.first_sequence, 4);
+        assert_eq!(range.last_sequence, 5);
+        assert_eq!(range.lines.len(), 2);
     }
 }

@@ -36,6 +36,7 @@ pub enum ClientRole {
     KwinScript,
     Satellite,
     Plugin,
+    LmuxMcp,
 }
 
 /// Compositor health state — payload for `compositor.status`.
@@ -87,9 +88,10 @@ pub struct StatusSnapshot {
     pub satellite_spawn_fail: u32,
 }
 
-/// One live pane as returned by `pane.list.result`. `anchor_id` is set
-/// when the pane is tagged as an anchor; `cwd` mirrors the pane's last
-/// known working directory (best-effort, may be absent on early-boot).
+/// One live pane as returned by `pane.list.result`. `anchor_id` is the owning
+/// anchor UUID for panes that belong to an anchor workspace or terminal tab
+/// stack; `cwd` mirrors the pane's last known working directory (best-effort,
+/// may be absent on early-boot).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSummary {
     pub pane_id: Uuid,
@@ -97,6 +99,134 @@ pub struct PaneSummary {
     pub anchor_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+}
+
+/// Agent identity carried by agent-aware requests. This is provenance and
+/// prompt text, not a standalone authorization credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentIdentity {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Provenance for a visible pane title.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneTitleProvenance {
+    Default,
+    Agent,
+    User,
+}
+
+/// Visible title plus provenance for pane/tab UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneTitle {
+    pub title: String,
+    pub provenance: PaneTitleProvenance,
+    #[serde(default)]
+    pub pinned: bool,
+}
+
+/// Where a new terminal pane should be inserted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PanePlacement {
+    Tab,
+    SplitRight,
+    SplitDown,
+}
+
+/// One transcript line captured from a PTY-backed terminal pane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptLine {
+    pub sequence: u64,
+    pub unix_millis: u64,
+    pub text: String,
+}
+
+/// Result payload for transcript tail/capture requests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptRange {
+    pub pane_id: Uuid,
+    pub first_sequence: u64,
+    pub last_sequence: u64,
+    #[serde(default)]
+    pub truncated: bool,
+    pub lines: Vec<TranscriptLine>,
+}
+
+/// Scope vocabulary for cockpit-owned agent grants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GrantScope {
+    ReadOutput,
+    SendInput,
+    Rename,
+    AttachWindow,
+}
+
+/// User decision for a pending agent grant request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum GrantDecision {
+    AllowOnce,
+    AllowUntil { expires_at_unix_seconds: u64 },
+    Deny,
+    Revoke,
+}
+
+/// Compact agent/pane status shown in anchor inventory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPaneStatus {
+    pub pane_id: Uuid,
+    pub agent: AgentIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+}
+
+/// One anchor workspace as returned by `anchor.list.result`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnchorSummary {
+    pub anchor_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<Uuid>,
+    pub label: String,
+    pub active: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_status: Vec<AgentPaneStatus>,
+    #[serde(default)]
+    pub pending_grants: u32,
+    #[serde(default)]
+    pub active_grants: u32,
+}
+
+/// Result of creating a terminal pane through an agent-aware path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneNewResult {
+    pub pane_id: Uuid,
+    pub anchor_id: Uuid,
+    pub placement: PanePlacement,
+}
+
+/// Pending grant request surfaced to the cockpit UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantRequest {
+    pub grant_id: Uuid,
+    pub requester: AgentIdentity,
+    pub scope: GrantScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_anchor: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_anchor: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_pane: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_window: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Satellite docking state — payload for `satellite.status`.
@@ -202,8 +332,65 @@ pub enum Kind {
     PaneList {},
     #[serde(rename = "pane.list.result")]
     PaneListResult { panes: Vec<PaneSummary> },
+    #[serde(rename = "pane.new")]
+    PaneNew {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_anchor: Option<Uuid>,
+        placement: PanePlacement,
+        #[serde(default)]
+        activate: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default)]
+        argv: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<AgentIdentity>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        purpose: Option<String>,
+    },
+    #[serde(rename = "pane.new.result")]
+    PaneNewResult(PaneNewResult),
+    #[serde(rename = "pane.tail")]
+    PaneTail {
+        pane_id: Uuid,
+        lines: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<AgentIdentity>,
+    },
+    #[serde(rename = "pane.capture")]
+    PaneCapture {
+        pane_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since_sequence: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_lines: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<AgentIdentity>,
+    },
+    #[serde(rename = "pane.transcript.result")]
+    PaneTranscriptResult(TranscriptRange),
+    #[serde(rename = "pane.send_input")]
+    PaneSendInput {
+        pane_id: Uuid,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<AgentIdentity>,
+    },
+    #[serde(rename = "pane.rename")]
+    PaneRename {
+        pane_id: Uuid,
+        title: String,
+        #[serde(default)]
+        pin: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<AgentIdentity>,
+    },
 
     // ---- anchor.* ----
+    #[serde(rename = "anchor.list")]
+    AnchorList {},
+    #[serde(rename = "anchor.list.result")]
+    AnchorListResult { anchors: Vec<AnchorSummary> },
     #[serde(rename = "anchor.tag")]
     AnchorTag { pane_id: Uuid },
     #[serde(rename = "anchor.new")]
@@ -224,6 +411,21 @@ pub enum Kind {
     AnchorRespawn { pane_id: Uuid },
     #[serde(rename = "anchor.status")]
     AnchorStatus { pane_id: Uuid, state: AnchorState },
+
+    // ---- grant.* ----
+    #[serde(rename = "grant.request")]
+    GrantRequest(GrantRequest),
+    #[serde(rename = "grant.request.result")]
+    GrantRequestResult {
+        grant_id: Uuid,
+        #[serde(default)]
+        pending: bool,
+    },
+    #[serde(rename = "grant.decide")]
+    GrantDecide {
+        grant_id: Uuid,
+        decision: GrantDecision,
+    },
 
     // ---- satellite.* ----
     #[serde(rename = "satellite.open")]
@@ -257,6 +459,20 @@ pub enum Kind {
         workspace: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<AgentIdentity>,
+    },
+    #[serde(rename = "satellite.launch_attach")]
+    SatelliteLaunchAttach {
+        argv: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title_hint: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app_hint: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<AgentIdentity>,
     },
     #[serde(rename = "satellite.map")]
     SatelliteMap {
@@ -336,12 +552,30 @@ mod tests {
         }
     }
 
+    fn agent() -> AgentIdentity {
+        AgentIdentity {
+            id: "codex".into(),
+            name: Some("Codex".into()),
+        }
+    }
+
     #[test]
     fn hello_roundtrip() {
         let k = Kind::Hello {
             client: ClientRole::LmuxCli,
             pid: 1234,
         };
+        assert_eq!(wrap_and_roundtrip(k.clone()), k);
+    }
+
+    #[test]
+    fn mcp_client_role_wire_name() {
+        let k = Kind::Hello {
+            client: ClientRole::LmuxMcp,
+            pid: 1234,
+        };
+        let s = serde_json::to_string(&k).unwrap();
+        assert!(s.contains("\"client\":\"lmux-mcp\""), "got: {s}");
         assert_eq!(wrap_and_roundtrip(k.clone()), k);
     }
 
@@ -468,6 +702,145 @@ mod tests {
     }
 
     #[test]
+    fn agent_payloads_roundtrip() {
+        let pane_id = Uuid::new_v4();
+        let anchor_id = Uuid::new_v4();
+        let grant_id = Uuid::new_v4();
+        let kinds = vec![
+            Kind::AnchorList {},
+            Kind::AnchorListResult {
+                anchors: vec![AnchorSummary {
+                    anchor_id,
+                    pane_id: Some(pane_id),
+                    label: "backend".into(),
+                    active: true,
+                    agent_status: vec![AgentPaneStatus {
+                        pane_id,
+                        agent: agent(),
+                        title: Some("tests".into()),
+                        purpose: Some("run tests".into()),
+                    }],
+                    pending_grants: 1,
+                    active_grants: 2,
+                }],
+            },
+            Kind::PaneNew {
+                target_anchor: Some(anchor_id),
+                placement: PanePlacement::Tab,
+                activate: true,
+                title: Some("tests".into()),
+                argv: vec!["cargo".into(), "test".into()],
+                agent: Some(agent()),
+                purpose: Some("run tests".into()),
+            },
+            Kind::PaneNewResult(PaneNewResult {
+                pane_id,
+                anchor_id,
+                placement: PanePlacement::Tab,
+            }),
+            Kind::PaneTail {
+                pane_id,
+                lines: 120,
+                agent: None,
+            },
+            Kind::PaneCapture {
+                pane_id,
+                since_sequence: Some(42),
+                max_lines: Some(80),
+                agent: None,
+            },
+            Kind::PaneTranscriptResult(TranscriptRange {
+                pane_id,
+                first_sequence: 40,
+                last_sequence: 42,
+                truncated: false,
+                lines: vec![TranscriptLine {
+                    sequence: 42,
+                    unix_millis: 1_700_000_000_000,
+                    text: "ok".into(),
+                }],
+            }),
+            Kind::PaneSendInput {
+                pane_id,
+                text: "q".into(),
+                agent: None,
+            },
+            Kind::PaneRename {
+                pane_id,
+                title: "unit tests".into(),
+                pin: true,
+                agent: Some(agent()),
+            },
+            Kind::GrantRequest(GrantRequest {
+                grant_id,
+                requester: agent(),
+                scope: GrantScope::ReadOutput,
+                source_anchor: Some(anchor_id),
+                target_anchor: Some(Uuid::new_v4()),
+                target_pane: Some(pane_id),
+                target_window: None,
+                reason: Some("need frontend logs".into()),
+            }),
+            Kind::GrantRequestResult {
+                grant_id,
+                pending: true,
+            },
+            Kind::GrantDecide {
+                grant_id,
+                decision: GrantDecision::AllowUntil {
+                    expires_at_unix_seconds: 1_700_000_600,
+                },
+            },
+        ];
+
+        for kind in kinds {
+            assert_eq!(wrap_and_roundtrip(kind.clone()), kind);
+        }
+    }
+
+    #[test]
+    fn agent_payloads_omit_optional_empty_fields() {
+        let pane_id = Uuid::nil();
+        let k = Kind::PaneNew {
+            target_anchor: None,
+            placement: PanePlacement::SplitRight,
+            activate: false,
+            title: None,
+            argv: Vec::new(),
+            agent: None,
+            purpose: None,
+        };
+        let s = serde_json::to_string(&k).unwrap();
+        assert!(!s.contains("target_anchor"), "got: {s}");
+        assert!(!s.contains("title"), "got: {s}");
+        assert!(!s.contains("agent"), "got: {s}");
+        assert!(!s.contains("purpose"), "got: {s}");
+
+        let k = Kind::PaneRename {
+            pane_id,
+            title: "logs".into(),
+            pin: false,
+            agent: None,
+        };
+        let s = serde_json::to_string(&k).unwrap();
+        assert!(!s.contains("agent"), "got: {s}");
+    }
+
+    #[test]
+    fn title_provenance_and_grant_scope_wire_names() {
+        let title = PaneTitle {
+            title: "server".into(),
+            provenance: PaneTitleProvenance::Agent,
+            pinned: false,
+        };
+        let s = serde_json::to_string(&title).unwrap();
+        assert!(s.contains("\"provenance\":\"agent\""), "got: {s}");
+
+        let s = serde_json::to_string(&GrantScope::ReadOutput).unwrap();
+        assert_eq!(s, "\"read-output\"");
+    }
+
+    #[test]
     fn session_list_result_skips_last_active_when_none() {
         let k = Kind::SessionListResult {
             sessions: vec![SessionSummary {
@@ -586,9 +959,22 @@ mod tests {
                 title: Some("Window".into()),
                 workspace: Some("1".into()),
                 output: Some("HDMI-A-1".into()),
+                agent: None,
             };
             assert_eq!(wrap_and_roundtrip(k.clone()), k);
         }
+    }
+
+    #[test]
+    fn satellite_launch_attach_roundtrip() {
+        let k = Kind::SatelliteLaunchAttach {
+            argv: vec!["kate".into(), "--new-window".into()],
+            title_hint: Some("notes".into()),
+            app_hint: Some("org.kde.kate".into()),
+            timeout_ms: Some(1500),
+            agent: Some(agent()),
+        };
+        assert_eq!(wrap_and_roundtrip(k.clone()), k);
     }
 
     #[test]
@@ -598,6 +984,10 @@ mod tests {
             Kind::Hello {
                 client: ClientRole::KwinScript,
                 pid: 1,
+            },
+            Kind::Hello {
+                client: ClientRole::LmuxMcp,
+                pid: 2,
             },
             Kind::HelloAck {
                 cockpit_version: "0.2.0".into(),
@@ -617,6 +1007,53 @@ mod tests {
             },
             Kind::SessionDelete { name: "a".into() },
             Kind::SessionOpen { name: "a".into() },
+            Kind::AnchorList {},
+            Kind::AnchorListResult {
+                anchors: Vec::new(),
+            },
+            Kind::PaneNew {
+                target_anchor: None,
+                placement: PanePlacement::Tab,
+                activate: false,
+                title: None,
+                argv: Vec::new(),
+                agent: None,
+                purpose: None,
+            },
+            Kind::PaneNewResult(PaneNewResult {
+                pane_id: Uuid::nil(),
+                anchor_id: Uuid::nil(),
+                placement: PanePlacement::Tab,
+            }),
+            Kind::PaneTail {
+                pane_id: Uuid::nil(),
+                lines: 20,
+                agent: None,
+            },
+            Kind::PaneCapture {
+                pane_id: Uuid::nil(),
+                since_sequence: None,
+                max_lines: None,
+                agent: None,
+            },
+            Kind::PaneTranscriptResult(TranscriptRange {
+                pane_id: Uuid::nil(),
+                first_sequence: 0,
+                last_sequence: 0,
+                truncated: false,
+                lines: Vec::new(),
+            }),
+            Kind::PaneSendInput {
+                pane_id: Uuid::nil(),
+                text: "q".into(),
+                agent: None,
+            },
+            Kind::PaneRename {
+                pane_id: Uuid::nil(),
+                title: "logs".into(),
+                pin: false,
+                agent: None,
+            },
             Kind::AnchorTag {
                 pane_id: Uuid::nil(),
             },
@@ -637,6 +1074,24 @@ mod tests {
             },
             Kind::AnchorRespawn {
                 pane_id: Uuid::nil(),
+            },
+            Kind::GrantRequest(GrantRequest {
+                grant_id: Uuid::nil(),
+                requester: agent(),
+                scope: GrantScope::SendInput,
+                source_anchor: None,
+                target_anchor: None,
+                target_pane: Some(Uuid::nil()),
+                target_window: None,
+                reason: None,
+            }),
+            Kind::GrantRequestResult {
+                grant_id: Uuid::nil(),
+                pending: true,
+            },
+            Kind::GrantDecide {
+                grant_id: Uuid::nil(),
+                decision: GrantDecision::Deny,
             },
             Kind::SatelliteOpen {
                 argv: vec!["kate".into()],
@@ -668,6 +1123,14 @@ mod tests {
                 title: Some("Example".into()),
                 workspace: None,
                 output: None,
+                agent: None,
+            },
+            Kind::SatelliteLaunchAttach {
+                argv: vec!["kate".into()],
+                title_hint: Some("Example".into()),
+                app_hint: None,
+                timeout_ms: Some(1000),
+                agent: None,
             },
             Kind::CompositorReinject {},
         ];
