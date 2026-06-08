@@ -22,16 +22,17 @@ Accepted ADRs may be superseded by the current specs or by later ADRs.
 ```text
 lmux window
 ├─ workspace: checkout-api
-│  ├─ terminal: shell / agent / build
+│  ├─ terminal tabs: shell / agent / build
 │  └─ app windows: browser, editor, IDE
 └─ workspace: billing-fix
-   ├─ terminal: shell / agent / logs
+   ├─ terminal tabs: shell / agent / logs
    └─ app windows: browser, editor, IDE
 ```
 
 The implementation still uses precise internal names:
 
-- **Pane**: a terminal pane inside the lmux window.
+- **Pane**: a terminal pane inside the lmux window. Panes can be split in the
+  visible layout or stacked as shell tabs inside a workspace.
 - **Anchor**: the terminal root for a work context. The first terminal is an
   anchor automatically.
 - **Satellite**: a native GUI window explicitly attached to an anchor.
@@ -110,7 +111,8 @@ manage.
 ## Daily Workflow
 
 1. Start `lmux`; the first terminal is already the active workspace anchor.
-2. Split terminal panes with `Ctrl+B -` or `Ctrl+B +`.
+2. Split terminal panes with `Ctrl+B -` or `Ctrl+B +`, or create another shell
+   tab with `Ctrl+B t` or the `+` button in the tab line.
 3. Open a normal app window from the desktop or shell.
 4. Use the sidebar link/add-window button and choose the exact window to attach.
 5. Create or cycle workspaces with `Ctrl+B a`; lmux keeps the active
@@ -163,6 +165,7 @@ one second.
 |---------|--------|
 | `Ctrl+B` `-` | Split focused pane horizontally, new pane below |
 | `Ctrl+B` `+` / `\|` / `\` | Split focused pane vertically, new pane right |
+| `Ctrl+B` `t` | Create a new shell tab in the active workspace |
 | `Ctrl+B` `x` | Close focused pane |
 | `Ctrl+B` `]` / `o` / `n` | Cycle focus forward |
 | `Ctrl+B` `[` / `p` | Cycle focus backward |
@@ -171,12 +174,16 @@ one second.
 | `Ctrl+B` `m` | Rearrange panes |
 | `Ctrl+B` `q` | Quit lmux, saving session state |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy / paste in terminal panes |
-| `Ctrl+F` | Search the focused terminal pane |
+| `Ctrl+F` | Search the focused terminal pane's scrollback |
 | macOS: `Command+C` / `Command+V` / `Command+F` | Copy / paste / search in terminal panes |
 | `PageUp` / `PageDown` / mouse wheel | Scrollback in focused pane |
 
 When an attached GUI window has focus, lmux lets key events pass through so the
 native app keeps its own shortcuts.
+
+Terminal search opens as an inline row under the tab line. Previous/Next
+navigate all retained scrollback, not only the rows currently visible, and
+scrolling still works while the search field has focus.
 
 If the clipboard contains an image, terminal paste writes it to an ephemeral PNG
 under the runtime temp directory and pastes the absolute file path into the PTY.
@@ -222,7 +229,10 @@ talk to a running lmux process over the bus socket:
 
 ```sh
 lmux-cli status
+lmux-cli mark-anchor
 lmux-cli pane list
+lmux-cli pane new --tab
+lmux-cli new-window
 lmux-cli anchor tag <uuid>
 lmux-cli anchor pause <uuid>
 lmux-cli session list
@@ -242,9 +252,10 @@ full surface.
 
 Use the GUI for ordinary workspace and window management. Use the CLI when you
 want scripts, diagnostics, or exact ids. `lmux-cli pane list` shows pane UUIDs
-for `anchor tag`; sidebar popovers expose anchor UUIDs for pause/resume/hide.
-`satellite list-windows` shows backend window ids for explicit attach. On macOS,
-`satellite attach-focused` attaches the currently focused native window.
+for `anchor tag`; `lmux-cli mark-anchor` tags the pane running the command.
+Sidebar popovers expose anchor UUIDs for pause/resume/hide. `satellite
+list-windows` shows backend window ids for explicit attach. On macOS, `satellite
+attach-focused` attaches the currently focused native window.
 
 ## Documentation
 

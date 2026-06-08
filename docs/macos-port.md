@@ -142,6 +142,7 @@ matches Linux and tmux:
 
 - `Ctrl+B`, then `|` / `\` / `+` splits vertically.
 - `Ctrl+B`, then `-` splits horizontally.
+- `Ctrl+B`, then `t` creates a new shell tab in the active workspace.
 - `Ctrl+B`, then `o` / `]` cycles focus forward.
 - `Ctrl+B`, then `p` / `[` cycles focus backward.
 - `Ctrl+B`, then `s` opens the session switcher.

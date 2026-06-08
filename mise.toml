@@ -33,7 +33,7 @@ description = "Run compositor contract tests, including the macOS helper scaffol
 run = "cargo test -p lmux-compositor"
 
 [tasks."test:portable"]
-description = "Run portable bus/control/PTY tests"
+description = "Run portable bus/PTY tests"
 run = "cargo test -p lmux-bus -p lmux-pty"
 
 [tasks."test:port"]
