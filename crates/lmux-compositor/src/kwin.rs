@@ -208,7 +208,7 @@ impl CompositorControl for KwinCompositor {
         let already: bool = scripting
             .call("isScriptLoaded", &(LMUX_PLUGIN_NAME,))
             .await
-            .map_err(|e| CompositorError::Domain(format!("isScriptLoaded: {e}")))?;
+            .map_err(|e| CompositorError::Offline(format!("isScriptLoaded: {e}")))?;
         if already {
             return Ok(());
         }
