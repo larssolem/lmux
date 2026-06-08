@@ -74,6 +74,9 @@ jobs:
       - name: Install pinned toolchains
         run: mise install
 
+      - name: Install Rust components
+        run: mise exec -- rustup component add rustfmt clippy
+
       - name: Install macOS dependencies
         run: mise run deps:macos
 

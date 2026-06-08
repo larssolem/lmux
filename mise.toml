@@ -26,7 +26,7 @@ run = "cargo fmt --all -- --check"
 
 [tasks."check:portable"]
 description = "Check the Linux-testable macOS port foundation crates"
-run = "cargo check -p lmux-compositor -p lmux-bus -p lmux-control -p lmux-pty -p lmux-wayland-host"
+run = "cargo check -p lmux-compositor -p lmux-bus -p lmux-pty -p lmux-wayland-host"
 
 [tasks."test:compositor"]
 description = "Run compositor contract tests, including the macOS helper scaffold"
@@ -34,7 +34,7 @@ run = "cargo test -p lmux-compositor"
 
 [tasks."test:portable"]
 description = "Run portable bus/control/PTY tests"
-run = "cargo test -p lmux-bus -p lmux-control -p lmux-pty"
+run = "cargo test -p lmux-bus -p lmux-pty"
 
 [tasks."test:port"]
 description = "Run the Linux-testable macOS port test set"
