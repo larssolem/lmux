@@ -143,6 +143,24 @@ application-level scroll/copy/paste shortcuts.
 - **THEN** lmux reads clipboard text and injects it through the normal
   bracketed-paste path
 
+#### Scenario: Terminal search highlights visible matches
+
+- **WHEN** the user presses `Ctrl+F` on Linux or `Command+F` on macOS
+  while a terminal pane is focused
+- **THEN** lmux opens a pane-local search entry without sending the shortcut to
+  the PTY
+- **AND** non-empty search text highlights case-insensitive substring matches in
+  the visible terminal viewport
+
+#### Scenario: Terminal search navigates through scrollback
+
+- **WHEN** a terminal search entry is open and the user presses `Enter`, presses
+  `Shift+Enter`, clicks `Next`, or clicks `Previous`
+- **THEN** lmux selects the next or previous visible match when available
+- **AND** if there is no adjacent visible match, lmux scans by paging the
+  terminal viewport through scrollback until a match is found or the scrollback
+  boundary is reached
+
 ### Requirement: Bell notification
 
 The cockpit SHALL convert terminal bell bytes into local desktop

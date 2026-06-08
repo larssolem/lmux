@@ -31,6 +31,7 @@ impl ShortcutPlatform {
 pub enum TerminalShortcut {
     Copy,
     Paste,
+    Find,
 }
 
 pub fn classify_terminal_shortcut(
@@ -50,13 +51,18 @@ pub fn classify_terminal_shortcut_for_platform(
         return match ch {
             'c' => Some(TerminalShortcut::Copy),
             'v' => Some(TerminalShortcut::Paste),
+            'f' => Some(TerminalShortcut::Find),
             _ => None,
         };
+    }
+    if platform == ShortcutPlatform::Default && has_control(modifier) && ch == 'f' {
+        return Some(TerminalShortcut::Find);
     }
     if platform == ShortcutPlatform::Macos && has_command(modifier) {
         return match ch {
             'c' => Some(TerminalShortcut::Copy),
             'v' => Some(TerminalShortcut::Paste),
+            'f' => Some(TerminalShortcut::Find),
             _ => None,
         };
     }
@@ -66,6 +72,10 @@ pub fn classify_terminal_shortcut_for_platform(
 fn has_control_shift(modifier: gdk::ModifierType) -> bool {
     let needed = gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK;
     modifier.contains(needed)
+}
+
+fn has_control(modifier: gdk::ModifierType) -> bool {
+    modifier.contains(gdk::ModifierType::CONTROL_MASK)
 }
 
 fn has_command(modifier: gdk::ModifierType) -> bool {
@@ -201,6 +211,34 @@ mod tests {
                 ShortcutPlatform::Macos,
             ),
             Some(TerminalShortcut::Paste)
+        );
+    }
+
+    #[test]
+    fn find_shortcut_is_ctrl_f_ctrl_shift_f_or_command_f() {
+        assert_eq!(
+            classify_terminal_shortcut_for_platform(
+                gdk::Key::f,
+                gdk::ModifierType::CONTROL_MASK,
+                ShortcutPlatform::Default,
+            ),
+            Some(TerminalShortcut::Find)
+        );
+        assert_eq!(
+            classify_terminal_shortcut_for_platform(
+                gdk::Key::f,
+                ctrl_shift(),
+                ShortcutPlatform::Default,
+            ),
+            Some(TerminalShortcut::Find)
+        );
+        assert_eq!(
+            classify_terminal_shortcut_for_platform(
+                gdk::Key::f,
+                gdk::ModifierType::META_MASK,
+                ShortcutPlatform::Macos,
+            ),
+            Some(TerminalShortcut::Find)
         );
     }
 

@@ -171,7 +171,8 @@ one second.
 | `Ctrl+B` `m` | Rearrange panes |
 | `Ctrl+B` `q` | Quit lmux, saving session state |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy / paste in terminal panes |
-| macOS: `Command+C` / `Command+V` | Copy / paste in terminal panes |
+| `Ctrl+F` | Search the focused terminal pane |
+| macOS: `Command+C` / `Command+V` / `Command+F` | Copy / paste / search in terminal panes |
 | `PageUp` / `PageDown` / mouse wheel | Scrollback in focused pane |
 
 When an attached GUI window has focus, lmux lets key events pass through so the

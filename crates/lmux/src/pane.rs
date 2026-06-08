@@ -10,9 +10,9 @@ use gtk4::glib;
 use gtk4::pango;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box as GtkBox, Button, DragSource, DrawingArea, DropTarget, EventControllerMotion,
-    EventControllerScroll, EventControllerScrollFlags, Frame, GestureClick, GestureDrag, Label,
-    Orientation, Popover,
+    Align, Box as GtkBox, Button, DragSource, DrawingArea, DropTarget, Entry,
+    EventControllerMotion, EventControllerScroll, EventControllerScrollFlags, Frame, GestureClick,
+    GestureDrag, Label, Orientation, Popover, PositionType,
 };
 use lmux_config::FocusMode;
 use lmux_libghostty::{
@@ -22,7 +22,7 @@ use lmux_pty::{self, Pane as PtyPane};
 
 use crate::keymap::{self, KeyAction, TerminalShortcut};
 use crate::layout::PaneId;
-use crate::render::{CairoRenderer, Selection};
+use crate::render::{CairoRenderer, SearchHighlight, Selection};
 
 const WHEEL_ROWS_PER_TICK: i32 = 3;
 
@@ -31,6 +31,7 @@ const INIT_ROWS: u16 = 30;
 const SCROLLBACK: usize = 100_000;
 const TRANSCRIPT_MAX_LINES: usize = 10_000;
 const READER_CHAN_CAPACITY: usize = 64;
+const SEARCH_SCAN_PAGES: usize = 512;
 #[cfg(target_os = "macos")]
 const DEFAULT_FONT_FAMILY: &str = "JetBrains Mono";
 #[cfg(target_os = "linux")]
@@ -153,10 +154,24 @@ struct Inner {
     rows: u16,
     font_desc: pango::FontDescription,
     selection: Option<(ScreenPoint, ScreenPoint)>,
+    search: Option<SearchState>,
     drag_anchor: Option<ScreenPoint>,
     drag_pointer: Option<(f64, f64)>,
     frozen_frame: Option<FrozenFrame>,
     exit_code: Option<i32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SearchMatch {
+    start: ScreenPoint,
+    end: ScreenPoint,
+}
+
+#[derive(Clone, Debug)]
+struct SearchState {
+    query: String,
+    matches: Vec<SearchMatch>,
+    active: Option<SearchMatch>,
 }
 
 struct TranscriptBuffer {
@@ -303,6 +318,7 @@ impl TerminalPane {
             rows: INIT_ROWS,
             font_desc: font_desc.clone(),
             selection: None,
+            search: None,
             drag_anchor: None,
             drag_pointer: None,
             frozen_frame: None,
@@ -375,6 +391,7 @@ impl TerminalPane {
         inner.pty.writer().write_all(text.as_bytes())?;
         inner.term.scroll_to_bottom();
         inner.selection = None;
+        inner.search = None;
         drop(inner);
         self.drawing_area.queue_draw();
         Ok(())
@@ -513,14 +530,18 @@ impl TerminalPane {
         let inner = self.inner.clone();
         let area = self.drawing_area.clone();
         key.connect_key_pressed(move |_ctrl, keyval, _code, modifier| {
-            if inner.borrow().exit_code.is_some() {
-                return glib::Propagation::Stop;
-            }
             if let Some(shortcut) = keymap::classify_terminal_shortcut(keyval, modifier) {
                 match shortcut {
                     TerminalShortcut::Copy => copy_selection_to_clipboard(&inner),
-                    TerminalShortcut::Paste => request_paste_from_clipboard(&area, &inner),
+                    TerminalShortcut::Paste if inner.borrow().exit_code.is_none() => {
+                        request_paste_from_clipboard(&area, &inner)
+                    }
+                    TerminalShortcut::Paste => {}
+                    TerminalShortcut::Find => open_search_popover(&area, &inner),
                 }
+                return glib::Propagation::Stop;
+            }
+            if inner.borrow().exit_code.is_some() {
                 return glib::Propagation::Stop;
             }
             let page_rows = inner.borrow().rows;
@@ -534,6 +555,7 @@ impl TerminalPane {
                     }
                     b.term.scroll_to_bottom();
                     b.selection = None;
+                    b.search = None;
                     b.frozen_frame = None;
                     drop(b);
                     area.queue_draw();
@@ -835,6 +857,346 @@ fn copy_selection_to_clipboard(inner: &Rc<RefCell<Inner>>) {
     }
 }
 
+fn open_search_popover(area: &DrawingArea, inner: &Rc<RefCell<Inner>>) {
+    let popover = Popover::new();
+    popover.set_position(PositionType::Top);
+    popover.set_has_arrow(false);
+    popover.set_autohide(true);
+    popover.set_parent(area);
+
+    let body = GtkBox::new(Orientation::Vertical, 6);
+    body.set_margin_top(8);
+    body.set_margin_bottom(8);
+    body.set_margin_start(8);
+    body.set_margin_end(8);
+    body.set_size_request(300, -1);
+
+    let entry = Entry::new();
+    entry.set_placeholder_text(Some("Search terminal..."));
+    if let Some(query) = inner
+        .borrow()
+        .search
+        .as_ref()
+        .map(|state| state.query.clone())
+    {
+        entry.set_text(&query);
+    }
+    body.append(&entry);
+
+    let status = Label::new(None);
+    status.set_xalign(0.0);
+    status.add_css_class("dim-label");
+    body.append(&status);
+
+    let controls = GtkBox::new(Orientation::Horizontal, 6);
+    let previous = Button::with_label("Previous");
+    let next = Button::with_label("Next");
+    controls.append(&previous);
+    controls.append(&next);
+    body.append(&controls);
+    popover.set_child(Some(&body));
+
+    update_search_status(&status, inner);
+
+    let inner_changed = inner.clone();
+    let area_changed = area.clone();
+    let status_changed = status.clone();
+    entry.connect_changed(move |entry| {
+        inner_changed
+            .borrow_mut()
+            .set_search_query(entry.text().to_string());
+        update_search_status(&status_changed, &inner_changed);
+        area_changed.queue_draw();
+    });
+
+    let inner_previous = inner.clone();
+    let area_previous = area.clone();
+    let status_previous = status.clone();
+    previous.connect_clicked(move |_| {
+        advance_search(&inner_previous, &area_previous, false);
+        update_search_status(&status_previous, &inner_previous);
+    });
+
+    let inner_next = inner.clone();
+    let area_next = area.clone();
+    let status_next = status.clone();
+    next.connect_clicked(move |_| {
+        advance_search(&inner_next, &area_next, true);
+        update_search_status(&status_next, &inner_next);
+    });
+
+    let key = gtk4::EventControllerKey::new();
+    let inner_key = inner.clone();
+    let area_key = area.clone();
+    let status_key = status.clone();
+    let popover_key = popover.clone();
+    key.connect_key_pressed(move |_, keyval, _, modifier| match keyval {
+        gdk::Key::Escape => {
+            popover_key.popdown();
+            glib::Propagation::Stop
+        }
+        gdk::Key::Return | gdk::Key::KP_Enter => {
+            let forward = !modifier.contains(gdk::ModifierType::SHIFT_MASK);
+            advance_search(&inner_key, &area_key, forward);
+            update_search_status(&status_key, &inner_key);
+            glib::Propagation::Stop
+        }
+        _ => glib::Propagation::Proceed,
+    });
+    entry.add_controller(key);
+
+    let inner_cleanup = inner.clone();
+    let area_cleanup = area.clone();
+    let popover_cleanup = popover.clone();
+    popover.connect_closed(move |_| {
+        inner_cleanup.borrow_mut().search = None;
+        area_cleanup.queue_draw();
+        popover_cleanup.unparent();
+    });
+
+    popover.popup();
+    entry.grab_focus();
+}
+
+fn update_search_status(label: &Label, inner: &Rc<RefCell<Inner>>) {
+    label.set_text(&inner.borrow().search_status());
+}
+
+fn advance_search(inner: &Rc<RefCell<Inner>>, area: &DrawingArea, forward: bool) {
+    {
+        let mut b = inner.borrow_mut();
+        if b.search.as_ref().is_none_or(|state| state.query.is_empty()) {
+            return;
+        }
+        if b.select_adjacent_visible_match(forward) {
+            area.queue_draw();
+            return;
+        }
+
+        let page_delta = b.rows.max(1) as isize;
+        let delta = if forward { page_delta } else { -page_delta };
+        for _ in 0..SEARCH_SCAN_PAGES {
+            let before = b.term.viewport_top_screen_row();
+            b.term.scroll_delta(delta);
+            let after = b.term.viewport_top_screen_row();
+            if before == after {
+                break;
+            }
+            b.refresh_search_matches(false);
+            let found = b.search.as_ref().and_then(|state| {
+                if forward {
+                    state.matches.first().copied()
+                } else {
+                    state.matches.last().copied()
+                }
+            });
+            if let Some(found) = found {
+                b.set_active_search_match(found);
+                break;
+            }
+        }
+    }
+    area.queue_draw();
+}
+
+impl Inner {
+    fn set_search_query(&mut self, query: String) {
+        if query.is_empty() {
+            self.search = None;
+            return;
+        }
+        self.search = Some(SearchState {
+            query,
+            matches: Vec::new(),
+            active: None,
+        });
+        self.refresh_search_matches(true);
+    }
+
+    fn refresh_search_matches(&mut self, select_first: bool) {
+        let Some(query) = self.search.as_ref().map(|state| state.query.clone()) else {
+            return;
+        };
+        let previous_active = self.search.as_ref().and_then(|state| state.active);
+        let matches = visible_search_matches(&mut self.term, &query);
+        let active = if select_first {
+            matches.first().copied()
+        } else {
+            previous_active
+        };
+        if let Some(state) = self.search.as_mut() {
+            state.matches = matches;
+            state.active = active;
+        }
+    }
+
+    fn select_adjacent_visible_match(&mut self, forward: bool) -> bool {
+        self.refresh_search_matches(false);
+        let Some(state) = self.search.as_ref() else {
+            return false;
+        };
+        let active = state.active;
+        let found = match (forward, active) {
+            (true, Some(active)) => state
+                .matches
+                .iter()
+                .find(|m| search_match_order_key(m) > search_match_order_key(&active))
+                .copied(),
+            (false, Some(active)) => state
+                .matches
+                .iter()
+                .rev()
+                .find(|m| search_match_order_key(m) < search_match_order_key(&active))
+                .copied(),
+            (true, None) => state.matches.first().copied(),
+            (false, None) => state.matches.last().copied(),
+        };
+        if let Some(found) = found {
+            self.set_active_search_match(found);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn set_active_search_match(&mut self, active: SearchMatch) {
+        if let Some(state) = self.search.as_mut() {
+            state.active = Some(active);
+        }
+    }
+
+    fn search_highlights(&self, viewport_top_screen_row: u32) -> Vec<SearchHighlight> {
+        self.search
+            .as_ref()
+            .map(|state| {
+                state
+                    .matches
+                    .iter()
+                    .map(|m| {
+                        SearchHighlight::new(
+                            m.start,
+                            m.end,
+                            state.active == Some(*m),
+                            viewport_top_screen_row,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn search_status(&self) -> String {
+        let Some(state) = self.search.as_ref() else {
+            return "Type to search".to_string();
+        };
+        if state.matches.is_empty() {
+            return "No matches visible; press Enter to scan scrollback".to_string();
+        }
+        match state
+            .active
+            .and_then(|active| state.matches.iter().position(|m| *m == active))
+        {
+            Some(index) => format!("{}/{} visible", index + 1, state.matches.len()),
+            None => format!("{} visible", state.matches.len()),
+        }
+    }
+}
+
+fn visible_search_matches(term: &mut Terminal, query: &str) -> Vec<SearchMatch> {
+    let query_width = query.chars().count();
+    if query.is_empty() || query_width == 0 {
+        return Vec::new();
+    }
+    let Some(top) = term.viewport_top_screen_row() else {
+        return Vec::new();
+    };
+    let mut visitor = ViewportTextVisitor::new(top);
+    term.render(&mut visitor);
+    visitor.matches(query)
+}
+
+fn search_match_order_key(m: &SearchMatch) -> (u32, u16) {
+    (m.start.row, m.start.col)
+}
+
+struct ViewportTextVisitor {
+    top_screen_row: u32,
+    rows: Vec<String>,
+}
+
+impl ViewportTextVisitor {
+    fn new(top_screen_row: u32) -> Self {
+        Self {
+            top_screen_row,
+            rows: Vec::new(),
+        }
+    }
+
+    fn matches(&self, query: &str) -> Vec<SearchMatch> {
+        self.rows
+            .iter()
+            .enumerate()
+            .flat_map(|(row, line)| {
+                find_matches_in_line(self.top_screen_row + row as u32, line, query)
+            })
+            .collect()
+    }
+}
+
+impl RenderVisitor for ViewportTextVisitor {
+    fn begin(&mut self, frame: &LgFrame) {
+        self.rows = vec![String::new(); frame.rows as usize];
+    }
+
+    fn cell(&mut self, cell: &CellView<'_>) {
+        let Some(row) = self.rows.get_mut(cell.row as usize) else {
+            return;
+        };
+        pad_to_column(row, cell.col as usize);
+        row.push_str(cell.text);
+    }
+
+    fn cursor(&mut self, _cursor: &CursorPos) {}
+    fn end(&mut self) {}
+}
+
+fn pad_to_column(row: &mut String, col: usize) {
+    let len = row.chars().count();
+    if len < col {
+        row.extend(std::iter::repeat_n(' ', col - len));
+    }
+}
+
+fn find_matches_in_line(row: u32, line: &str, query: &str) -> Vec<SearchMatch> {
+    let needle = query.to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let haystack = line.to_lowercase();
+    let query_width = query.chars().count().max(1);
+    let mut out = Vec::new();
+    let mut offset = 0;
+    while let Some(relative) = haystack[offset..].find(&needle) {
+        let start_byte = offset + relative;
+        let start_col = line[..start_byte].chars().count();
+        let end_col = start_col.saturating_add(query_width).saturating_sub(1);
+        let start_col = start_col.min(u16::MAX as usize) as u16;
+        let end_col = end_col.min(u16::MAX as usize) as u16;
+        out.push(SearchMatch {
+            start: ScreenPoint {
+                row,
+                col: start_col,
+            },
+            end: ScreenPoint { row, col: end_col },
+        });
+        offset = start_byte.saturating_add(needle.len().max(1));
+        if offset >= haystack.len() {
+            break;
+        }
+    }
+    out
+}
+
 #[derive(Clone)]
 struct FrozenFrame {
     top_screen_row: u32,
@@ -970,6 +1332,7 @@ fn paste_text(inner: &Rc<RefCell<Inner>>, area: &DrawingArea, text: &str) {
     }
     b.term.scroll_to_bottom();
     b.selection = None;
+    b.search = None;
     b.frozen_frame = None;
     drop(b);
     area.queue_draw();
@@ -1015,6 +1378,18 @@ fn open_terminal_context_menu(
         move || {
             request_paste_from_clipboard(&area_paste, &inner_paste);
             popover_paste.popdown();
+        },
+    ));
+
+    let inner_find = inner.clone();
+    let area_find = area.clone();
+    let popover_find = popover.clone();
+    body.append(&context_menu_button(
+        "Search",
+        terminal_find_shortcut(),
+        move || {
+            popover_find.popdown();
+            open_search_popover(&area_find, &inner_find);
         },
     ));
 
@@ -1160,6 +1535,14 @@ fn terminal_paste_shortcut() -> &'static str {
         "Cmd+V"
     } else {
         "Ctrl+Shift+V"
+    }
+}
+
+fn terminal_find_shortcut() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Cmd+F"
+    } else {
+        "Ctrl+F"
     }
 }
 
@@ -1342,10 +1725,12 @@ fn install_draw_func(area: &DrawingArea, inner: &Rc<RefCell<Inner>>) {
         let selection = b
             .selection
             .and_then(|(s, e)| viewport_top.map(|top| Selection::new(s, e, top)));
+        let search = viewport_top
+            .map(|top| b.search_highlights(top))
+            .unwrap_or_default();
         let exit = b.exit_code;
-        let cols = b.cols;
         let mut renderer =
-            CairoRenderer::new(cr, &font, cell_w, cell_h, selection.as_ref(), exit, cols);
+            CairoRenderer::new(cr, &font, cell_w, cell_h, selection.as_ref(), &search, exit);
         if let Some(frozen) = frozen {
             renderer.begin(&frozen.frame);
             for cell in &frozen.cells {
@@ -1716,7 +2101,9 @@ impl Pane {
 
 #[cfg(test)]
 mod tests {
-    use super::{BellScanner, TranscriptBuffer};
+    use lmux_libghostty::ScreenPoint;
+
+    use super::{find_matches_in_line, BellScanner, SearchMatch, TranscriptBuffer};
 
     #[test]
     fn counts_bare_bells() {
@@ -1760,6 +2147,30 @@ mod tests {
         // still inside OSC and swallow the BEL in the second chunk.
         assert_eq!(s.scan(b"\x1b]0;par"), 0);
         assert_eq!(s.scan(b"tial\x07after\x07"), 1);
+    }
+
+    #[test]
+    fn search_matcher_finds_case_insensitive_columns() {
+        let matches = find_matches_in_line(7, "alpha Beta beta", "beta");
+
+        assert_eq!(
+            matches,
+            vec![
+                SearchMatch {
+                    start: ScreenPoint { row: 7, col: 6 },
+                    end: ScreenPoint { row: 7, col: 9 },
+                },
+                SearchMatch {
+                    start: ScreenPoint { row: 7, col: 11 },
+                    end: ScreenPoint { row: 7, col: 14 },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn search_matcher_skips_empty_queries() {
+        assert!(find_matches_in_line(1, "anything", "").is_empty());
     }
 
     #[test]

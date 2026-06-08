@@ -32,14 +32,51 @@ impl Selection {
     }
 }
 
+/// A search result range, normalised in full-screen coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchHighlight {
+    pub start: ScreenPoint,
+    pub end: ScreenPoint,
+    pub active: bool,
+    viewport_top_screen_row: u32,
+}
+
+impl SearchHighlight {
+    pub fn new(
+        start: ScreenPoint,
+        end: ScreenPoint,
+        active: bool,
+        viewport_top_screen_row: u32,
+    ) -> Self {
+        let (start, end) = if (start.row, start.col) <= (end.row, end.col) {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        Self {
+            start,
+            end,
+            active,
+            viewport_top_screen_row,
+        }
+    }
+
+    fn contains(&self, row: u16, col: u16) -> bool {
+        let pos = (self.viewport_top_screen_row + u32::from(row), col);
+        let s = (self.start.row, self.start.col);
+        let e = (self.end.row, self.end.col);
+        pos >= s && pos <= e
+    }
+}
+
 pub struct CairoRenderer<'a> {
     cr: &'a cairo::Context,
     layout: pango::Layout,
     cell_w: f64,
     cell_h: f64,
     selection: Option<&'a Selection>,
+    search: &'a [SearchHighlight],
     exit_code: Option<i32>,
-    cols: u16,
     frame: Option<Frame>,
 }
 
@@ -50,8 +87,8 @@ impl<'a> CairoRenderer<'a> {
         cell_w: f64,
         cell_h: f64,
         selection: Option<&'a Selection>,
+        search: &'a [SearchHighlight],
         exit_code: Option<i32>,
-        cols: u16,
     ) -> Self {
         let pctx = pangocairo::functions::create_context(cr);
         // Match `measure_cell` — snap glyph advance to the pixel grid so
@@ -83,8 +120,8 @@ impl<'a> CairoRenderer<'a> {
             cell_w,
             cell_h,
             selection,
+            search,
             exit_code,
-            cols,
             frame: None,
         }
     }
@@ -113,14 +150,34 @@ impl RenderVisitor for CairoRenderer<'_> {
             .selection
             .map(|s| s.contains(cell.row, cell.col))
             .unwrap_or(false);
+        let search_active = self
+            .search
+            .iter()
+            .any(|m| m.active && m.contains(cell.row, cell.col));
+        let search_match = !search_active
+            && self
+                .search
+                .iter()
+                .any(|m| !m.active && m.contains(cell.row, cell.col));
 
-        if selected {
-            self.cr.set_source_rgba(0.27, 0.50, 0.78, 0.45);
-            self.cr.rectangle(x, y, self.cell_w, self.cell_h);
-            let _ = self.cr.fill();
-        } else if !cell.bg_is_default {
+        if !cell.bg_is_default {
             let (r, g, b) = to_rgb(cell.bg);
             self.cr.set_source_rgb(r, g, b);
+            self.cr.rectangle(x, y, self.cell_w, self.cell_h);
+            let _ = self.cr.fill();
+        }
+        if search_match {
+            self.cr.set_source_rgba(0.95, 0.77, 0.06, 0.36);
+            self.cr.rectangle(x, y, self.cell_w, self.cell_h);
+            let _ = self.cr.fill();
+        }
+        if search_active {
+            self.cr.set_source_rgba(0.96, 0.42, 0.12, 0.55);
+            self.cr.rectangle(x, y, self.cell_w, self.cell_h);
+            let _ = self.cr.fill();
+        }
+        if selected {
+            self.cr.set_source_rgba(0.27, 0.50, 0.78, 0.45);
             self.cr.rectangle(x, y, self.cell_w, self.cell_h);
             let _ = self.cr.fill();
         }
@@ -158,7 +215,7 @@ impl CairoRenderer<'_> {
             return;
         }
         let y = f64::from(rows - 1) * self.cell_h;
-        let width = f64::from(self.cols.max(1)) * self.cell_w;
+        let width = f64::from(frame.cols.max(1)) * self.cell_w;
         self.cr.set_source_rgb(0.55, 0.08, 0.12);
         self.cr.rectangle(0.0, y, width, self.cell_h);
         let _ = self.cr.fill();
