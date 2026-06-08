@@ -7,9 +7,9 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Minimum acceptable Zig version. Ghostty's `minimum_zig_version` is 0.15.2
-/// and Ghostty has not yet migrated to 0.16 (upstream issue #12228).
-const MINIMUM_ZIG_VERSION: (u32, u32, u32) = (0, 15, 2);
+/// Required Zig version. Ghostty's `minimum_zig_version` is 0.15.2 and the
+/// vendored build has not yet migrated to Zig 0.16 (upstream issue #12228).
+const REQUIRED_ZIG_VERSION: (u32, u32, u32) = (0, 15, 2);
 const MACOS_DEPLOYMENT_TARGET: &str = "14.0";
 
 fn main() {
@@ -237,21 +237,21 @@ fn prepend_path(command: &mut Command, dir: &Path) {
 }
 
 fn verify_zig_version(zig: &std::ffi::OsStr) {
-    let (min_major, min_minor, min_patch) = MINIMUM_ZIG_VERSION;
-    let min = format!("{min_major}.{min_minor}.{min_patch}");
+    let (major, minor, patch) = REQUIRED_ZIG_VERSION;
+    let required = format!("{major}.{minor}.{patch}");
     let output = Command::new(zig).arg("version").output().unwrap_or_else(|err| {
         panic!(
-            "failed to run `{} version`: {err}. Run `mise install` or set ZIG=/path/to/zig (>= {min})",
+            "failed to run `{} version`: {err}. Run `mise install` or set ZIG=/path/to/zig-{required}",
             PathBuf::from(zig).display()
         )
     });
     let stdout = String::from_utf8_lossy(&output.stdout);
     let version = stdout.trim();
-    let meets_minimum =
-        output.status.success() && parse_version(version).is_some_and(|v| v >= MINIMUM_ZIG_VERSION);
+    let is_required = output.status.success()
+        && parse_version(version).is_some_and(|v| v == REQUIRED_ZIG_VERSION);
     assert!(
-        meets_minimum,
-        "vendor-ghostty requires Zig >= {min}, got {} from `{}`. Run `mise install` or set ZIG=/path/to/zig (>= {min}).",
+        is_required,
+        "vendor-ghostty requires Zig {required}, got {} from `{}`. Run `mise install` or set ZIG=/path/to/zig-{required}.",
         if version.is_empty() { "unknown" } else { version },
         PathBuf::from(zig).display()
     );

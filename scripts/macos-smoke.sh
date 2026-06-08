@@ -5,17 +5,17 @@ echo "== lmux macOS smoke =="
 echo "rustc: $(rustc --version)"
 echo "cargo: $(cargo --version)"
 
-minimum_zig="0.15.2"
+required_zig="0.15.2"
 zig_bin="${ZIG:-zig}"
 if ! command -v "$zig_bin" >/dev/null 2>&1; then
-  echo "missing Zig. Install Zig >= $minimum_zig or set ZIG=/path/to/zig" >&2
+  echo "missing Zig. Install Zig $required_zig or set ZIG=/path/to/zig" >&2
   exit 1
 fi
 
 zig_version="$("$zig_bin" version)"
 echo "zig: $zig_version ($zig_bin)"
-if ! printf '%s\n%s\n' "$minimum_zig" "${zig_version%%-*}" | sort -V -C 2>/dev/null; then
-  echo "warning: vendored Ghostty expects Zig >= $minimum_zig (got $zig_version); continuing anyway" >&2
+if [[ "${zig_version%%-*}" != "$required_zig" ]]; then
+  echo "warning: vendored Ghostty expects Zig $required_zig (got $zig_version); continuing anyway" >&2
 fi
 
 echo "== protocol / portable crates =="

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lmux_bus::{BusError, Client, ClientRole, Handler, Kind, Server};
+use lmux_bus::{BusError, Client, ClientRole, Handler, Kind, RequestContext, Server};
 use tempfile::tempdir;
 use uuid::Uuid;
 
@@ -15,7 +15,7 @@ struct EchoHandler;
 
 #[async_trait]
 impl Handler for EchoHandler {
-    async fn handle(&self, req: Kind) -> Result<Kind, BusError> {
+    async fn handle(&self, _ctx: RequestContext, req: Kind) -> Result<Kind, BusError> {
         match req {
             Kind::SessionList {} => Ok(Kind::CompositorStatus {
                 state: lmux_bus::kinds::CompositorState::Online,

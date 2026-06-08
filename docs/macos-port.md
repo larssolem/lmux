@@ -1,6 +1,6 @@
 # macOS Port Test Notes
 
-This branch contains the foundation for the macOS port:
+This document describes the foundation for the macOS port:
 
 - Linux-only Wayland host dependencies are target-gated.
 - Bus/control sockets have macOS runtime-dir fallbacks.
@@ -11,7 +11,7 @@ This branch contains the foundation for the macOS port:
 
 ## Current Scope
 
-The branch is intended to run native terminal panes and controlled macOS GUI
+The port is intended to run native terminal panes and controlled macOS GUI
 satellites. GUI ownership is intentionally conservative: lmux controls only
 windows the user explicitly attaches, keyed by CoreGraphics window id. Ambiguous
 windows are left unmanaged instead of falling back to bundle-wide control.
@@ -42,7 +42,7 @@ and Graphene; `brew bundle` installs both and `mise run doctor:macos` verifies
 
 ## Toolchain via mise
 
-This branch pins the build tool versions in `mise.toml`:
+This repo pins the build tool versions in `mise.toml`:
 
 ```sh
 mise trust

@@ -9,7 +9,7 @@ context: |
 
   Tech stack:
     - Rust workspace (edition shared across crates); GTK4 via gtk4-rs
-    - libghostty (dynamic link) for terminal rendering
+    - vendored libghostty-vt static library for terminal rendering
     - Tokio for async I/O; glib::MainContext::spawn_local bridges to the
       GTK main loop
     - zbus for KWin scripting D-Bus calls

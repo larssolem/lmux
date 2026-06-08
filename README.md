@@ -250,7 +250,7 @@ for `anchor tag`; sidebar popovers expose anchor UUIDs for pause/resume/hide.
 - [`BUILD.md`](BUILD.md): prerequisites, build, install, and troubleshooting
 - [`docs/macos-port.md`](docs/macos-port.md): current macOS port notes
 - [`openspec/specs/`](openspec/specs/): living capability specs
-- [`openspec/changes/`](openspec/changes/): active change proposals
+- [`openspec/changes/`](openspec/changes/): proposed or in-progress changes
 - [`docs/adr/`](docs/adr/): numbered architecture decisions
 - [`docs/history/`](docs/history/): product brief, original brainstorm, v0.2 PRD
 

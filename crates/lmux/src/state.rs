@@ -827,6 +827,10 @@ impl AppState {
         Some(self.drain_panes_for_shutdown())
     }
 
+    pub fn is_shutting_down(&self) -> bool {
+        self.phase == Phase::ShuttingDown
+    }
+
     pub fn set_bell_callback(&mut self, cb: BellCallback) {
         for pane in self.panes.values() {
             pane.set_bell_callback(cb.clone());
@@ -2710,6 +2714,9 @@ impl AppState {
         }
         let store = lmux_session::SessionStore::new(store_root);
         let now = lmux_session::now_unix_seconds();
+        let loaded = store
+            .load(&target_name)
+            .map_err(|err| format!("switch_session: load target {target_name:?}: {err}"))?;
 
         // Persist the outgoing session so its layout + cwds survive the
         // swap. Only save when we know the name; legacy (current_session
@@ -2728,12 +2735,10 @@ impl AppState {
                 terminal_tabs: snap.terminal_tabs,
                 pane_terminal_tab_roots: snap.pane_terminal_tab_roots,
             };
-            if let Err(err) = store.save(&session) {
-                tracing::warn!(error = %err, session = %cur, "switch_session: save outgoing failed");
-            }
+            store
+                .save(&session)
+                .map_err(|err| format!("switch_session: save outgoing {cur:?}: {err}"))?;
         }
-
-        let loaded = store.load(&target_name).ok();
 
         // Tear down the current pane tree. After this call `self.panes`
         // is empty and the root container has no children.
@@ -2766,9 +2771,7 @@ impl AppState {
 
         // Rehydrate the pane set from the target snapshot or fall back
         // to a single shell in $HOME.
-        let (mut panes, layout, focused, restored_anchors, next_id) = loaded
-            .as_ref()
-            .and_then(build_session_panes)
+        let (mut panes, layout, focused, restored_anchors, next_id) = build_session_panes(&loaded)
             .or_else(|| fresh_session_panes(1))
             .ok_or_else(|| "switch_session: could not spawn any pane".to_string())?;
 
@@ -2838,9 +2841,7 @@ impl AppState {
         for id in restored_anchors {
             self.restore_anchor(id);
         }
-        if let Some(session) = loaded.as_ref() {
-            self.restore_session_metadata(session);
-        }
+        self.restore_session_metadata(&loaded);
         if let Some(primary) = first_anchor {
             self.set_active_anchor(Some(primary));
         }

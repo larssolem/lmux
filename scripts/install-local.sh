@@ -8,6 +8,7 @@ echo "Installing lmux locally for $os"
 
 cargo install --path "$repo_root/crates/lmux" --force
 cargo install --path "$repo_root/crates/lmux-cli" --force
+cargo install --path "$repo_root/crates/lmux-mcp" --force
 
 if [[ -n "${CARGO_INSTALL_ROOT:-}" ]]; then
   lmux_bin="$CARGO_INSTALL_ROOT/bin/lmux"

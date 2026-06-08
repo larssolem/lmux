@@ -19,9 +19,8 @@ When working inside lmux:
    lmux-cli --json pane list
    ```
 
-3. For long-running commands, prefer creating or using an agent-owned pane once
-   `pane new` is available. Until then, ask the user which pane should run the
-   command.
+3. For long-running commands, prefer creating or using an agent-owned pane with
+   `lmux-cli pane new`.
 
 4. Read terminal output through transcript commands instead of scraping the
    screen.

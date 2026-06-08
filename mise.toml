@@ -40,6 +40,10 @@ run = "cargo test -p lmux-bus -p lmux-control -p lmux-pty"
 description = "Run the Linux-testable macOS port test set"
 depends = ["test:compositor", "test:portable"]
 
+[tasks."test:workspace"]
+description = "Run the full Rust workspace test suite"
+run = "cargo test --workspace --all-targets"
+
 [tasks."check:app"]
 description = "Check the GTK app binary with the pinned Zig toolchain"
 depends = ["deps:macos"]
@@ -72,5 +76,5 @@ env = { RUST_LOG = "lmux=debug" }
 run = "cargo run -p lmux"
 
 [tasks.verify]
-description = "Run formatting plus the Linux-testable macOS port checks"
-depends = ["fmt:check", "check:portable", "test:port"]
+description = "Run formatting plus the full Rust workspace checks"
+depends = ["fmt:check", "check:portable", "test:workspace"]

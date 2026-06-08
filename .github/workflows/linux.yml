@@ -1,0 +1,45 @@
+name: Linux
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Linux build and checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev \
+            libpango1.0-dev \
+            libcairo2-dev \
+            pkg-config \
+            build-essential
+
+      - name: Install mise toolchains
+        uses: jdx/mise-action@v3
+        with:
+          install: true
+          cache: true
+          experimental: true
+
+      - name: Format
+        run: mise run fmt:check
+
+      - name: Clippy
+        run: mise exec -- cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Workspace tests
+        run: mise run test:workspace
+
+      - name: App compile check
+        run: mise run check:app

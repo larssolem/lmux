@@ -83,6 +83,9 @@ jobs:
       - name: Portable port tests
         run: mise run test:port
 
+      - name: Clippy
+        run: mise exec -- cargo clippy --workspace --all-targets --all-features -- -D warnings
+
       - name: App compile check
         run: mise run check:app
 

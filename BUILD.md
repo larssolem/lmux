@@ -56,7 +56,7 @@ Cargo's local bin directory and registers an OS launcher entry:
 `~/.local/share/applications/no.jpro.lmux.desktop` on Linux. On Linux it also
 installs the KWin script to `~/.local/share/lmux/kwin/lmux-dock.js`.
 
-### macOS port branch
+### macOS port
 
 macOS work-in-progress notes live in [docs/macos-port.md](docs/macos-port.md).
 The first supported path is a native build on Apple hardware; Docker is not
@@ -95,7 +95,7 @@ Log output goes to stderr.
 ### Tests
 
 ```sh
-cargo test --workspace
+mise exec -- cargo test --workspace
 ```
 
 ## Manual smoke tests

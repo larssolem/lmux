@@ -1167,25 +1167,18 @@ fn terminal_paste_shortcut() -> &'static str {
 /// like `claude` cli accept the file path as an argument-like paste
 /// and load the image themselves. Files land under
 /// `$XDG_RUNTIME_DIR/lmux/pastes/` (or `/tmp/lmux-pastes-<uid>` if
-/// the runtime dir is unset). Filenames embed the cockpit pid + a
-/// monotonic counter so concurrent panes don't collide.
+/// the runtime dir is unset). The directory is kept private and filenames
+/// use random UUIDs so clipboard contents are not exposed through predictable
+/// paths.
 fn write_clipboard_image(texture: &gdk::Texture) -> std::io::Result<std::path::PathBuf> {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-
     let dir = paste_dir();
-    std::fs::create_dir_all(&dir)?;
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let filename = format!("paste-{pid}-{stamp}-{n}.png");
+    ensure_private_paste_dir(&dir)?;
+    let filename = format!("paste-{}.png", uuid::Uuid::new_v4());
     let path = dir.join(filename);
     texture
         .save_to_png(&path)
         .map_err(|e| std::io::Error::other(format!("gdk_texture_save_to_png failed: {e}")))?;
+    set_file_mode_0600(&path)?;
     tracing::info!(path = %path.display(), "image paste: wrote tempfile");
     Ok(path)
 }
@@ -1198,6 +1191,47 @@ fn paste_dir() -> std::path::PathBuf {
     }
     let uid = unsafe { libc::getuid() };
     std::env::temp_dir().join(format!("lmux-pastes-{uid}"))
+}
+
+fn ensure_private_paste_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(dir)?;
+    let meta = std::fs::metadata(dir)?;
+    if !meta.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("paste path is not a directory: {}", dir.display()),
+        ));
+    }
+    let uid = unsafe { libc::getuid() };
+    if meta.uid() != uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "paste directory {} is owned by uid {}, expected {uid}",
+                dir.display(),
+                meta.uid()
+            ),
+        ));
+    }
+    if meta.permissions().mode() & 0o077 != 0 {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(dir, perms)?;
+    }
+    Ok(())
+}
+
+fn set_file_mode_0600(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(0o600);
+    std::fs::set_permissions(path, perms)
 }
 
 /// RenderVisitor that collapses each terminal cell to a single RGB pixel.

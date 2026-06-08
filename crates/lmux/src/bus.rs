@@ -7,8 +7,8 @@
 //! mutation (anchor.*, session.new, ...) are forwarded over
 //! [`DeferredRequestSender`] to the GTK thread; that thread applies the
 //! mutation on [`AppState`] and replies over the oneshot carried in the
-//! request. Kinds the GTK side doesn't recognise return
-//! `not_implemented`.
+//! request. The dispatcher launches one main-context task per request so
+//! long-running window attach flows do not block unrelated bus mutations.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -21,7 +21,8 @@ use async_trait::async_trait;
 use lmux_bus::{
     kinds::{CompositorState, WindowCandidate},
     paths::{bus_pid_path, bus_socket_path},
-    BusError, Kind, PaneSummary, Server, SessionSummary, StatusSnapshot,
+    BusError, ClientRole, Kind, PaneSummary, RequestContext, Server, SessionSummary,
+    StatusSnapshot,
 };
 use lmux_compositor::{CompositorControl, Health, SatelliteWindowId};
 use tokio::sync::oneshot;
@@ -49,9 +50,8 @@ pub type DeferredRequestReceiver = async_channel::Receiver<DeferredRequest>;
 pub struct BusContext {
     pub store_root: PathBuf,
     pub cockpit_version: String,
-    /// Dispatcher to the GTK main thread. `None` means write kinds
-    /// return `not_implemented` — handy for tests that exercise the
-    /// read paths in isolation.
+    /// Dispatcher to the GTK main thread. `None` means write kinds return
+    /// `not_implemented`; this is handy for read-path tests.
     pub write_tx: Option<DeferredRequestSender>,
     /// Live anchor count, kept in sync by `AppState`'s anchors-changed
     /// hook. The bus thread reads it to answer `status.get` without
@@ -70,9 +70,26 @@ pub struct LmuxBusHandler {
     ctx: BusContext,
 }
 
+pub struct BusServerHandle {
+    shutdown: Option<std::sync::mpsc::Sender<()>>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for BusServerHandle {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
 #[async_trait]
 impl lmux_bus::Handler for LmuxBusHandler {
-    async fn handle(&self, req: Kind) -> Result<Kind, BusError> {
+    async fn handle(&self, ctx: RequestContext, req: Kind) -> Result<Kind, BusError> {
+        authorize_public_request(ctx, &req)?;
         match req {
             Kind::SessionList {} => self.handle_session_list().await,
             Kind::StatusGet {} => self.handle_status_get().await,
@@ -83,14 +100,40 @@ impl lmux_bus::Handler for LmuxBusHandler {
             | Kind::PaneCapture { .. }
             | Kind::PaneSendInput { .. }
             | Kind::PaneRename { .. }
-            | Kind::GrantRequest(_)
-            | Kind::GrantDecide { .. } => self.dispatch_to_gtk(req).await,
+            | Kind::GrantRequest(_) => self.dispatch_to_gtk(req).await,
             other => self.dispatch_to_gtk(other).await,
         }
     }
 
     fn cockpit_version(&self) -> String {
         self.ctx.cockpit_version.clone()
+    }
+}
+
+fn authorize_public_request(ctx: RequestContext, req: &Kind) -> Result<(), BusError> {
+    if matches!(req, Kind::GrantDecide { .. }) {
+        return Err(BusError::Unauthorized(
+            "grant.decide is only available from the cockpit UI".into(),
+        ));
+    }
+    if ctx.client == ClientRole::LmuxMcp && agent_sensitive_request_missing_identity(req) {
+        return Err(BusError::Unauthorized(
+            "MCP requests for pane/window control must include agent identity".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn agent_sensitive_request_missing_identity(req: &Kind) -> bool {
+    match req {
+        Kind::PaneNew { agent, .. }
+        | Kind::PaneTail { agent, .. }
+        | Kind::PaneCapture { agent, .. }
+        | Kind::PaneSendInput { agent, .. }
+        | Kind::PaneRename { agent, .. }
+        | Kind::SatelliteAttachWindow { agent, .. }
+        | Kind::SatelliteLaunchAttach { agent, .. } => agent.is_none(),
+        _ => false,
     }
 }
 
@@ -330,12 +373,44 @@ mod tests {
             None,
         ));
     }
+
+    #[test]
+    fn public_grant_decide_is_rejected() {
+        let ctx = RequestContext {
+            client: ClientRole::LmuxCli,
+            pid: 42,
+        };
+        let req = Kind::GrantDecide {
+            grant_id: uuid::Uuid::new_v4(),
+            decision: lmux_bus::GrantDecision::Deny,
+        };
+        assert!(matches!(
+            authorize_public_request(ctx, &req),
+            Err(BusError::Unauthorized(_))
+        ));
+    }
+
+    #[test]
+    fn mcp_agent_sensitive_requests_require_identity() {
+        let ctx = RequestContext {
+            client: ClientRole::LmuxMcp,
+            pid: 42,
+        };
+        let req = Kind::PaneTail {
+            pane_id: uuid::Uuid::new_v4(),
+            lines: 10,
+            agent: None,
+        };
+        assert!(matches!(
+            authorize_public_request(ctx, &req),
+            Err(BusError::Unauthorized(_))
+        ));
+    }
 }
 
-/// GTK-side dispatcher: consumes [`DeferredRequest`]s off the channel
-/// and applies them to [`SessionStore`] / the cockpit state. First write
-/// kind wired is `session.new`; the rest still return `not_implemented`
-/// so the external surface is clear about where the cut is.
+/// GTK-side dispatcher: consumes [`DeferredRequest`]s off the channel and
+/// starts one main-context task per request. Each task applies its mutations
+/// to [`SessionStore`] / cockpit state and resolves its own response channel.
 ///
 /// Invoked from `glib::MainContext::spawn_local` so every mutation runs
 /// on the GTK main loop. Does NOT borrow `AppState` here — the caller
@@ -348,9 +423,15 @@ pub async fn run_dispatcher(
     satellite_counters: SatelliteCounters,
 ) {
     while let Ok((req, resp_tx)) = rx.recv().await {
-        let result =
-            handle_deferred(req, &store_root, &state, &compositor, &satellite_counters).await;
-        let _ = resp_tx.send(result);
+        let store_root = store_root.clone();
+        let state = state.clone();
+        let compositor = compositor.clone();
+        let satellite_counters = satellite_counters.clone();
+        gtk4::glib::MainContext::default().spawn_local(async move {
+            let result =
+                handle_deferred(req, &store_root, &state, &compositor, &satellite_counters).await;
+            let _ = resp_tx.send(result);
+        });
     }
 }
 
@@ -584,8 +665,16 @@ async fn handle_deferred(
         Kind::SatelliteOpen {
             argv,
             target_pane: _,
-            no_sandbox: _,
+            no_sandbox,
         } => {
+            if !no_sandbox {
+                satellite_counters
+                    .spawn_fail
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(BusError::Domain(
+                    "satellite.open: sandboxed launch is not implemented; use explicit window attach or set no_sandbox=true for the legacy unsandboxed spawn path".into(),
+                ));
+            }
             #[cfg(target_os = "macos")]
             {
                 let _ = argv;
@@ -783,11 +872,9 @@ async fn handle_deferred(
     }
 }
 
-/// Start the bus server on a background thread + tokio runtime. Returns a
-/// handle to the OS thread so the caller can decide whether to join on
-/// shutdown; for v0.2 we fire-and-forget — clean unbind happens via the
-/// `Server` `Drop` impl when the process exits.
-pub fn start(ctx: BusContext) -> Option<thread::JoinHandle<()>> {
+/// Start the bus server on a background thread + tokio runtime. The returned
+/// handle signals shutdown and joins the thread on drop.
+pub fn start(ctx: BusContext) -> Option<BusServerHandle> {
     let socket_path = match bus_socket_path() {
         Ok(p) => p,
         Err(err) => {
@@ -803,6 +890,7 @@ pub fn start(ctx: BusContext) -> Option<thread::JoinHandle<()>> {
         }
     };
     let handler = Arc::new(LmuxBusHandler { ctx });
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
 
     let join = thread::Builder::new()
         .name("lmux-bus".into())
@@ -821,9 +909,7 @@ pub fn start(ctx: BusContext) -> Option<thread::JoinHandle<()>> {
                 match Server::bind(socket_path.clone(), pid_path.clone(), handler).await {
                     Ok(mut server) => {
                         tracing::info!(path = %socket_path.display(), "lmux-bus: up");
-                        // Park the task forever; Server cleanup runs on drop.
-                        std::future::pending::<()>().await;
-                        // unreachable, but keeps `server` alive
+                        let _ = tokio::task::spawn_blocking(move || shutdown_rx.recv()).await;
                         server.shutdown().await;
                     }
                     Err(err) => {
@@ -833,5 +919,8 @@ pub fn start(ctx: BusContext) -> Option<thread::JoinHandle<()>> {
             });
         })
         .ok()?;
-    Some(join)
+    Some(BusServerHandle {
+        shutdown: Some(shutdown_tx),
+        join: Some(join),
+    })
 }

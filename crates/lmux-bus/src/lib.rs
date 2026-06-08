@@ -30,4 +30,4 @@ pub use kinds::{
     SessionSummary, StatusSnapshot, TranscriptLine, TranscriptRange,
 };
 pub use paths::{bus_pid_path, bus_socket_path};
-pub use server::{Handler, RejectAllHandler, Server};
+pub use server::{Handler, RejectAllHandler, RequestContext, Server};

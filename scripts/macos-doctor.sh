@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-minimum_zig="0.15.2"
+required_zig="0.15.2"
 failures=0
 warnings=0
 
@@ -69,12 +69,10 @@ check_pkg_config() {
 
 if command -v zig >/dev/null 2>&1; then
   zig_version="$(zig version 2>/dev/null || true)"
-  # Numeric compare of MAJOR.MINOR.PATCH against minimum_zig.
-  if [[ -n "$zig_version" ]] && printf '%s\n%s\n' "$minimum_zig" "${zig_version%%-*}" \
-      | sort -V -C 2>/dev/null; then
-    ok "zig version is $zig_version (>= $minimum_zig)"
+  if [[ "${zig_version%%-*}" == "$required_zig" ]]; then
+    ok "zig version is $zig_version (= $required_zig)"
   else
-    fail "expected zig >= $minimum_zig, got ${zig_version:-unknown}. Run: mise install"
+    fail "expected zig $required_zig, got ${zig_version:-unknown}. Run: mise install"
   fi
 fi
 

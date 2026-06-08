@@ -168,8 +168,10 @@ enum SatelliteCommand {
     ListWindows,
     /// Attach a specific native window to the active anchor.
     AttachWindow {
-        #[arg(long, default_value = "macos")]
+        /// Window backend from `satellite list-windows`, such as `kwin`, `x11`, or `macos`.
+        #[arg(long)]
         backend: String,
+        /// Backend window id from `satellite list-windows`.
         #[arg(long)]
         backend_window_id: Option<String>,
         #[arg(long)]
@@ -577,7 +579,7 @@ fn run_satellite_open(target: &str, argv: Vec<String>) -> ExitCode {
     match run_bus_write(lmux_bus::Kind::SatelliteOpen {
         argv,
         target_pane: target_uuid,
-        no_sandbox: false,
+        no_sandbox: true,
     }) {
         Ok(()) => {
             println!("satellite spawned");

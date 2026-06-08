@@ -5,6 +5,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
 pub fn run_stdio<R: BufRead, W: Write>(mut input: R, mut output: W) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|err| err.to_string())?;
     while let Some(request) = read_message(&mut input)? {
@@ -358,6 +360,11 @@ fn read_message<R: BufRead>(input: &mut R) -> Result<Option<Value>, String> {
         }
     }
     let len = content_length.ok_or_else(|| "missing Content-Length".to_string())?;
+    if len > MAX_MESSAGE_BYTES {
+        return Err(format!(
+            "Content-Length {len} exceeds maximum {MAX_MESSAGE_BYTES}"
+        ));
+    }
     let mut body = vec![0_u8; len];
     input.read_exact(&mut body).map_err(|err| err.to_string())?;
     serde_json::from_slice(&body).map_err(|err| err.to_string())

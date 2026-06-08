@@ -177,10 +177,14 @@ impl SessionStore {
             Err(err) => return Err(StoreError::Io(err)),
         };
         let text = String::from_utf8_lossy(&bytes);
-        toml::from_str::<SessionIndex>(&text).map_err(|source| StoreError::TomlDecode {
-            file: path.display().to_string(),
-            source,
-        })
+        match toml::from_str::<SessionIndex>(&text) {
+            Ok(index) => Ok(index),
+            Err(err) => {
+                tracing::warn!(file = %path.display(), error = %err, "session index malformed, renaming aside and rebuilding");
+                rename_aside(&path);
+                Ok(self.rebuild_index_from_sessions())
+            }
+        }
     }
 
     fn write_index(&self, index: &SessionIndex) -> Result<(), StoreError> {
@@ -193,6 +197,42 @@ impl SessionStore {
         let mut index = self.read_index()?;
         index.touch(name, now_unix_seconds);
         self.write_index(&index)
+    }
+
+    fn rebuild_index_from_sessions(&self) -> SessionIndex {
+        let mut index = SessionIndex::default();
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return index;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.file_name().and_then(|name| name.to_str()) == Some("index.toml") {
+                continue;
+            }
+            let Some(name) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_suffix(".toml"))
+            else {
+                continue;
+            };
+            if !valid_name(name) {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&bytes);
+            match toml::from_str::<Session>(&text) {
+                Ok(session) => index.touch(name, session.last_opened_at_unix_seconds),
+                Err(err) => tracing::warn!(
+                    file = %path.display(),
+                    error = %err,
+                    "skipping malformed session while rebuilding index"
+                ),
+            }
+        }
+        index
     }
 }
 
@@ -397,6 +437,23 @@ mod tests {
             name.to_string_lossy().starts_with("alpha.toml.bad.")
         });
         assert!(bad, "expected alpha.toml.bad.<ts>");
+    }
+
+    #[test]
+    fn malformed_index_is_renamed_aside_and_rebuilt() {
+        let dir = tempdir();
+        let store = SessionStore::new(&dir);
+        store.create("alpha", 100).unwrap();
+        store.create("beta", 200).unwrap();
+        std::fs::write(store.root().join("index.toml"), b"not valid toml [[[").unwrap();
+
+        let names: Vec<_> = store.list().unwrap().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, vec!["beta", "alpha"]);
+        let bad = std::fs::read_dir(store.root()).unwrap().any(|e| {
+            let name = e.unwrap().file_name();
+            name.to_string_lossy().starts_with("index.toml.bad.")
+        });
+        assert!(bad, "expected index.toml.bad.<ts>");
     }
 
     #[test]

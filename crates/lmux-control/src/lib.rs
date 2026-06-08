@@ -6,8 +6,9 @@
 //! the matching `Response` on a per-request channel, and writes it back on
 //! the same connection.
 
-use std::io::{self};
+use std::io::{self, Write};
 use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -84,20 +85,28 @@ fn runtime_dir() -> Result<PathBuf, Error> {
     Err(Error::NoRuntimeDir)
 }
 
-/// Ensure `$XDG_RUNTIME_DIR/lmux/` exists with mode 0700 and unlink a stale
-/// socket file if present. Returns the socket path.
-fn prepare_socket_dir() -> Result<PathBuf, Error> {
+fn pid_path_for_socket(path: &Path) -> PathBuf {
+    let mut os = path.as_os_str().to_owned();
+    os.push(".pid");
+    PathBuf::from(os)
+}
+
+/// Ensure `$XDG_RUNTIME_DIR/lmux/` exists with mode 0700 and unlink only stale
+/// socket files. Returns the socket and pid paths.
+fn prepare_socket_dir() -> Result<(PathBuf, PathBuf), Error> {
     let path = socket_path()?;
     if let Some(parent) = path.parent() {
         std::fs::DirBuilder::new()
             .mode(0o700)
             .recursive(true)
             .create(parent)?;
+        ensure_private_dir(parent)?;
     }
+    let pid_path = pid_path_for_socket(&path);
     if path.exists() {
-        std::fs::remove_file(&path).ok();
+        reclaim_stale_socket(&path, &pid_path)?;
     }
-    Ok(path)
+    Ok((path, pid_path))
 }
 
 /// Spawn the server thread. `dispatch` is invoked on the server thread
@@ -107,11 +116,16 @@ pub fn spawn_server<F>(dispatch: F) -> Result<ServerHandle, Error>
 where
     F: Fn(AppEvent) + Send + Sync + 'static,
 {
-    let path = prepare_socket_dir()?;
+    let (path, pid_path) = prepare_socket_dir()?;
     let listener = UnixListener::bind(&path)?;
+    set_mode_0600(&path)?;
+    write_pid_file(&pid_path)?;
     tracing::info!(?path, "control socket bound");
     let self_uid = unsafe { libc::getuid() };
-    let handle = ServerHandle { path: path.clone() };
+    let handle = ServerHandle {
+        path: path.clone(),
+        pid_path,
+    };
     thread::Builder::new()
         .name("lmux-control".into())
         .spawn(move || {
@@ -133,6 +147,7 @@ where
 
 pub struct ServerHandle {
     path: PathBuf,
+    pid_path: PathBuf,
 }
 
 impl ServerHandle {
@@ -144,7 +159,93 @@ impl ServerHandle {
 impl Drop for ServerHandle {
     fn drop(&mut self) {
         std::fs::remove_file(&self.path).ok();
+        std::fs::remove_file(&self.pid_path).ok();
     }
+}
+
+fn reclaim_stale_socket(path: &Path, pid_path: &Path) -> Result<(), Error> {
+    match std::fs::read_to_string(pid_path) {
+        Ok(s) => {
+            let pid: i32 = s.trim().parse().unwrap_or(0);
+            if pid > 0 && pid_is_alive(pid) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("control socket already owned by live pid {pid}"),
+                )
+                .into());
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            if UnixStream::connect(path).is_ok() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "control socket exists and accepts connections",
+                )
+                .into());
+            }
+        }
+        Err(err) => return Err(err.into()),
+    }
+    std::fs::remove_file(path).ok();
+    std::fs::remove_file(pid_path).ok();
+    Ok(())
+}
+
+fn pid_is_alive(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+fn write_pid_file(path: &Path) -> Result<(), Error> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let pid = unsafe { libc::getpid() };
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true).mode(0o600);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(pid.to_string().as_bytes())?;
+    Ok(())
+}
+
+fn set_mode_0600(path: &Path) -> Result<(), Error> {
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(0o600);
+    std::fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+fn ensure_private_dir(path: &Path) -> Result<(), Error> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("runtime path is not a directory: {}", path.display()),
+        )
+        .into());
+    }
+    let uid = unsafe { libc::getuid() };
+    if meta.uid() != uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "runtime directory {} is owned by uid {}, expected {uid}",
+                path.display(),
+                meta.uid()
+            ),
+        )
+        .into());
+    }
+    if meta.permissions().mode() & 0o077 != 0 {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(path, perms)?;
+    }
+    Ok(())
 }
 
 fn handle_conn<F>(mut stream: UnixStream, self_uid: u32, dispatch: &F) -> Result<(), Error>
@@ -227,12 +328,15 @@ fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
         if rc != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(cred.uid as u32)
+        Ok(cred.uid)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = stream;
-        Ok(unsafe { libc::getuid() } as u32)
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "peer credential checks are not supported on this target",
+        ))
     }
 }
 

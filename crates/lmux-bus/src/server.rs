@@ -11,7 +11,7 @@
 //! The server is generic over the handler so unit tests can stand it up
 //! against a fake.
 
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,7 +25,14 @@ use uuid::Uuid;
 use crate::codec::{read_frame, write_frame};
 use crate::envelope::{Envelope, PROTOCOL_VERSION};
 use crate::error::{BusError, ErrorCode, ErrorPayload};
-use crate::kinds::Kind;
+use crate::kinds::{ClientRole, Kind};
+
+/// Connection-scoped metadata established by the `hello` handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestContext {
+    pub client: ClientRole,
+    pub pid: i32,
+}
 
 /// Handler for cockpit-side request dispatch.
 ///
@@ -36,7 +43,7 @@ use crate::kinds::Kind;
 #[async_trait::async_trait]
 pub trait Handler: Send + Sync + 'static {
     /// Handle one request. The server has already validated `v` and kind.
-    async fn handle(&self, req: Kind) -> Result<Kind, BusError>;
+    async fn handle(&self, ctx: RequestContext, req: Kind) -> Result<Kind, BusError>;
 
     /// Cockpit semver reported to clients on handshake.
     fn cockpit_version(&self) -> String {
@@ -62,7 +69,7 @@ impl Server {
         handler: Arc<H>,
     ) -> Result<Self, BusError> {
         if let Some(parent) = socket_path.parent() {
-            std::fs::create_dir_all(parent).map_err(BusError::Io)?;
+            ensure_private_dir(parent)?;
         }
 
         reclaim_stale(&socket_path, &pid_path)?;
@@ -172,7 +179,7 @@ async fn serve_connection<H: Handler>(
         return Ok(());
     }
 
-    let mut handshake_complete = false;
+    let mut request_context = None;
     loop {
         let frame = match read_frame(&mut stream).await {
             Ok(f) => f,
@@ -194,7 +201,7 @@ async fn serve_connection<H: Handler>(
             }
         };
 
-        if !handshake_complete && envelope.kind != "hello" {
+        if request_context.is_none() && envelope.kind != "hello" {
             let payload = ErrorPayload {
                 code: ErrorCode::BadRequest,
                 message: "hello handshake required before other requests".into(),
@@ -225,12 +232,23 @@ async fn serve_connection<H: Handler>(
         let response_kind = match &kind {
             Kind::Hello { client, pid } => {
                 debug!(?client, pid, "lmux-bus: hello");
-                handshake_complete = true;
+                request_context = Some(RequestContext {
+                    client: *client,
+                    pid: *pid,
+                });
                 Kind::HelloAck {
                     cockpit_version: handler.cockpit_version(),
                 }
             }
-            _ => match handler.handle(kind).await {
+            _ => match handler
+                .handle(
+                    request_context.ok_or_else(|| {
+                        BusError::BadRequest("hello handshake context missing".into())
+                    })?,
+                    kind,
+                )
+                .await
+            {
                 Ok(resp) => resp,
                 Err(err) => {
                     let payload = ErrorPayload {
@@ -303,9 +321,19 @@ fn pid_is_alive(pid: i32) -> bool {
 }
 
 fn write_pid_file(pid_path: &Path) -> Result<(), BusError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
     // SAFETY: getpid is always safe to call.
     let pid = unsafe { libc::getpid() };
-    std::fs::write(pid_path, pid.to_string()).map_err(BusError::Io)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true).mode(0o600);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(pid_path).map_err(BusError::Io)?;
+    file.write_all(pid.to_string().as_bytes())
+        .map_err(BusError::Io)
 }
 
 fn set_mode_0600(path: &Path) -> Result<(), BusError> {
@@ -313,6 +341,37 @@ fn set_mode_0600(path: &Path) -> Result<(), BusError> {
     let mut perms = std::fs::metadata(path).map_err(BusError::Io)?.permissions();
     perms.set_mode(0o600);
     std::fs::set_permissions(path, perms).map_err(BusError::Io)
+}
+
+fn ensure_private_dir(path: &Path) -> Result<(), BusError> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(path)
+        .map_err(BusError::Io)?;
+    let meta = std::fs::metadata(path).map_err(BusError::Io)?;
+    if !meta.is_dir() {
+        return Err(BusError::Domain(format!(
+            "runtime path is not a directory: {}",
+            path.display()
+        )));
+    }
+    let uid = current_uid();
+    if meta.uid() != uid {
+        return Err(BusError::Domain(format!(
+            "runtime directory {} is owned by uid {}, expected {uid}",
+            path.display(),
+            meta.uid()
+        )));
+    }
+    if meta.permissions().mode() & 0o077 != 0 {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(path, perms).map_err(BusError::Io)?;
+    }
+    Ok(())
 }
 
 fn current_uid() -> u32 {
@@ -350,12 +409,14 @@ fn so_peercred_uid(stream: &UnixStream) -> Result<u32, BusError> {
         if rc != 0 {
             return Err(BusError::Io(io::Error::last_os_error()));
         }
-        Ok(cred.uid as u32)
+        Ok(cred.uid)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = stream;
-        Ok(current_uid())
+        Err(BusError::Domain(
+            "peer credential checks are not supported on this target".into(),
+        ))
     }
 }
 
@@ -367,7 +428,7 @@ pub struct RejectAllHandler;
 
 #[async_trait::async_trait]
 impl Handler for RejectAllHandler {
-    async fn handle(&self, req: Kind) -> Result<Kind, BusError> {
+    async fn handle(&self, _ctx: RequestContext, req: Kind) -> Result<Kind, BusError> {
         Err(BusError::Domain(format!("no handler for {req:?}")))
     }
 }

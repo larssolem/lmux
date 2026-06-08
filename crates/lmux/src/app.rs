@@ -280,7 +280,7 @@ pub fn activate(app: &Application) {
     install_close_request(app, &window, &state);
     install_control_socket(&window, &state);
     install_notifier(&window, &state);
-    install_bus_server(&state, compositor);
+    install_bus_server(&window, &state, compositor);
     install_config_watch(&window, &state, shortcut_prefix);
     #[cfg(target_os = "linux")]
     install_wayland_host(&state);
@@ -689,18 +689,8 @@ fn parse_prefix_binding(prefix: &str) -> Option<PrefixBinding> {
     (binding.key != '\0').then_some(binding)
 }
 
-/// Spawn the control-socket server and wire a UI-thread consumer to turn
-/// `AppEvent`s into `AppState` mutations. The `ServerHandle` is stashed on
-/// the window so the socket file is unlinked on drop.
-/// Spawn the lmux-bus server on a background thread so external clients
-/// (`lmux-cli`, KWin script, v0.3 plugins) can hit read-only endpoints
-/// like `session.list` and `status.get`. Write endpoints still
-/// surface `not_implemented` until Epic 3 step 2 wires cross-thread
-/// dispatch into `AppState`.
-/// Watch `~/.config/lmux/config.toml` and log each debounced reload.
-/// Full propagation (rebuild sidebar, re-apply font, etc.) is a v0.3
-/// follow-up — this version satisfies Epic 10's hot-reload surface by
-/// proving the observer loop runs end-to-end.
+/// Watch `~/.config/lmux/config.toml` and apply supported settings after each
+/// debounced reload.
 fn install_config_watch(
     window: &ApplicationWindow,
     state: &SharedAppState,
@@ -763,6 +753,7 @@ fn install_config_watch(
 }
 
 fn install_bus_server(
+    window: &ApplicationWindow,
     state: &SharedAppState,
     compositor: std::sync::Arc<dyn lmux_compositor::CompositorControl>,
 ) {
@@ -795,7 +786,11 @@ fn install_bus_server(
         satellite_spawn_ok,
         satellite_spawn_fail,
     };
-    let _ = crate::bus::start(ctx);
+    if let Some(handle) = crate::bus::start(ctx) {
+        unsafe {
+            window.set_data::<crate::bus::BusServerHandle>("lmux-bus-server", handle);
+        }
+    }
     let state_for_dispatch = state.clone();
     glib::MainContext::default().spawn_local(crate::bus::run_dispatcher(
         write_rx,
@@ -1118,11 +1113,12 @@ fn install_close_request(app: &Application, window: &ApplicationWindow, state: &
 ///      handles (which releases PTY masters and reaps children on drop),
 ///      and call `app.quit()`.
 fn run_shutdown(app: &Application, state: &SharedAppState) {
+    if state.borrow().is_shutting_down() {
+        tracing::debug!("shutdown already in progress — ignoring");
+        return;
+    }
     // Snapshot BEFORE begin_shutdown — the drain step SIGTERMs every child,
     // so `/proc/<pid>/cwd` may disappear mid-snapshot if we did it after.
-    // Guard against double-snapshot by peeking the phase first via a
-    // borrow: begin_shutdown is idempotent and returns None on the second
-    // call, at which point we also skip the save.
     save_snapshot(state);
 
     let drained = match state.borrow_mut().begin_shutdown() {

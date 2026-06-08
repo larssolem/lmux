@@ -62,7 +62,7 @@ must not overwrite user-pinned titles.
 Build or install the MCP adapter so `lmux-mcp` is in `PATH`:
 
 ```sh
-cargo build -p lmux-mcp
+cargo install --path crates/lmux-mcp --force
 ```
 
 Inspect local MCP availability:
