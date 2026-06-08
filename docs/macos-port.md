@@ -3,7 +3,7 @@
 This document describes the foundation for the macOS port:
 
 - Linux-only Wayland host dependencies are target-gated.
-- Bus/control sockets have macOS runtime-dir fallbacks.
+- The v2 bus socket has a macOS runtime-dir fallback.
 - Peer credential checks have a macOS path.
 - PTY cwd/trampoline behavior is portable enough for non-Linux builds.
 - `lmux-compositor` has a stable `SatelliteWindowId` model and a macOS backend that delegates grouped window operations to `lmux-macos-helper`.
@@ -70,7 +70,7 @@ Start with the crates that do not require the GTK app binary:
 
 ```sh
 cargo test -p lmux-compositor
-cargo test -p lmux-bus -p lmux-control -p lmux-pty
+cargo test -p lmux-bus -p lmux-pty
 cargo check -p lmux-wayland-host
 ```
 

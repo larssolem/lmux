@@ -1139,8 +1139,6 @@ dependencies = [
  "lmux-bus",
  "lmux-compositor",
  "lmux-config",
- "lmux-control",
- "lmux-layout",
  "lmux-libghostty",
  "lmux-macos-helper",
  "lmux-notify",
@@ -1196,7 +1194,6 @@ dependencies = [
  "clap",
  "libc",
  "lmux-bus",
- "lmux-control",
  "lmux-session",
  "serde",
  "serde_json",
@@ -1237,18 +1234,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lmux-control"
-version = "0.1.0-dev"
-dependencies = [
- "async-channel",
- "libc",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
 name = "lmux-e2e"
 version = "0.1.0-dev"
 dependencies = [
@@ -1259,14 +1244,6 @@ dependencies = [
  "predicates",
  "tempfile",
  "tokio",
-]
-
-[[package]]
-name = "lmux-layout"
-version = "0.1.0-dev"
-dependencies = [
- "serde",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1324,24 +1301,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "lmux-satellite"
-version = "0.1.0-dev"
-dependencies = [
- "lmux-bus",
- "lmux-compositor",
- "lmux-layout",
- "serde",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "lmux-session"
 version = "0.1.0-dev"
 dependencies = [
- "lmux-layout",
  "lmux-state",
  "serde",
  "thiserror 2.0.18",
@@ -1354,7 +1316,6 @@ dependencies = [
 name = "lmux-state"
 version = "0.1.0-dev"
 dependencies = [
- "lmux-layout",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

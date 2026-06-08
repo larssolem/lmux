@@ -12,7 +12,7 @@ use gtk4::prelude::*;
 use gtk4::{
     Align, Box as GtkBox, Button, DragSource, DrawingArea, DropTarget, Entry,
     EventControllerMotion, EventControllerScroll, EventControllerScrollFlags, Frame, GestureClick,
-    GestureDrag, Label, Orientation, Popover, PositionType,
+    GestureDrag, Label, Orientation, Popover,
 };
 use lmux_config::FocusMode;
 use lmux_libghostty::{
@@ -31,7 +31,6 @@ const INIT_ROWS: u16 = 30;
 const SCROLLBACK: usize = 100_000;
 const TRANSCRIPT_MAX_LINES: usize = 10_000;
 const READER_CHAN_CAPACITY: usize = 64;
-const SEARCH_SCAN_PAGES: usize = 512;
 #[cfg(target_os = "macos")]
 const DEFAULT_FONT_FAMILY: &str = "JetBrains Mono";
 #[cfg(target_os = "linux")]
@@ -60,6 +59,7 @@ pub type ShortcutPrefixCell = Rc<RefCell<String>>;
 pub enum TerminalContextAction {
     SplitRight,
     SplitDown,
+    NewTab,
     ClosePane,
     NewAnchor,
     NextPane,
@@ -136,6 +136,9 @@ pub struct TerminalPane {
     id: PaneId,
     frame: Frame,
     drawing_area: DrawingArea,
+    search_bar: GtkBox,
+    search_entry: Entry,
+    search_status: Label,
     inner: Rc<RefCell<Inner>>,
     transcript: Rc<RefCell<TranscriptBuffer>>,
     bell_cb: Rc<RefCell<Option<BellCallback>>>,
@@ -172,6 +175,7 @@ struct SearchState {
     query: String,
     matches: Vec<SearchMatch>,
     active: Option<SearchMatch>,
+    scrollback_matches: Option<Vec<SearchMatch>>,
 }
 
 struct TranscriptBuffer {
@@ -300,8 +304,37 @@ impl TerminalPane {
         let (cell_w, cell_h) = measure_cell(&drawing_area, &font_desc);
 
         let frame = Frame::builder().hexpand(true).vexpand(true).build();
-        frame.set_child(Some(&drawing_area));
         frame.add_css_class("pane");
+        let pane_body = GtkBox::new(Orientation::Vertical, 0);
+        pane_body.set_hexpand(true);
+        pane_body.set_vexpand(true);
+
+        let search_bar = GtkBox::new(Orientation::Horizontal, 6);
+        search_bar.add_css_class("lmux-terminal-search");
+        search_bar.set_visible(false);
+        search_bar.set_hexpand(true);
+
+        let search_entry = Entry::new();
+        search_entry.set_placeholder_text(Some("Search terminal..."));
+        search_entry.set_hexpand(true);
+
+        let search_status = Label::new(Some("Type to search"));
+        search_status.set_xalign(0.0);
+        search_status.set_width_chars(24);
+        search_status.add_css_class("dim-label");
+
+        let search_previous = Button::with_label("Previous");
+        let search_next = Button::with_label("Next");
+        let search_close = Button::with_label("Close");
+
+        search_bar.append(&search_entry);
+        search_bar.append(&search_status);
+        search_bar.append(&search_previous);
+        search_bar.append(&search_next);
+        search_bar.append(&search_close);
+        pane_body.append(&search_bar);
+        pane_body.append(&drawing_area);
+        frame.set_child(Some(&pane_body));
         // Clamp minimum geometry so divider drags (Story 3.4) can't shrink a
         // pane below a usable size.
         frame.set_size_request(
@@ -331,6 +364,18 @@ impl TerminalPane {
 
         install_draw_func(&drawing_area, &inner);
         install_resize_handler(&drawing_area, &inner);
+        install_search_bar(
+            SearchBarParts {
+                bar: &search_bar,
+                entry: &search_entry,
+                status: &search_status,
+                previous: &search_previous,
+                next: &search_next,
+                close: &search_close,
+            },
+            &drawing_area,
+            &inner,
+        );
         start_pty_reader(
             &drawing_area,
             &inner,
@@ -345,6 +390,9 @@ impl TerminalPane {
             id,
             frame,
             drawing_area,
+            search_bar,
+            search_entry,
+            search_status,
             inner,
             transcript,
             bell_cb,
@@ -529,6 +577,9 @@ impl TerminalPane {
         let key = gtk4::EventControllerKey::new();
         let inner = self.inner.clone();
         let area = self.drawing_area.clone();
+        let search_bar = self.search_bar.clone();
+        let search_entry = self.search_entry.clone();
+        let search_status = self.search_status.clone();
         key.connect_key_pressed(move |_ctrl, keyval, _code, modifier| {
             if let Some(shortcut) = keymap::classify_terminal_shortcut(keyval, modifier) {
                 match shortcut {
@@ -537,7 +588,9 @@ impl TerminalPane {
                         request_paste_from_clipboard(&area, &inner)
                     }
                     TerminalShortcut::Paste => {}
-                    TerminalShortcut::Find => open_search_popover(&area, &inner),
+                    TerminalShortcut::Find => {
+                        show_search_bar(&search_bar, &search_entry, &search_status, &area, &inner)
+                    }
                 }
                 return glib::Propagation::Stop;
             }
@@ -558,6 +611,7 @@ impl TerminalPane {
                     b.search = None;
                     b.frozen_frame = None;
                     drop(b);
+                    search_bar.set_visible(false);
                     area.queue_draw();
                 }
                 KeyAction::ScrollRows(delta) => {
@@ -739,18 +793,26 @@ impl TerminalPane {
         let id = self.id;
         let area = self.drawing_area.clone();
         let inner = self.inner.clone();
+        let search_bar = self.search_bar.clone();
+        let search_entry = self.search_entry.clone();
+        let search_status = self.search_status.clone();
         click.connect_pressed(move |_g, _n, x, y| {
             area.grab_focus();
             on_focus(id);
-            open_terminal_context_menu(
-                &area,
-                &inner,
-                id,
+            open_terminal_context_menu(TerminalContextMenu {
+                area: &area,
+                inner: &inner,
+                search: SearchUi {
+                    bar: &search_bar,
+                    entry: &search_entry,
+                    status: &search_status,
+                },
+                pane_id: id,
                 x,
                 y,
-                on_action.clone(),
-                shortcut_prefix.borrow().clone(),
-            );
+                on_action: on_action.clone(),
+                prefix: shortcut_prefix.borrow().clone(),
+            });
         });
         self.drawing_area.add_controller(click);
     }
@@ -857,51 +919,26 @@ fn copy_selection_to_clipboard(inner: &Rc<RefCell<Inner>>) {
     }
 }
 
-fn open_search_popover(area: &DrawingArea, inner: &Rc<RefCell<Inner>>) {
-    let popover = Popover::new();
-    popover.set_position(PositionType::Top);
-    popover.set_has_arrow(false);
-    popover.set_autohide(true);
-    popover.set_parent(area);
+struct SearchUi<'a> {
+    bar: &'a GtkBox,
+    entry: &'a Entry,
+    status: &'a Label,
+}
 
-    let body = GtkBox::new(Orientation::Vertical, 6);
-    body.set_margin_top(8);
-    body.set_margin_bottom(8);
-    body.set_margin_start(8);
-    body.set_margin_end(8);
-    body.set_size_request(300, -1);
+struct SearchBarParts<'a> {
+    bar: &'a GtkBox,
+    entry: &'a Entry,
+    status: &'a Label,
+    previous: &'a Button,
+    next: &'a Button,
+    close: &'a Button,
+}
 
-    let entry = Entry::new();
-    entry.set_placeholder_text(Some("Search terminal..."));
-    if let Some(query) = inner
-        .borrow()
-        .search
-        .as_ref()
-        .map(|state| state.query.clone())
-    {
-        entry.set_text(&query);
-    }
-    body.append(&entry);
-
-    let status = Label::new(None);
-    status.set_xalign(0.0);
-    status.add_css_class("dim-label");
-    body.append(&status);
-
-    let controls = GtkBox::new(Orientation::Horizontal, 6);
-    let previous = Button::with_label("Previous");
-    let next = Button::with_label("Next");
-    controls.append(&previous);
-    controls.append(&next);
-    body.append(&controls);
-    popover.set_child(Some(&body));
-
-    update_search_status(&status, inner);
-
+fn install_search_bar(parts: SearchBarParts<'_>, area: &DrawingArea, inner: &Rc<RefCell<Inner>>) {
     let inner_changed = inner.clone();
     let area_changed = area.clone();
-    let status_changed = status.clone();
-    entry.connect_changed(move |entry| {
+    let status_changed = parts.status.clone();
+    parts.entry.connect_changed(move |entry| {
         inner_changed
             .borrow_mut()
             .set_search_query(entry.text().to_string());
@@ -911,28 +948,40 @@ fn open_search_popover(area: &DrawingArea, inner: &Rc<RefCell<Inner>>) {
 
     let inner_previous = inner.clone();
     let area_previous = area.clone();
-    let status_previous = status.clone();
-    previous.connect_clicked(move |_| {
+    let status_previous = parts.status.clone();
+    parts.previous.connect_clicked(move |_| {
         advance_search(&inner_previous, &area_previous, false);
         update_search_status(&status_previous, &inner_previous);
     });
 
     let inner_next = inner.clone();
     let area_next = area.clone();
-    let status_next = status.clone();
-    next.connect_clicked(move |_| {
+    let status_next = parts.status.clone();
+    parts.next.connect_clicked(move |_| {
         advance_search(&inner_next, &area_next, true);
         update_search_status(&status_next, &inner_next);
     });
 
+    let scroll = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
+    scroll.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    let inner_scroll = inner.clone();
+    let area_scroll = area.clone();
+    let status_scroll = parts.status.clone();
+    scroll.connect_scroll(move |_, _dx, dy| {
+        let rows = (dy * f64::from(WHEEL_ROWS_PER_TICK)).round() as i32;
+        scroll_search_viewport(&inner_scroll, &area_scroll, &status_scroll, rows);
+        glib::Propagation::Stop
+    });
+    parts.bar.add_controller(scroll);
+
     let key = gtk4::EventControllerKey::new();
     let inner_key = inner.clone();
     let area_key = area.clone();
-    let status_key = status.clone();
-    let popover_key = popover.clone();
+    let status_key = parts.status.clone();
+    let bar_key = parts.bar.clone();
     key.connect_key_pressed(move |_, keyval, _, modifier| match keyval {
         gdk::Key::Escape => {
-            popover_key.popdown();
+            close_search_bar(&bar_key, &inner_key, &area_key);
             glib::Propagation::Stop
         }
         gdk::Key::Return | gdk::Key::KP_Enter => {
@@ -941,25 +990,72 @@ fn open_search_popover(area: &DrawingArea, inner: &Rc<RefCell<Inner>>) {
             update_search_status(&status_key, &inner_key);
             glib::Propagation::Stop
         }
-        _ => glib::Propagation::Proceed,
+        _ => {
+            let page_rows = inner_key.borrow().rows;
+            match keymap::classify_key(keyval, modifier, page_rows) {
+                KeyAction::ScrollRows(rows) => {
+                    scroll_search_viewport(&inner_key, &area_key, &status_key, rows);
+                    glib::Propagation::Stop
+                }
+                KeyAction::Write(_) => glib::Propagation::Proceed,
+            }
+        }
     });
-    entry.add_controller(key);
+    parts.entry.add_controller(key);
 
-    let inner_cleanup = inner.clone();
-    let area_cleanup = area.clone();
-    let popover_cleanup = popover.clone();
-    popover.connect_closed(move |_| {
-        inner_cleanup.borrow_mut().search = None;
-        area_cleanup.queue_draw();
-        popover_cleanup.unparent();
+    let inner_close = inner.clone();
+    let area_close = area.clone();
+    let bar_close = parts.bar.clone();
+    parts.close.connect_clicked(move |_| {
+        close_search_bar(&bar_close, &inner_close, &area_close);
     });
+}
 
-    popover.popup();
+fn show_search_bar(
+    bar: &GtkBox,
+    entry: &Entry,
+    status: &Label,
+    area: &DrawingArea,
+    inner: &Rc<RefCell<Inner>>,
+) {
+    bar.set_visible(true);
+    let query = entry.text().to_string();
+    if !query.is_empty() {
+        inner.borrow_mut().set_search_query(query);
+    }
+    update_search_status(status, inner);
+    area.queue_draw();
     entry.grab_focus();
+    entry.select_region(0, -1);
+}
+
+fn close_search_bar(bar: &GtkBox, inner: &Rc<RefCell<Inner>>, area: &DrawingArea) {
+    bar.set_visible(false);
+    inner.borrow_mut().search = None;
+    area.queue_draw();
+    area.grab_focus();
 }
 
 fn update_search_status(label: &Label, inner: &Rc<RefCell<Inner>>) {
     label.set_text(&inner.borrow().search_status());
+}
+
+fn scroll_search_viewport(
+    inner: &Rc<RefCell<Inner>>,
+    area: &DrawingArea,
+    status: &Label,
+    rows: i32,
+) {
+    if rows == 0 {
+        return;
+    }
+    {
+        let mut b = inner.borrow_mut();
+        b.term.scroll_delta(rows as isize);
+        b.refresh_visible_search_matches(false);
+    }
+    update_search_status(status, inner);
+    area.queue_draw();
 }
 
 fn advance_search(inner: &Rc<RefCell<Inner>>, area: &DrawingArea, forward: bool) {
@@ -968,33 +1064,7 @@ fn advance_search(inner: &Rc<RefCell<Inner>>, area: &DrawingArea, forward: bool)
         if b.search.as_ref().is_none_or(|state| state.query.is_empty()) {
             return;
         }
-        if b.select_adjacent_visible_match(forward) {
-            area.queue_draw();
-            return;
-        }
-
-        let page_delta = b.rows.max(1) as isize;
-        let delta = if forward { page_delta } else { -page_delta };
-        for _ in 0..SEARCH_SCAN_PAGES {
-            let before = b.term.viewport_top_screen_row();
-            b.term.scroll_delta(delta);
-            let after = b.term.viewport_top_screen_row();
-            if before == after {
-                break;
-            }
-            b.refresh_search_matches(false);
-            let found = b.search.as_ref().and_then(|state| {
-                if forward {
-                    state.matches.first().copied()
-                } else {
-                    state.matches.last().copied()
-                }
-            });
-            if let Some(found) = found {
-                b.set_active_search_match(found);
-                break;
-            }
-        }
+        b.select_adjacent_scrollback_match(forward);
     }
     area.queue_draw();
 }
@@ -1009,11 +1079,36 @@ impl Inner {
             query,
             matches: Vec::new(),
             active: None,
+            scrollback_matches: None,
         });
         self.refresh_search_matches(true);
     }
 
     fn refresh_search_matches(&mut self, select_first: bool) {
+        let Some(query) = self.search.as_ref().map(|state| state.query.clone()) else {
+            return;
+        };
+        let previous_active = self.search.as_ref().and_then(|state| state.active);
+        let scrollback_matches =
+            scrollback_search_matches(&mut self.term, &query, self.cols, self.rows);
+        let matches = visible_search_matches(&mut self.term, &query);
+        let active = if select_first {
+            matches.first().copied()
+        } else {
+            previous_active.filter(|active| {
+                scrollback_matches
+                    .as_ref()
+                    .is_some_and(|matches| matches.contains(active))
+            })
+        };
+        if let Some(state) = self.search.as_mut() {
+            state.matches = matches;
+            state.active = active;
+            state.scrollback_matches = scrollback_matches;
+        }
+    }
+
+    fn refresh_visible_search_matches(&mut self, select_first: bool) {
         let Some(query) = self.search.as_ref().map(|state| state.query.clone()) else {
             return;
         };
@@ -1030,33 +1125,74 @@ impl Inner {
         }
     }
 
-    fn select_adjacent_visible_match(&mut self, forward: bool) -> bool {
+    fn select_adjacent_scrollback_match(&mut self, forward: bool) -> bool {
         self.refresh_search_matches(false);
         let Some(state) = self.search.as_ref() else {
             return false;
         };
         let active = state.active;
+        let Some(scrollback_matches) = state.scrollback_matches.as_ref() else {
+            return false;
+        };
+        if scrollback_matches.is_empty() {
+            return false;
+        }
         let found = match (forward, active) {
-            (true, Some(active)) => state
-                .matches
+            (true, Some(active)) => scrollback_matches
                 .iter()
                 .find(|m| search_match_order_key(m) > search_match_order_key(&active))
                 .copied(),
-            (false, Some(active)) => state
-                .matches
+            (false, Some(active)) => scrollback_matches
                 .iter()
                 .rev()
                 .find(|m| search_match_order_key(m) < search_match_order_key(&active))
                 .copied(),
-            (true, None) => state.matches.first().copied(),
-            (false, None) => state.matches.last().copied(),
+            (true, None) => self
+                .term
+                .viewport_top_screen_row()
+                .and_then(|top| {
+                    scrollback_matches
+                        .iter()
+                        .find(|m| m.start.row >= top)
+                        .copied()
+                })
+                .or_else(|| scrollback_matches.first().copied()),
+            (false, None) => self
+                .term
+                .viewport_top_screen_row()
+                .and_then(|top| {
+                    let bottom = top.saturating_add(u32::from(self.rows.saturating_sub(1)));
+                    scrollback_matches
+                        .iter()
+                        .rev()
+                        .find(|m| m.start.row <= bottom)
+                        .copied()
+                })
+                .or_else(|| scrollback_matches.last().copied()),
         };
         if let Some(found) = found {
             self.set_active_search_match(found);
+            self.scroll_search_match_into_view(found);
+            self.refresh_visible_search_matches(false);
             true
         } else {
             false
         }
+    }
+
+    fn scroll_search_match_into_view(&mut self, active: SearchMatch) {
+        let Some(top) = self.term.viewport_top_screen_row() else {
+            return;
+        };
+        let rows = u32::from(self.rows.max(1));
+        let bottom = top.saturating_add(rows.saturating_sub(1));
+        if active.start.row >= top && active.start.row <= bottom {
+            return;
+        }
+        let target_top = active.start.row.saturating_sub(rows / 2);
+        let delta = i64::from(target_top) - i64::from(top);
+        let delta = delta.clamp(isize::MIN as i64, isize::MAX as i64) as isize;
+        self.term.scroll_delta(delta);
     }
 
     fn set_active_search_match(&mut self, active: SearchMatch) {
@@ -1089,15 +1225,11 @@ impl Inner {
         let Some(state) = self.search.as_ref() else {
             return "Type to search".to_string();
         };
-        if state.matches.is_empty() {
-            return "No matches visible; press Enter to scan scrollback".to_string();
-        }
-        match state
-            .active
-            .and_then(|active| state.matches.iter().position(|m| *m == active))
-        {
-            Some(index) => format!("{}/{} visible", index + 1, state.matches.len()),
-            None => format!("{} visible", state.matches.len()),
+        match state.scrollback_matches.as_ref().map(Vec::len) {
+            Some(0) => "No matches found in scrollback".to_string(),
+            Some(1) => "1 found in scrollback".to_string(),
+            Some(total) => format!("{total} found in scrollback"),
+            None => "Scrollback count unavailable".to_string(),
         }
     }
 }
@@ -1113,6 +1245,57 @@ fn visible_search_matches(term: &mut Terminal, query: &str) -> Vec<SearchMatch> 
     let mut visitor = ViewportTextVisitor::new(top);
     term.render(&mut visitor);
     visitor.matches(query)
+}
+
+fn scrollback_search_matches(
+    term: &mut Terminal,
+    query: &str,
+    cols: u16,
+    rows: u16,
+) -> Option<Vec<SearchMatch>> {
+    if query.is_empty() {
+        return Some(Vec::new());
+    }
+    let original_top = term.viewport_top_screen_row()?;
+    let scroll_extent = (SCROLLBACK as isize).saturating_add((rows as isize).max(1));
+
+    term.scroll_delta(-scroll_extent);
+    let top = term.viewport_top_screen_row();
+
+    term.scroll_to_bottom();
+    let bottom_top = term.viewport_top_screen_row();
+    let bottom = term.screen_point_from_viewport(ViewportPoint {
+        row: rows.saturating_sub(1),
+        col: cols.saturating_sub(1),
+    });
+    let text = match (top, bottom) {
+        (Some(top), Some(bottom)) => {
+            term.selection_text_screen(ScreenPoint { row: top, col: 0 }, bottom)
+        }
+        _ => None,
+    };
+
+    let restore_from = bottom_top.unwrap_or(original_top);
+    let restore_delta = i64::from(original_top) - i64::from(restore_from);
+    let restore_delta = restore_delta.clamp(isize::MIN as i64, isize::MAX as i64) as isize;
+    term.scroll_delta(restore_delta);
+
+    match (top, text) {
+        (Some(top), Some(text)) => Some(find_matches_in_text(top, &text, query)),
+        _ => None,
+    }
+}
+
+fn find_matches_in_text(first_row: u32, text: &str, query: &str) -> Vec<SearchMatch> {
+    text.lines()
+        .enumerate()
+        .flat_map(|(row, line)| find_matches_in_line(first_row + row as u32, line, query))
+        .collect()
+}
+
+#[cfg(test)]
+fn count_matches_in_text(text: &str, query: &str) -> usize {
+    find_matches_in_text(0, text, query).len()
 }
 
 fn search_match_order_key(m: &SearchMatch) -> (u32, u16) {
@@ -1338,19 +1521,27 @@ fn paste_text(inner: &Rc<RefCell<Inner>>, area: &DrawingArea, text: &str) {
     area.queue_draw();
 }
 
-fn open_terminal_context_menu(
-    area: &DrawingArea,
-    inner: &Rc<RefCell<Inner>>,
+struct TerminalContextMenu<'a> {
+    area: &'a DrawingArea,
+    inner: &'a Rc<RefCell<Inner>>,
+    search: SearchUi<'a>,
     pane_id: PaneId,
     x: f64,
     y: f64,
     on_action: TerminalActionCallback,
     prefix: String,
-) {
+}
+
+fn open_terminal_context_menu(menu: TerminalContextMenu<'_>) {
     let popover = Popover::new();
     popover.set_has_arrow(true);
-    popover.set_parent(area);
-    popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+    popover.set_parent(menu.area);
+    popover.set_pointing_to(Some(&gdk::Rectangle::new(
+        menu.x as i32,
+        menu.y as i32,
+        1,
+        1,
+    )));
 
     let body = GtkBox::new(Orientation::Vertical, 2);
     body.set_margin_top(6);
@@ -1358,7 +1549,7 @@ fn open_terminal_context_menu(
     body.set_margin_start(6);
     body.set_margin_end(6);
 
-    let inner_copy = inner.clone();
+    let inner_copy = menu.inner.clone();
     let popover_copy = popover.clone();
     body.append(&context_menu_button(
         "Copy",
@@ -1369,8 +1560,8 @@ fn open_terminal_context_menu(
         },
     ));
 
-    let inner_paste = inner.clone();
-    let area_paste = area.clone();
+    let inner_paste = menu.inner.clone();
+    let area_paste = menu.area.clone();
     let popover_paste = popover.clone();
     body.append(&context_menu_button(
         "Paste",
@@ -1381,15 +1572,24 @@ fn open_terminal_context_menu(
         },
     ));
 
-    let inner_find = inner.clone();
-    let area_find = area.clone();
+    let inner_find = menu.inner.clone();
+    let area_find = menu.area.clone();
+    let search_bar_find = menu.search.bar.clone();
+    let search_entry_find = menu.search.entry.clone();
+    let search_status_find = menu.search.status.clone();
     let popover_find = popover.clone();
     body.append(&context_menu_button(
         "Search",
         terminal_find_shortcut(),
         move || {
             popover_find.popdown();
-            open_search_popover(&area_find, &inner_find);
+            show_search_bar(
+                &search_bar_find,
+                &search_entry_find,
+                &search_status_find,
+                &area_find,
+                &inner_find,
+            );
         },
     ));
 
@@ -1398,38 +1598,47 @@ fn open_terminal_context_menu(
     append_action_button(
         &body,
         &popover,
-        pane_id,
+        menu.pane_id,
         "Split right",
-        &prefixed_shortcut(&prefix, "|"),
+        &prefixed_shortcut(&menu.prefix, "|"),
         TerminalContextAction::SplitRight,
-        on_action.clone(),
+        menu.on_action.clone(),
     );
     append_action_button(
         &body,
         &popover,
-        pane_id,
+        menu.pane_id,
         "Split down",
-        &prefixed_shortcut(&prefix, "-"),
+        &prefixed_shortcut(&menu.prefix, "-"),
         TerminalContextAction::SplitDown,
-        on_action.clone(),
+        menu.on_action.clone(),
     );
     append_action_button(
         &body,
         &popover,
-        pane_id,
+        menu.pane_id,
+        "New tab",
+        &prefixed_shortcut(&menu.prefix, "t"),
+        TerminalContextAction::NewTab,
+        menu.on_action.clone(),
+    );
+    append_action_button(
+        &body,
+        &popover,
+        menu.pane_id,
         "Close pane",
-        &prefixed_shortcut(&prefix, "x"),
+        &prefixed_shortcut(&menu.prefix, "x"),
         TerminalContextAction::ClosePane,
-        on_action.clone(),
+        menu.on_action.clone(),
     );
     append_action_button(
         &body,
         &popover,
-        pane_id,
+        menu.pane_id,
         "New anchor",
         "",
         TerminalContextAction::NewAnchor,
-        on_action.clone(),
+        menu.on_action.clone(),
     );
 
     append_separator(&body);
@@ -1437,29 +1646,29 @@ fn open_terminal_context_menu(
     append_action_button(
         &body,
         &popover,
-        pane_id,
+        menu.pane_id,
         "Next pane",
-        &prefixed_shortcut(&prefix, "o"),
+        &prefixed_shortcut(&menu.prefix, "o"),
         TerminalContextAction::NextPane,
-        on_action.clone(),
+        menu.on_action.clone(),
     );
     append_action_button(
         &body,
         &popover,
-        pane_id,
+        menu.pane_id,
         "Previous pane",
-        &prefixed_shortcut(&prefix, "p"),
+        &prefixed_shortcut(&menu.prefix, "p"),
         TerminalContextAction::PreviousPane,
-        on_action.clone(),
+        menu.on_action.clone(),
     );
     append_action_button(
         &body,
         &popover,
-        pane_id,
+        menu.pane_id,
         "Rearrange mode",
-        &prefixed_shortcut(&prefix, "m"),
+        &prefixed_shortcut(&menu.prefix, "m"),
         TerminalContextAction::ToggleRearrange,
-        on_action,
+        menu.on_action,
     );
 
     popover.set_child(Some(&body));
@@ -2103,7 +2312,10 @@ impl Pane {
 mod tests {
     use lmux_libghostty::ScreenPoint;
 
-    use super::{find_matches_in_line, BellScanner, SearchMatch, TranscriptBuffer};
+    use super::{
+        count_matches_in_text, find_matches_in_line, find_matches_in_text, BellScanner,
+        SearchMatch, TranscriptBuffer,
+    };
 
     #[test]
     fn counts_bare_bells() {
@@ -2171,6 +2383,27 @@ mod tests {
     #[test]
     fn search_matcher_skips_empty_queries() {
         assert!(find_matches_in_line(1, "anything", "").is_empty());
+    }
+
+    #[test]
+    fn search_count_reports_matches_across_scrollback_text() {
+        let text = "alpha beta\nBETA gamma beta\nnothing";
+
+        assert_eq!(count_matches_in_text(text, "beta"), 3);
+        assert_eq!(count_matches_in_text(text, "missing"), 0);
+    }
+
+    #[test]
+    fn search_index_preserves_scrollback_row_coordinates() {
+        let matches = find_matches_in_text(40, "alpha\nbeta\nbeta", "beta");
+
+        assert_eq!(
+            matches
+                .iter()
+                .map(|m| (m.start.row, m.start.col))
+                .collect::<Vec<_>>(),
+            vec![(41, 0), (42, 0)]
+        );
     }
 
     #[test]

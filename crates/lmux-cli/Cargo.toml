@@ -24,5 +24,4 @@ serde_json.workspace = true
 uuid.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time"] }
 lmux-bus = { path = "../lmux-bus" }
-lmux-control = { path = "../lmux-control" }
 lmux-session = { path = "../lmux-session" }

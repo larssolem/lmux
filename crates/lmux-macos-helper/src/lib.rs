@@ -1517,7 +1517,11 @@ fn set_visible_by_window_id_for_inner(
     window: &WindowRef,
     visible: bool,
 ) -> Result<bool, HelperError> {
-    if let Some(result) = *TEST_WINDOW_ID_VISIBILITY_RESULT.lock().unwrap() {
+    if let Some(result) = TEST_WINDOW_ID_VISIBILITY_RESULT
+        .lock()
+        .ok()
+        .and_then(|guard| *guard)
+    {
         return Ok(result);
     }
     set_visible_by_window_id(window, visible)
@@ -1660,7 +1664,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn native_window_id_success_does_not_invoke_osascript() {
-        *TEST_WINDOW_ID_VISIBILITY_RESULT.lock().unwrap() = Some(true);
+        if let Ok(mut result) = TEST_WINDOW_ID_VISIBILITY_RESULT.lock() {
+            *result = Some(true);
+        }
         TEST_OSASCRIPT_CALLS.store(0, Ordering::SeqCst);
 
         let result = set_visible(
@@ -1674,7 +1680,9 @@ mod tests {
             true,
         );
 
-        *TEST_WINDOW_ID_VISIBILITY_RESULT.lock().unwrap() = None;
+        if let Ok(mut result) = TEST_WINDOW_ID_VISIBILITY_RESULT.lock() {
+            *result = None;
+        }
         assert!(result.is_ok());
         assert_eq!(TEST_OSASCRIPT_CALLS.load(Ordering::SeqCst), 0);
     }

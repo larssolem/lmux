@@ -393,6 +393,10 @@ pub enum Kind {
     AnchorListResult { anchors: Vec<AnchorSummary> },
     #[serde(rename = "anchor.tag")]
     AnchorTag { pane_id: Uuid },
+    #[serde(rename = "anchor.tag_self")]
+    AnchorTagSelf {},
+    #[serde(rename = "anchor.tag_self.result")]
+    AnchorTagSelfResult { pane_id: u32 },
     #[serde(rename = "anchor.new")]
     AnchorNew {},
     #[serde(rename = "anchor.activate")]
@@ -1057,6 +1061,8 @@ mod tests {
             Kind::AnchorTag {
                 pane_id: Uuid::nil(),
             },
+            Kind::AnchorTagSelf {},
+            Kind::AnchorTagSelfResult { pane_id: 7 },
             Kind::AnchorUntag {
                 pane_id: Uuid::nil(),
             },

@@ -1,12 +1,6 @@
 use std::process::ExitCode;
-use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use lmux_control::{
-    send_request, socket_path, Error as CtrlError, Request, Response, PROTOCOL_VERSION,
-};
-
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Parser, Debug)]
 #[command(name = "lmux-cli", version, about = "lmux control CLI")]
@@ -1477,61 +1471,12 @@ fn try_session_list_via_store() -> anyhow::Result<Vec<(String, u64)>> {
 }
 
 fn run_mark_anchor() -> ExitCode {
-    // Pre-flight: if the socket file isn't there at all, lmux isn't running.
-    // This is FR38's "not running" branch and deserves its own exit code so
-    // shell wrappers can distinguish it from protocol errors.
-    let path = match socket_path() {
-        Ok(p) => p,
-        Err(err) => {
-            eprintln!("lmux-cli: {err}");
-            return ExitCode::from(2);
-        }
-    };
-    if !path.exists() {
-        eprintln!(
-            "lmux-cli: lmux not running (no control socket at {})",
-            path.display()
-        );
-        return ExitCode::from(2);
-    }
-
-    let source_pid = unsafe { libc::getpid() } as u32;
-    let req = Request::MarkAnchor {
-        v: PROTOCOL_VERSION,
-        source_pid,
-    };
-    match send_request(&req, CONNECT_TIMEOUT) {
-        Ok(Response::Ok { pane_id, .. }) => {
-            match pane_id {
-                Some(id) => println!("anchor: {id}"),
-                None => println!("anchor: set"),
-            }
+    match run_bus_request(lmux_bus::Kind::AnchorTagSelf {}) {
+        Ok(lmux_bus::Kind::AnchorTagSelfResult { pane_id }) => {
+            println!("anchor: {pane_id}");
             ExitCode::SUCCESS
         }
-        Ok(Response::Error { message, .. }) => {
-            eprintln!("lmux-cli: {message}");
-            ExitCode::from(4)
-        }
-        Err(CtrlError::Timeout) => {
-            eprintln!("lmux-cli: lmux control socket unresponsive (timed out after 2 s)");
-            ExitCode::from(3)
-        }
-        Err(CtrlError::Io(err))
-            if matches!(
-                err.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            eprintln!(
-                "lmux-cli: lmux not running (no control socket at {})",
-                path.display()
-            );
-            ExitCode::from(2)
-        }
-        Err(CtrlError::Io(err)) if err.kind() == std::io::ErrorKind::WouldBlock => {
-            eprintln!("lmux-cli: lmux control socket unresponsive (timed out after 2 s)");
-            ExitCode::from(3)
-        }
+        Ok(other) => unexpected_response(other),
         Err(err) => {
             eprintln!("lmux-cli: {err}");
             ExitCode::from(1)

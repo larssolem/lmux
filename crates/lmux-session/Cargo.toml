@@ -10,7 +10,6 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-lmux-layout = { path = "../lmux-layout" }
 lmux-state = { path = "../lmux-state" }
 serde.workspace = true
 thiserror.workspace = true

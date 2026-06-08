@@ -39,7 +39,11 @@ pub struct SatelliteCounters {
 /// Envelope posted from the tokio bus thread to the GTK main thread for
 /// kinds that need cockpit state. The oneshot sender carries the reply
 /// back; the bus handler awaits it before answering the client.
-pub type DeferredRequest = (Kind, oneshot::Sender<Result<Kind, BusError>>);
+pub type DeferredRequest = (
+    RequestContext,
+    Kind,
+    oneshot::Sender<Result<Kind, BusError>>,
+);
 pub type DeferredRequestSender = async_channel::Sender<DeferredRequest>;
 pub type DeferredRequestReceiver = async_channel::Receiver<DeferredRequest>;
 
@@ -95,13 +99,14 @@ impl lmux_bus::Handler for LmuxBusHandler {
             Kind::StatusGet {} => self.handle_status_get().await,
             Kind::SatelliteListWindows {} => self.handle_satellite_list_windows().await,
             Kind::AnchorList {}
+            | Kind::AnchorTagSelf {}
             | Kind::PaneNew { .. }
             | Kind::PaneTail { .. }
             | Kind::PaneCapture { .. }
             | Kind::PaneSendInput { .. }
             | Kind::PaneRename { .. }
-            | Kind::GrantRequest(_) => self.dispatch_to_gtk(req).await,
-            other => self.dispatch_to_gtk(other).await,
+            | Kind::GrantRequest(_) => self.dispatch_to_gtk(ctx, req).await,
+            other => self.dispatch_to_gtk(ctx, other).await,
         }
     }
 
@@ -138,14 +143,14 @@ fn agent_sensitive_request_missing_identity(req: &Kind) -> bool {
 }
 
 impl LmuxBusHandler {
-    async fn dispatch_to_gtk(&self, req: Kind) -> Result<Kind, BusError> {
+    async fn dispatch_to_gtk(&self, ctx: RequestContext, req: Kind) -> Result<Kind, BusError> {
         let Some(tx) = &self.ctx.write_tx else {
             return Err(BusError::Domain(format!(
                 "not_implemented: {req:?} (no GTK dispatcher installed)"
             )));
         };
         let (resp_tx, resp_rx) = oneshot::channel();
-        tx.send((req, resp_tx))
+        tx.send((ctx, req, resp_tx))
             .await
             .map_err(|e| BusError::Domain(format!("dispatch send: {e}")))?;
         resp_rx
@@ -422,20 +427,28 @@ pub async fn run_dispatcher(
     compositor: Arc<dyn CompositorControl>,
     satellite_counters: SatelliteCounters,
 ) {
-    while let Ok((req, resp_tx)) = rx.recv().await {
+    while let Ok((ctx, req, resp_tx)) = rx.recv().await {
         let store_root = store_root.clone();
         let state = state.clone();
         let compositor = compositor.clone();
         let satellite_counters = satellite_counters.clone();
         gtk4::glib::MainContext::default().spawn_local(async move {
-            let result =
-                handle_deferred(req, &store_root, &state, &compositor, &satellite_counters).await;
+            let result = handle_deferred(
+                ctx,
+                req,
+                &store_root,
+                &state,
+                &compositor,
+                &satellite_counters,
+            )
+            .await;
             let _ = resp_tx.send(result);
         });
     }
 }
 
 async fn handle_deferred(
+    ctx: RequestContext,
     req: Kind,
     store_root: &std::path::Path,
     state: &SharedAppState,
@@ -644,6 +657,17 @@ async fn handle_deferred(
             Ok(Kind::Ok {
                 of: Some("anchor.tag".into()),
             })
+        }
+        Kind::AnchorTagSelf {} => {
+            let source_pid = u32::try_from(ctx.pid).map_err(|_| {
+                BusError::Domain(format!("anchor.tag_self: invalid pid {}", ctx.pid))
+            })?;
+            let mut st = state.borrow_mut();
+            let pid = st.resolve_owning_pane(source_pid).ok_or_else(|| {
+                BusError::Domain(format!("anchor.tag_self: no pane owns pid {source_pid}"))
+            })?;
+            st.add_anchor(pid);
+            Ok(Kind::AnchorTagSelfResult { pane_id: pid })
         }
         Kind::AnchorNew {} => {
             let mut st = state.borrow_mut();

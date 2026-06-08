@@ -32,6 +32,17 @@ use crate::pane::{
 #[cfg(target_os = "linux")]
 use crate::satellite::SatelliteWidget;
 
+mod support;
+
+use support::{
+    agent_identity_from_child_env, insert_satellite_window_for_anchor,
+    owning_anchor_for_terminal_pane, satellite_visibility_for_active,
+};
+#[cfg(target_os = "macos")]
+use support::{macos_backend_window_id, macos_satellite_for_window};
+#[cfg(test)]
+use support::{remove_satellite_backend_window, remove_satellite_request};
+
 /// CSS class applied to an anchor pane's Frame. Paired with the provider
 /// loaded in `app::install_css`.
 pub const ANCHOR_CSS_CLASS: &str = "pane--anchor";
@@ -65,138 +76,8 @@ fn default_window_backend() -> WindowBackend {
     }
 }
 
-fn satellite_visibility_for_active(
-    active: Option<PaneId>,
-    windows_by_anchor: &HashMap<PaneId, Vec<SatelliteWindowId>>,
-) -> (Vec<SatelliteWindowId>, Vec<SatelliteWindowId>) {
-    let mut hide = Vec::new();
-    let mut show = Vec::new();
-    for (anchor, windows) in windows_by_anchor {
-        if Some(*anchor) == active {
-            show.extend(windows.iter().cloned());
-        } else {
-            hide.extend(windows.iter().cloned());
-        }
-    }
-    (hide, show)
-}
-
-fn owning_anchor_for_terminal_pane(
-    pane_id: PaneId,
-    anchors: &BTreeSet<PaneId>,
-    pane_workspace: &HashMap<PaneId, PaneId>,
-    terminal_tabs_by_anchor: &HashMap<PaneId, Vec<PaneId>>,
-    pane_terminal_tab_roots: &HashMap<PaneId, PaneId>,
-) -> Option<PaneId> {
-    if anchors.contains(&pane_id) {
-        return Some(pane_id);
-    }
-    if let Some(owner) = pane_workspace
-        .get(&pane_id)
-        .copied()
-        .filter(|owner| anchors.contains(owner))
-    {
-        return Some(owner);
-    }
-
-    let tab_root = pane_terminal_tab_roots
-        .get(&pane_id)
-        .copied()
-        .unwrap_or(pane_id);
-    terminal_tabs_by_anchor.iter().find_map(|(anchor, tabs)| {
-        if anchors.contains(anchor) && tabs.contains(&tab_root) {
-            Some(*anchor)
-        } else {
-            None
-        }
-    })
-}
-
-fn remove_satellite_request(
-    windows_by_anchor: &mut HashMap<PaneId, Vec<SatelliteWindowId>>,
-    request_id: Uuid,
-) {
-    for windows in windows_by_anchor.values_mut() {
-        windows.retain(|existing| existing.request_id != Some(request_id));
-    }
-}
-
-fn remove_satellite_backend_window(
-    windows_by_anchor: &mut HashMap<PaneId, Vec<SatelliteWindowId>>,
-    backend_window_id: &str,
-) {
-    for windows in windows_by_anchor.values_mut() {
-        windows.retain(|existing| existing.backend_window_id != backend_window_id);
-    }
-}
-
-fn insert_satellite_window_for_anchor(
-    windows_by_anchor: &mut HashMap<PaneId, Vec<SatelliteWindowId>>,
-    anchor: PaneId,
-    window: SatelliteWindowId,
-) {
-    if let Some(request_id) = window.request_id {
-        remove_satellite_request(windows_by_anchor, request_id);
-    }
-    remove_satellite_backend_window(windows_by_anchor, &window.backend_window_id);
-    windows_by_anchor.entry(anchor).or_default().push(window);
-}
-
 fn noop_terminal_action_callback() -> TerminalActionCallback {
     Rc::new(|_, _| {})
-}
-
-#[cfg(target_os = "linux")]
-fn agent_identity_from_child_env(pid: u32) -> Option<lmux_bus::AgentIdentity> {
-    let bytes = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
-    let mut id = None;
-    let mut name = None;
-    for entry in bytes.split(|b| *b == 0) {
-        if let Some(value) = entry.strip_prefix(b"LMUX_AGENT_ID=") {
-            let value = String::from_utf8_lossy(value).trim().to_string();
-            if !value.is_empty() {
-                id = Some(value);
-            }
-        } else if let Some(value) = entry.strip_prefix(b"LMUX_AGENT_NAME=") {
-            let value = String::from_utf8_lossy(value).trim().to_string();
-            if !value.is_empty() {
-                name = Some(value);
-            }
-        }
-    }
-    id.map(|id| lmux_bus::AgentIdentity { id, name })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn agent_identity_from_child_env(_pid: u32) -> Option<lmux_bus::AgentIdentity> {
-    None
-}
-
-#[cfg(target_os = "macos")]
-fn macos_backend_window_id(window: &MacosWindowInfo) -> String {
-    match window.window_id {
-        Some(window_id) => format!("macos-window-id:{window_id}:index:{}", window.window_index),
-        None => format!(
-            "macos-window-pid:{}:index:{}",
-            window.pid, window.window_index
-        ),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn macos_satellite_for_window(
-    request_id: Uuid,
-    bundle_id: Option<String>,
-    window: &MacosWindowInfo,
-) -> SatelliteWindowId {
-    SatelliteWindowId {
-        backend: WindowBackend::Macos,
-        request_id: Some(request_id),
-        pid: Some(window.pid),
-        backend_window_id: macos_backend_window_id(window),
-        bundle_id: window.bundle_id.clone().or(bundle_id),
-        title: window.title.clone(),
-    }
 }
 
 #[cfg(test)]
@@ -521,6 +402,7 @@ pub struct AppState {
     terminal_exit_cb: Option<TerminalExitCallback>,
     terminal_tab_cb: Option<TerminalTabActivatedCallback>,
     terminal_tab_rename_cb: Option<TerminalTabRenameCallback>,
+    terminal_tab_new_cb: Option<TerminalTabNewCallback>,
     /// Notification ids per-pane, so the next bell from a pane replaces the
     /// previous toast rather than stacking. Story 6.2.
     last_notif_id: HashMap<PaneId, u32>,
@@ -581,6 +463,7 @@ pub type AnchorsChangedCallback = Rc<dyn Fn()>;
 pub type ActiveAnchorChangedCallback = Rc<dyn Fn(Option<PaneId>)>;
 pub type TerminalTabActivatedCallback = Rc<dyn Fn(PaneId, PaneId)>;
 pub type TerminalTabRenameCallback = Rc<dyn Fn(PaneId, Option<String>)>;
+pub type TerminalTabNewCallback = Rc<dyn Fn(PaneId)>;
 
 pub type SharedAppState = Rc<RefCell<AppState>>;
 
@@ -638,6 +521,7 @@ impl AppState {
             terminal_exit_cb: None,
             terminal_tab_cb: None,
             terminal_tab_rename_cb: None,
+            terminal_tab_new_cb: None,
             last_notif_id: HashMap::new(),
             phase: Phase::Running,
             on_anchors_changed: Vec::new(),
@@ -703,6 +587,7 @@ impl AppState {
             terminal_exit_cb: None,
             terminal_tab_cb: None,
             terminal_tab_rename_cb: None,
+            terminal_tab_new_cb: None,
             last_notif_id: HashMap::new(),
             phase: Phase::Running,
             on_anchors_changed: Vec::new(),
@@ -852,6 +737,11 @@ impl AppState {
 
     pub fn set_terminal_tab_rename_callback(&mut self, cb: TerminalTabRenameCallback) {
         self.terminal_tab_rename_cb = Some(cb);
+        self.rebuild_widget_tree();
+    }
+
+    pub fn set_terminal_tab_new_callback(&mut self, cb: TerminalTabNewCallback) {
+        self.terminal_tab_new_cb = Some(cb);
         self.rebuild_widget_tree();
     }
 
@@ -1182,6 +1072,113 @@ impl AppState {
         self.active_terminal_tab_by_anchor.insert(anchor, tab_root);
         self.rebuild_widget_tree();
         true
+    }
+
+    pub fn create_terminal_tab_for_anchor(&mut self, anchor: PaneId) -> bool {
+        if !self.anchors.contains(&anchor) || !self.panes.contains_key(&anchor) {
+            tracing::warn!(anchor, "new terminal tab aborted: unknown anchor");
+            return false;
+        }
+        self.ensure_terminal_tab_stack(anchor);
+        let target = self.active_terminal_tab(anchor);
+        if !self.panes.contains_key(&target) {
+            tracing::warn!(
+                anchor,
+                target,
+                "new terminal tab aborted: missing active tab"
+            );
+            return false;
+        }
+        let cwd = self
+            .panes
+            .get(&target)
+            .and_then(|p| p.cwd())
+            .map(|p| p.to_path_buf());
+        let new_id = self.next_id;
+        let Some(new_pane) = Pane::new(new_id, cwd.as_deref()) else {
+            tracing::warn!(anchor, "new terminal tab aborted: pane allocation failed");
+            return false;
+        };
+        if let Some(cb) = &self.focus_cb {
+            new_pane.attach_controllers(
+                cb.clone(),
+                self.focus_mode.clone(),
+                self.terminal_action_cb
+                    .clone()
+                    .unwrap_or_else(noop_terminal_action_callback),
+                self.shortcut_prefix.clone(),
+            );
+        }
+        if let Some(cb) = &self.reparent_cb {
+            new_pane.attach_rearrange_controllers(self.rearrange_mode.clone(), cb.clone());
+        }
+        if let Some(cb) = &self.bell_cb {
+            new_pane.set_bell_callback(cb.clone());
+        }
+        if let Some(cb) = &self.terminal_exit_cb {
+            new_pane.set_exit_callback(cb.clone());
+        }
+
+        self.panes.insert(new_id, new_pane);
+        self.pane_uuids.insert(new_id, Uuid::new_v4());
+        self.pane_workspace.insert(new_id, anchor);
+        self.pane_terminal_tab_roots.insert(new_id, new_id);
+        self.terminal_tabs_by_anchor
+            .entry(anchor)
+            .or_insert_with(|| vec![anchor])
+            .push(new_id);
+        self.active_terminal_tab_by_anchor.insert(anchor, new_id);
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .unwrap_or_else(|| u32::MAX.saturating_sub(0));
+
+        let replaced = self.layout.replace_leaf(target, |id| Layout::Split {
+            dir: Dir::Vertical,
+            a: Box::new(Layout::Leaf(id)),
+            b: Box::new(Layout::Leaf(new_id)),
+            ratio: 0.5,
+        });
+        if !replaced {
+            tracing::warn!(
+                anchor,
+                target,
+                "new terminal tab could not locate target leaf"
+            );
+            self.panes.remove(&new_id);
+            self.pane_uuids.remove(&new_id);
+            self.pane_titles.remove(&new_id);
+            self.pane_agents.remove(&new_id);
+            self.remove_terminal_tab_metadata(new_id);
+            return false;
+        }
+        self.focused = new_id;
+        if let Some(pane) = self.panes.get(&new_id) {
+            pane.grab_focus();
+        }
+        self.refresh_focus_css();
+        self.rebuild_widget_tree();
+        true
+    }
+
+    pub fn create_terminal_tab_for_focused(&mut self) -> bool {
+        let target = self.focused;
+        let anchor = owning_anchor_for_terminal_pane(
+            target,
+            &self.anchors,
+            &self.pane_workspace,
+            &self.terminal_tabs_by_anchor,
+            &self.pane_terminal_tab_roots,
+        )
+        .or_else(|| self.is_anchor(target).then_some(target))
+        .or(self.active_anchor);
+        match anchor {
+            Some(anchor) => self.create_terminal_tab_for_anchor(anchor),
+            None => {
+                tracing::warn!(target, "new terminal tab aborted: no active anchor");
+                false
+            }
+        }
     }
 
     fn remove_terminal_tab_metadata(&mut self, pane_id: PaneId) {
@@ -3501,9 +3498,6 @@ impl AppState {
             .get(&anchor)
             .cloned()
             .unwrap_or_else(|| vec![anchor]);
-        if tabs.len() <= 1 {
-            return widget;
-        }
         let outer = gtk4::Box::new(Orientation::Vertical, 0);
         let strip = gtk4::Box::new(Orientation::Horizontal, 4);
         strip.add_css_class("lmux-terminal-tabs");
@@ -3535,6 +3529,14 @@ impl AppState {
                 });
                 button.add_controller(click);
             }
+            strip.append(&button);
+        }
+        if let Some(cb) = self.terminal_tab_new_cb.clone() {
+            let button = Button::with_label("+");
+            button.add_css_class("lmux-terminal-tab");
+            button.add_css_class("lmux-terminal-tab--new");
+            button.set_tooltip_text(Some("New shell tab"));
+            button.connect_clicked(move |_| cb(anchor));
             strip.append(&button);
         }
         outer.append(&strip);

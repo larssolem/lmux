@@ -23,11 +23,9 @@ tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 lmux-libghostty = { path = "../lmux-libghostty" }
-lmux-layout = { path = "../lmux-layout" }
 lmux-state = { path = "../lmux-state" }
 lmux-pty = { path = "../lmux-pty" }
 lmux-notify = { path = "../lmux-notify" }
-lmux-control = { path = "../lmux-control" }
 lmux-anchor = { path = "../lmux-anchor" }
 lmux-config = { path = "../lmux-config" }
 lmux-bus = { path = "../lmux-bus" }

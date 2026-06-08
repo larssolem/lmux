@@ -31,9 +31,10 @@ use gtk4::{
     ScrolledWindow, StringObject,
 };
 
+#[cfg(test)]
+use lmux_bus::kinds::WindowCandidateBackend;
 use lmux_compositor::{
-    CompositorControl, SatelliteWindowId, WindowAppIdentity, WindowCandidate,
-    WindowCandidateBackend, WindowPreview, WindowPreviewData,
+    CompositorControl, SatelliteWindowId, WindowCandidate, WindowPreview, WindowPreviewData,
 };
 use lmux_config::{Sidebar as SidebarCfg, SidebarPosition};
 #[cfg(target_os = "macos")]
@@ -43,7 +44,17 @@ use lmux_macos_helper::WindowPreview as MacosWindowPreview;
 
 use crate::layout::PaneId;
 use crate::pane::ShortcutPrefixCell;
-use crate::state::{AnchorAgentActivity, AnchorGrantView, SharedAppState};
+use crate::state::{AnchorAgentActivity, SharedAppState};
+
+mod grants;
+mod labels;
+
+use grants::grant_row;
+#[cfg(target_os = "macos")]
+use labels::{macos_window_initials, macos_window_meta, macos_window_title};
+use labels::{window_app_label, window_backend_label, window_initials, window_meta, window_title};
+#[cfg(test)]
+use lmux_compositor::WindowAppIdentity;
 
 type ActiveRows = Rc<RefCell<HashMap<PaneId, ActiveRow>>>;
 
@@ -284,6 +295,7 @@ pub fn install(
     apply_collapsed(
         &sidebar_box,
         &paned,
+        &collapse_btn,
         &cfg,
         collapsed.get(),
         hover_expanded.get(),
@@ -293,6 +305,7 @@ pub fn install(
     let sb_for_btn = sidebar_box.clone();
     let paned_for_btn = paned.clone();
     let cfg_for_btn = cfg.clone();
+    let collapse_for_btn = collapse_btn.clone();
     let collapsed_for_btn = collapsed.clone();
     let hover_for_btn = hover_expanded.clone();
     let expanded_only_for_btn = expanded_only.clone();
@@ -302,6 +315,7 @@ pub fn install(
         apply_collapsed(
             &sb_for_btn,
             &paned_for_btn,
+            &collapse_for_btn,
             &cfg_for_btn,
             collapsed_for_btn.get(),
             hover_for_btn.get(),
@@ -312,6 +326,7 @@ pub fn install(
     let hover = EventControllerMotion::new();
     let sb_for_enter = sidebar_box.clone();
     let paned_for_enter = paned.clone();
+    let collapse_for_enter = collapse_btn.clone();
     let cfg_for_enter = cfg.clone();
     let collapsed_for_enter = collapsed.clone();
     let hover_for_enter = hover_expanded.clone();
@@ -322,6 +337,7 @@ pub fn install(
             apply_collapsed(
                 &sb_for_enter,
                 &paned_for_enter,
+                &collapse_for_enter,
                 &cfg_for_enter,
                 collapsed_for_enter.get(),
                 hover_for_enter.get(),
@@ -331,6 +347,7 @@ pub fn install(
     });
     let sb_for_leave = sidebar_box.clone();
     let paned_for_leave = paned.clone();
+    let collapse_for_leave = collapse_btn.clone();
     let cfg_for_leave = cfg.clone();
     let collapsed_for_leave = collapsed.clone();
     let hover_for_leave = hover_expanded.clone();
@@ -340,6 +357,7 @@ pub fn install(
         apply_collapsed(
             &sb_for_leave,
             &paned_for_leave,
+            &collapse_for_leave,
             &cfg_for_leave,
             collapsed_for_leave.get(),
             hover_for_leave.get(),
@@ -381,12 +399,14 @@ pub fn install(
 fn apply_collapsed(
     sidebar: &GtkBox,
     paned: &Paned,
+    collapse_btn: &Button,
     cfg: &SidebarCfg,
     collapsed: bool,
     hover_expanded: bool,
     expanded_only: &[gtk4::Widget],
 ) {
     let expanded = !collapsed || hover_expanded;
+    collapse_btn.set_icon_name(collapse_icon_name(cfg.position, expanded));
     let width = if expanded {
         cfg.width
     } else {
@@ -406,6 +426,15 @@ fn apply_collapsed(
             }
         }
     };
+}
+
+fn collapse_icon_name(position: SidebarPosition, expanded: bool) -> &'static str {
+    match (position, expanded) {
+        (SidebarPosition::Left, true) => "pan-start-symbolic",
+        (SidebarPosition::Left, false) => "pan-end-symbolic",
+        (SidebarPosition::Right, true) => "pan-end-symbolic",
+        (SidebarPosition::Right, false) => "pan-start-symbolic",
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1172,83 +1201,6 @@ fn clear_box(container: &GtkBox) {
     }
 }
 
-fn window_title(window: &WindowCandidate) -> String {
-    window
-        .title
-        .as_deref()
-        .map(str::trim)
-        .filter(|title| !title.is_empty())
-        .unwrap_or("(untitled window)")
-        .to_string()
-}
-
-fn window_meta(window: &WindowCandidate) -> String {
-    let mut parts = vec![
-        window_backend_label(window),
-        window.backend_window_id.clone(),
-    ];
-    if let Some(pid) = window.pid {
-        parts.push(format!("pid {pid}"));
-    }
-    if let Some(app) = app_identity_label(window.app_identity.as_ref()) {
-        parts.push(app);
-    }
-    if let Some(workspace) = &window.workspace {
-        parts.push(format!("workspace {workspace}"));
-    }
-    if let Some(output) = &window.output {
-        parts.push(output.clone());
-    }
-    parts.join(" · ")
-}
-
-fn window_backend_label(window: &WindowCandidate) -> String {
-    match &window.backend {
-        WindowCandidateBackend::Macos => "macOS",
-        WindowCandidateBackend::Kwin => "KWin",
-        WindowCandidateBackend::X11 => "X11",
-        WindowCandidateBackend::Hyprland => "Hyprland",
-        WindowCandidateBackend::Sway => "Sway",
-        WindowCandidateBackend::Noop => "Noop",
-        WindowCandidateBackend::Unsupported => "Unsupported",
-    }
-    .to_string()
-}
-
-fn window_app_label(window: &WindowCandidate) -> String {
-    app_identity_label(window.app_identity.as_ref()).unwrap_or_default()
-}
-
-fn app_identity_label(identity: Option<&WindowAppIdentity>) -> Option<String> {
-    match identity {
-        Some(WindowAppIdentity::BundleId(value)) => Some(value.clone()),
-        Some(WindowAppIdentity::DesktopEntry(value)) => Some(value.clone()),
-        Some(WindowAppIdentity::WmClass(value)) => Some(value.clone()),
-        Some(WindowAppIdentity::AppId(value)) => Some(value.clone()),
-        Some(WindowAppIdentity::Other(value)) => Some(value.clone()),
-        None => None,
-    }
-}
-
-fn window_initials(window: &WindowCandidate) -> String {
-    let source =
-        app_identity_label(window.app_identity.as_ref()).unwrap_or_else(|| window_title(window));
-    let mut initials = String::new();
-    for word in source.split(|c: char| !c.is_alphanumeric()) {
-        if let Some(ch) = word.chars().next() {
-            initials.extend(ch.to_uppercase());
-        }
-        if initials.chars().count() >= 2 {
-            break;
-        }
-    }
-    if initials.is_empty() {
-        "W".to_string()
-    } else {
-        initials
-    }
-}
-
 #[cfg(target_os = "macos")]
 fn open_macos_attach_picker(parent: &gtk4::ApplicationWindow, state: &SharedAppState) {
     let dialog = gtk4::Window::builder()
@@ -1517,60 +1469,6 @@ fn bgra_texture(preview: MacosWindowPreview) -> gdk::MemoryTexture {
     )
 }
 
-#[cfg(target_os = "macos")]
-fn macos_window_title(window: &MacosWindowInfo) -> String {
-    window
-        .title
-        .as_deref()
-        .map(str::trim)
-        .filter(|title| !title.is_empty())
-        .unwrap_or("(untitled window)")
-        .to_string()
-}
-
-#[cfg(target_os = "macos")]
-fn macos_window_meta(window: &MacosWindowInfo) -> String {
-    let app = window
-        .bundle_id
-        .as_deref()
-        .and_then(|bundle| bundle.rsplit('.').next())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("macOS");
-    let id = window
-        .window_id
-        .map(|id| format!("id {id}"))
-        .unwrap_or_else(|| "no id".to_string());
-    format!(
-        "{app} · pid {} · window {} · {id}",
-        window.pid, window.window_index
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn macos_window_initials(window: &MacosWindowInfo) -> String {
-    let source = window
-        .bundle_id
-        .as_deref()
-        .and_then(|bundle| bundle.rsplit('.').next())
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| macos_window_title(window));
-    let mut initials = String::new();
-    for word in source.split(|c: char| !c.is_alphanumeric()) {
-        if let Some(ch) = word.chars().next() {
-            initials.extend(ch.to_uppercase());
-        }
-        if initials.chars().count() >= 2 {
-            break;
-        }
-    }
-    if initials.is_empty() {
-        "W".to_string()
-    } else {
-        initials
-    }
-}
-
 fn show_row_popover(
     anchor_widget: &GtkBox,
     pane_id: PaneId,
@@ -1718,96 +1616,6 @@ fn show_row_popover(
 
     popover.popup();
     name_entry.grab_focus();
-}
-
-fn grant_row(grant: AnchorGrantView, state: SharedAppState) -> gtk4::Widget {
-    let row = GtkBox::new(Orientation::Vertical, 4);
-    row.add_css_class("lmux-sidebar__grant-row");
-
-    let requester = grant
-        .requester
-        .name
-        .as_deref()
-        .unwrap_or(grant.requester.id.as_str());
-    let state_text = if grant.pending { "pending" } else { "active" };
-    let mut text = format!("{requester} · {:?} · {state_text}", grant.scope);
-    if let Some(reason) = &grant.reason {
-        text.push_str(" · ");
-        text.push_str(reason);
-    }
-    let label = Label::new(Some(&text));
-    label.set_xalign(0.0);
-    label.set_wrap(true);
-    row.append(&label);
-
-    let buttons = GtkBox::new(Orientation::Horizontal, 4);
-    buttons.set_halign(Align::End);
-    if grant.pending {
-        let allow_once = Button::with_label("Allow once");
-        let allow_timed = Button::with_label("Allow 10m");
-        let deny = Button::with_label("Deny");
-        deny.add_css_class("destructive-action");
-
-        let state_once = state.clone();
-        let once_id = grant.grant_id;
-        allow_once.connect_clicked(move |_| {
-            if let Err(err) = state_once
-                .borrow_mut()
-                .decide_grant(once_id, lmux_bus::GrantDecision::AllowOnce)
-            {
-                tracing::warn!(error = %err, "grant allow-once failed");
-            }
-        });
-
-        let state_timed = state.clone();
-        let timed_id = grant.grant_id;
-        allow_timed.connect_clicked(move |_| {
-            let expires_at_unix_seconds = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_secs() + 600)
-                .unwrap_or(600);
-            if let Err(err) = state_timed.borrow_mut().decide_grant(
-                timed_id,
-                lmux_bus::GrantDecision::AllowUntil {
-                    expires_at_unix_seconds,
-                },
-            ) {
-                tracing::warn!(error = %err, "grant allow-timed failed");
-            }
-        });
-
-        let state_deny = state;
-        let deny_id = grant.grant_id;
-        deny.connect_clicked(move |_| {
-            if let Err(err) = state_deny
-                .borrow_mut()
-                .decide_grant(deny_id, lmux_bus::GrantDecision::Deny)
-            {
-                tracing::warn!(error = %err, "grant deny failed");
-            }
-        });
-
-        buttons.append(&allow_once);
-        buttons.append(&allow_timed);
-        buttons.append(&deny);
-    } else if grant.active {
-        let revoke = Button::with_label("Revoke");
-        revoke.add_css_class("destructive-action");
-        let state_revoke = state;
-        let revoke_id = grant.grant_id;
-        revoke.connect_clicked(move |_| {
-            if let Err(err) = state_revoke
-                .borrow_mut()
-                .decide_grant(revoke_id, lmux_bus::GrantDecision::Revoke)
-            {
-                tracing::warn!(error = %err, "grant revoke failed");
-            }
-        });
-        buttons.append(&revoke);
-    }
-
-    row.append(&buttons);
-    row.upcast()
 }
 
 fn trim_to_option(s: &gtk4::glib::GString) -> Option<String> {

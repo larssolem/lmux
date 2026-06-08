@@ -128,11 +128,19 @@ frame.pane--anchor.pane--focused {
     border-color: #3b82f6;
     font-weight: 700;
 }
+.lmux-terminal-tab--new {
+    min-width: 32px;
+    font-weight: 700;
+}
+.lmux-terminal-search {
+    padding: 5px 6px;
+    background-color: alpha(#111827, 0.08);
+    border-bottom: 1px solid alpha(#64748b, 0.24);
+}
 ";
 
 use std::sync::Arc;
 
-use lmux_control::{AppEvent, Response as CtrlResponse, PROTOCOL_VERSION};
 use lmux_notify::Notifier;
 
 use std::collections::HashMap;
@@ -234,6 +242,7 @@ pub fn activate(app: &Application) {
     let terminal_exit_cb = make_terminal_exit_cb(&state);
     let terminal_tab_cb = make_terminal_tab_cb(&state);
     let terminal_tab_rename_cb = make_terminal_tab_rename_cb(&state);
+    let terminal_tab_new_cb = make_terminal_tab_new_cb(&state);
     {
         let mut s = state.borrow_mut();
         s.attach_controllers_for_all(
@@ -245,6 +254,7 @@ pub fn activate(app: &Application) {
         s.set_terminal_exit_callback(terminal_exit_cb);
         s.set_terminal_tab_activated_callback(terminal_tab_cb);
         s.set_terminal_tab_rename_callback(terminal_tab_rename_cb);
+        s.set_terminal_tab_new_callback(terminal_tab_new_cb);
     }
 
     let compositor = build_compositor();
@@ -278,7 +288,6 @@ pub fn activate(app: &Application) {
     install_window_menu_actions(app, &window, &state, shortcut_prefix.clone());
     install_window_shortcuts(app, &window, &state, shortcut_prefix.clone(), &prefix_hint);
     install_close_request(app, &window, &state);
-    install_control_socket(&window, &state);
     install_notifier(&window, &state);
     install_bus_server(&window, &state, compositor);
     install_config_watch(&window, &state, shortcut_prefix);
@@ -373,6 +382,19 @@ fn make_terminal_tab_rename_cb(state: &SharedAppState) -> crate::state::Terminal
     })
 }
 
+fn make_terminal_tab_new_cb(state: &SharedAppState) -> crate::state::TerminalTabNewCallback {
+    let weak = Rc::downgrade(state);
+    Rc::new(move |anchor| {
+        if let Some(s) = weak.upgrade() {
+            if let Ok(mut state) = s.try_borrow_mut() {
+                state.create_terminal_tab_for_anchor(anchor);
+            } else {
+                tracing::debug!(anchor, "new terminal tab skipped (state busy)");
+            }
+        }
+    })
+}
+
 fn make_terminal_action_cb(state: &SharedAppState) -> crate::pane::TerminalActionCallback {
     let weak = Rc::downgrade(state);
     Rc::new(move |pane_id, action| {
@@ -391,6 +413,9 @@ fn make_terminal_action_cb(state: &SharedAppState) -> crate::pane::TerminalActio
         match action {
             TerminalContextAction::SplitRight => state.split_focused(Dir::Vertical),
             TerminalContextAction::SplitDown => state.split_focused(Dir::Horizontal),
+            TerminalContextAction::NewTab => {
+                state.create_terminal_tab_for_focused();
+            }
             TerminalContextAction::ClosePane => state.close_focused(),
             TerminalContextAction::NewAnchor => state.create_new_anchor(),
             TerminalContextAction::NextPane => state.cycle_focus(true),
@@ -467,6 +492,7 @@ fn request_platform_permissions() {
 /// Commands after prefix:
 ///   `|` / `\`    — split vertical
 ///   `-`          — split horizontal
+///   `t`          — new terminal tab
 ///   `x`          — close focused pane
 ///   `a`          — toggle anchor tag on focused pane
 ///   `q`          — coordinated shutdown
@@ -562,6 +588,9 @@ fn install_window_shortcuts(
                 }
                 Some('s') => {
                     crate::switcher::open(&window_cb, &state_cb);
+                }
+                Some('t') => {
+                    state_cb.borrow_mut().create_terminal_tab_for_focused();
                 }
                 Some('m') => {
                     state_cb.borrow().toggle_rearrange_mode();
@@ -892,53 +921,6 @@ fn locate_kwin_script() -> Option<PathBuf> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     candidates.push(PathBuf::from(manifest_dir).join("../../share/lmux/kwin/lmux-dock.js"));
     candidates.into_iter().find(|p| p.exists())
-}
-
-fn install_control_socket(window: &ApplicationWindow, state: &SharedAppState) {
-    let (event_tx, event_rx) = async_channel::unbounded::<AppEvent>();
-    let handle = match lmux_control::spawn_server(move |ev| {
-        let _ = event_tx.send_blocking(ev);
-    }) {
-        Ok(h) => h,
-        Err(err) => {
-            tracing::warn!(error = %err, "control socket server failed to start");
-            return;
-        }
-    };
-    unsafe {
-        window.set_data::<lmux_control::ServerHandle>("lmux-control-server", handle);
-    }
-
-    let state = state.clone();
-    glib::MainContext::default().spawn_local(async move {
-        while let Ok(ev) = event_rx.recv().await {
-            match ev {
-                AppEvent::MarkAnchor { source_pid, reply } => {
-                    let resolved = {
-                        let mut s = state.borrow_mut();
-                        match s.resolve_owning_pane(source_pid) {
-                            Some(id) => {
-                                s.add_anchor(id);
-                                Some(id)
-                            }
-                            None => None,
-                        }
-                    };
-                    let resp = match resolved {
-                        Some(id) => CtrlResponse::Ok {
-                            v: PROTOCOL_VERSION,
-                            pane_id: Some(id),
-                        },
-                        None => CtrlResponse::Error {
-                            v: PROTOCOL_VERSION,
-                            message: format!("no pane owns pid {source_pid}"),
-                        },
-                    };
-                    let _ = reply.send(resp).await;
-                }
-            }
-        }
-    });
 }
 
 /// Spawn the notifier + wire bell events. A bell on pane P triggers a
