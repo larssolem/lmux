@@ -66,14 +66,14 @@ impl Env {
     /// Invoke the named workspace binary with every XDG var pointing
     /// into this sandbox and `$HOME` redirected as a fallback.
     pub fn cli(&self, bin: &str) -> Command {
-        let mut cmd = Command::cargo_bin(bin).unwrap_or_else(|e| panic!("cargo_bin {bin}: {e}"));
+        let mut cmd = workspace_bin(bin);
         self.apply_env(&mut cmd);
         cmd
     }
 
     /// Start a real `lmux` cockpit process in this sandbox.
     pub fn spawn_lmux(&self) -> RunningLmux {
-        let mut cmd = Command::cargo_bin("lmux").unwrap_or_else(|e| panic!("cargo_bin lmux: {e}"));
+        let mut cmd = workspace_bin("lmux");
         self.apply_env(&mut cmd);
         let log_path = self.root.join("lmux.log");
         let log = OpenOptions::new()
@@ -123,6 +123,29 @@ impl Env {
             .unwrap_or_else(|e| panic!("seed session {name}: {e}"));
         store
     }
+}
+
+fn workspace_bin(bin: &str) -> Command {
+    let env_key = format!("CARGO_BIN_EXE_{bin}");
+    if let Some(path) = std::env::var_os(&env_key) {
+        return Command::new(path);
+    }
+    if let Some(path) = target_profile_bin(bin) {
+        return Command::new(path);
+    }
+    Command::cargo_bin(bin).unwrap_or_else(|e| panic!("cargo_bin {bin}: {e}"))
+}
+
+fn target_profile_bin(bin: &str) -> Option<PathBuf> {
+    let current_exe = std::env::current_exe().ok()?;
+    let current_dir = current_exe.parent()?;
+    let profile_dir = if current_dir.file_name().is_some_and(|name| name == "deps") {
+        current_dir.parent()?
+    } else {
+        current_dir
+    };
+    let candidate = profile_dir.join(format!("{bin}{}", std::env::consts::EXE_SUFFIX));
+    candidate.exists().then_some(candidate)
 }
 
 pub struct RunningLmux {
