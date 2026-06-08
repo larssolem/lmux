@@ -40,8 +40,13 @@ run = "cargo test -p lmux-bus -p lmux-pty"
 description = "Run the Linux-testable macOS port test set"
 depends = ["test:compositor", "test:portable"]
 
+[tasks."build:e2e-bins"]
+description = "Build workspace binaries used by e2e tests"
+run = "cargo build -p lmux-cli --bin lmux-cli -p lmux --bin lmux"
+
 [tasks."test:workspace"]
 description = "Run the full Rust workspace test suite"
+depends = ["build:e2e-bins"]
 run = "cargo test --workspace --all-targets"
 
 [tasks."check:app"]
