@@ -64,6 +64,9 @@ fn main() {
         )
     });
     assert!(status.success(), "zig build failed");
+    if target_os == "macos" {
+        normalize_macos_static_archive(&lib_dir.join("libghostty-vt-static.a"));
+    }
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=static=ghostty-vt-static");
@@ -234,6 +237,59 @@ fn prepend_path(command: &mut Command, dir: &Path) {
     if let Ok(joined) = env::join_paths(paths) {
         command.env("PATH", joined);
     }
+}
+
+fn normalize_macos_static_archive(archive: &Path) {
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let normalize_dir = out_dir.join("macos-archive-normalize");
+    let _ = fs::remove_dir_all(&normalize_dir);
+    fs::create_dir_all(&normalize_dir).expect("create archive normalize dir");
+
+    let members = Command::new("ar")
+        .arg("-t")
+        .arg(archive)
+        .output()
+        .expect("list static archive members");
+    assert!(
+        members.status.success(),
+        "ar -t failed for {}",
+        archive.display()
+    );
+    let members = String::from_utf8(members.stdout).expect("archive member list is utf-8");
+    let object_members: Vec<String> = members
+        .lines()
+        .filter(|line| line.ends_with(".o"))
+        .map(ToOwned::to_owned)
+        .collect();
+    if object_members.is_empty() {
+        return;
+    }
+
+    let status = Command::new("ar")
+        .arg("-x")
+        .arg(archive)
+        .current_dir(&normalize_dir)
+        .status()
+        .expect("extract static archive");
+    assert!(status.success(), "ar -x failed for {}", archive.display());
+
+    for member in &object_members {
+        let path = normalize_dir.join(member);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .expect("make extracted archive object readable");
+    }
+
+    let normalized = normalize_dir.join("libghostty-vt-static.a");
+    let mut libtool = Command::new("libtool");
+    libtool.arg("-static").arg("-o").arg(&normalized);
+    for member in &object_members {
+        libtool.arg(normalize_dir.join(member));
+    }
+    let status = libtool.status().expect("run libtool for static archive");
+    assert!(status.success(), "libtool failed for {}", archive.display());
+    fs::rename(&normalized, archive).expect("replace normalized static archive");
+    fs::set_permissions(archive, fs::Permissions::from_mode(0o644))
+        .expect("make normalized static archive readable");
 }
 
 fn verify_zig_version(zig: &std::ffi::OsStr) {

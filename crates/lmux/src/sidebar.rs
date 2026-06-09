@@ -243,10 +243,14 @@ pub fn install(
         expanded_only.push(attach_btn.clone().upcast());
         if attach_view.sensitive {
             let state_for_attach = state.clone();
+            #[cfg(not(target_os = "macos"))]
             let compositor_for_attach = compositor.clone();
             attach_btn.connect_clicked(move |btn| {
                 if let Some(root) = btn.root() {
                     if let Ok(win) = root.downcast::<gtk4::ApplicationWindow>() {
+                        #[cfg(target_os = "macos")]
+                        open_macos_attach_picker(&win, &state_for_attach);
+                        #[cfg(not(target_os = "macos"))]
                         open_attach_picker(&win, &state_for_attach, compositor_for_attach.clone());
                     }
                 }

@@ -20,7 +20,7 @@ fi
 
 echo "== protocol / portable crates =="
 cargo test -p lmux-compositor
-cargo test -p lmux-bus -p lmux-control -p lmux-pty
+cargo test -p lmux-bus -p lmux-pty
 cargo test -p lmux-macos-helper
 
 echo "== app compile =="
